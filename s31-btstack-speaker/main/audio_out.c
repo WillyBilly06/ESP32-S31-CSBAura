@@ -96,6 +96,12 @@ void audio_out_push(ao_owner_t owner, const int16_t *lr, int n)
     if (owner != s_owner || n <= 0 || s_gen != s_gen_seen) {
         return;                                   /* not ours, or the writer has not flushed yet */
     }
+    static int16_t vol_buf[480 * 2];
+    if ((owner == AO_HOST || owner == AO_LOCAL) && n <= 480) {
+        memcpy(vol_buf, lr, (size_t)n * 4);       /* phone volume: here, not on the broadcast */
+        a2dp_in_apply_volume(vol_buf, n);
+        lr = vol_buf;
+    }
     uint32_t space = ring_space(&s_ring);
     if ((uint32_t)n > space) {                    /* producer ahead (should not happen): keep the newest */
         st_dropped += ring_drop_oldest(&s_ring, (uint32_t)n - space);

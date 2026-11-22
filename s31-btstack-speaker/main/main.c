@@ -173,7 +173,8 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
         a2dp_in_on_hci_working();
         auracast_on_hci_working();
         jbl_on_hci_working();
-        auracast_host_start();
+        /* no broadcast at boot: nothing plays yet, and the radio is better spent
+         * paging the last phone (party starts LISTEN once it is connected) */
         party_on_hci_working();
     }
 }
@@ -184,8 +185,11 @@ static void btstack_task(void *arg)
     btstack_memory_init();
     btstack_run_loop_init(btstack_run_loop_freertos_get_instance());
     hci_init(hci_transport_s31_vhci_get_instance(), NULL);
-#ifdef S31_HCI_DUMP
+    /* BTstack log_error lines on the console (no packet dump) */
     hci_dump_init(hci_dump_embedded_stdout_get_instance());
+    hci_dump_enable_packet_log(false);
+#ifdef S31_HCI_DUMP
+    hci_dump_enable_packet_log(true);
 #endif
 
     const btstack_tlv_t *tlv = btstack_tlv_esp32_get_instance();
@@ -206,7 +210,9 @@ static void btstack_task(void *arg)
         auracast_setup();
         party_setup();
         buttons_setup();
+        gap_set_security_level(LEVEL_0);     /* incoming ATT-over-BR/EDR (JBL One): the phone authenticates */
         jbl_setup();
+        gap_set_security_level(LEVEL_2);     /* channels we open */
     }
 
     hci_power_control(HCI_POWER_ON);
@@ -215,6 +221,9 @@ static void btstack_task(void *arg)
 
 void app_main(void)
 {
+    /* LMP opcode 54 (LMP_page_scan_mode_req, deprecated) from phones: the closed
+     * controller rejects it and continues - logged at ERROR on every connect */
+    esp_log_level_set("OLM_LMP", ESP_LOG_NONE);
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         nvs_flash_erase();

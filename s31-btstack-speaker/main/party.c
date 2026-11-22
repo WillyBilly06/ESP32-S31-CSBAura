@@ -101,6 +101,7 @@ static struct { bd_addr_t a; uint32_t until; } s_black[4];
 #define CONN_SETUP_HOLD_MS 4000
 static uint32_t s_scan_hold_until;
 static bool s_scan_held;
+static bool s_boot_hold;                         /* boot: scan waits for the phone */
 
 /* BASE */
 typedef struct {
@@ -747,7 +748,11 @@ static void listen_poll(void)
         if (now_ms() - s_state_ms >= TICK_MS) listen_reset("start listening");
         break;
     case L_SCAN:
-        if (s_scan_held && (int32_t)(s_scan_hold_until - now_ms()) <= 0) {
+        if (s_boot_hold && (a2dp_in_connected() || (int32_t)(s_scan_hold_until - now_ms()) <= 0)) {
+            s_boot_hold = false;
+            if (a2dp_in_connected()) s_scan_hold_until = now_ms() + 1500;   /* AVDTP/AVRCP setup */
+        }
+        if (s_scan_held && !s_boot_hold && (int32_t)(s_scan_hold_until - now_ms()) <= 0) {
             scan_start();
             ESP_LOGW(TAG, "LE scan resumed");
         }
@@ -863,7 +868,11 @@ void party_setup(void)
 
 void party_on_hci_working(void)
 {
-    s_role = R_HOST;
+    /* boot: Auracast is off; go straight to LISTEN, but hold the scan until the
+     * phone is back (power-up call-back pages it) or 6 s have passed */
+    s_scan_hold_until = now_ms() + 6000;
+    s_boot_hold = true;
+    s_role = R_HOST_STOPPING;
     s_role_ms = now_ms();
     s_idle_ms = 0;
     btstack_run_loop_set_timer_handler(&s_tick, tick);

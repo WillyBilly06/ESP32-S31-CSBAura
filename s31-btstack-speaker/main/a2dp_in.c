@@ -342,7 +342,9 @@ static float volume_gain(uint8_t v)
     return x * x * x;
 }
 
-static void apply_volume(int16_t *pcm, int n)
+/* Local speaker only (audio_out): the Auracast broadcast stays full scale like
+ * a real JBL master, so party members keep their own volume. */
+void a2dp_in_apply_volume(int16_t *pcm, int n)
 {
     float target = volume_gain(s_volume);
     if (s_gain_cur < 0.0f) {
@@ -467,7 +469,7 @@ int a2dp_in_read(int16_t *pcm, int n)
                 s_ceiling_hits = 0;
                 s_ceilings++;
                 s_track_lo = s_track_hi = 0;
-                apply_volume(pcm, n);
+                /* full scale out: the phone volume is applied at the local speaker only */
                 return n;
             }
         } else {
@@ -507,13 +509,13 @@ int a2dp_in_read(int16_t *pcm, int n)
             s_deficit += (uint32_t)n;              /* time passes: late audio arriving later is owed */
             if (s_deficit > MS_FRAMES(RING_MS)) s_deficit = MS_FRAMES(RING_MS);
             s_deficit_reads = 0;
-            apply_volume(pcm, n);
+            /* full scale out: the phone volume is applied at the local speaker only */
             return 0;
         }
         s_reprime = false;
     }
     if (s_deficit > 0 && catch_up(pcm, n, false)) {
-        apply_volume(pcm, n);
+        /* full scale out: the phone volume is applied at the local speaker only */
         return n;
     }
     uint32_t take = ring_read_upto(&s_ring, (uint32_t *)pcm, (uint32_t)n);
@@ -538,7 +540,7 @@ int a2dp_in_read(int16_t *pcm, int n)
         if (s_deficit > MS_FRAMES(RING_MS)) s_deficit = MS_FRAMES(RING_MS);
         s_deficit_reads = 0;
     }
-    apply_volume(pcm, n);
+    /* full scale out: the phone volume is applied at the local speaker only */
     return (int)take;
 }
 
@@ -601,7 +603,7 @@ static void delay_report_soon(uint32_t ms)
     btstack_run_loop_add_timer(&s_dr_timer);
 }
 
-/* The phone normally opens AVRCP itself; if it has not after 2 s, we do. */
+/* The phone normally opens AVRCP itself; if it has not after 0.4 s, we do. */
 static void avrcp_connect_cb(btstack_timer_source_t *ts)
 {
     (void)ts;
@@ -730,7 +732,7 @@ static void a2dp_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet,
                  role == HCI_ROLE_MASTER ? "MASTER (S31 schedules the phone)" : "SLAVE");
         btstack_run_loop_remove_timer(&s_avrcp_timer);
         btstack_run_loop_set_timer_handler(&s_avrcp_timer, avrcp_connect_cb);
-        btstack_run_loop_set_timer(&s_avrcp_timer, 2000);
+        btstack_run_loop_set_timer(&s_avrcp_timer, 400);    /* the phone holds its stream until AVRCP is up: 2 s here = 2 s reconnect delay */
         btstack_run_loop_add_timer(&s_avrcp_timer);
         break;
     }
@@ -907,11 +909,22 @@ void a2dp_in_setup(void)
 
     /* Bluetooth side */
     l2cap_init();
+    /* Incoming AVDTP/AVCTP channels: do NOT start our own authentication. The
+     * phone authenticates + encrypts the link itself right after connecting;
+     * BTstack's level-2 check on its AVDTP channel started a second, colliding
+     * authentication and the controller dropped the link (0x16, ~80 ms after
+     * the link key reply) - every phone-initiated reconnect failed. Services
+     * registered below read this level (gap_get_security_level()). */
+    gap_set_security_level(LEVEL_0);
     sdp_init();
     a2dp_sink_init();
     avrcp_init();
     avrcp_controller_init();
     avrcp_target_init();
+    /* services above registered at LEVEL_0 (incoming: the phone authenticates);
+     * channels WE open (power-up call-back) need LEVEL_2 - the phone closes an
+     * unauthenticated AVDTP channel */
+    gap_set_security_level(LEVEL_2);
     a2dp_sink_register_packet_handler(&a2dp_handler);
     a2dp_sink_register_media_handler(&media_handler);
     avrcp_register_packet_handler(&avrcp_handler);
@@ -996,6 +1009,6 @@ void a2dp_in_on_hci_working(void)
         return;
     }
     btstack_run_loop_set_timer_handler(&s_reconn_timer, reconnect_cb);
-    btstack_run_loop_set_timer(&s_reconn_timer, 2000);
+    btstack_run_loop_set_timer(&s_reconn_timer, 300);
     btstack_run_loop_add_timer(&s_reconn_timer);
 }
