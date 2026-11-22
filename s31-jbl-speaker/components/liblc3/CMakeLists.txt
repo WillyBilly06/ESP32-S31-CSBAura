@@ -8,10 +8,10 @@ file(GLOB LC3_SRCS "${CMAKE_CURRENT_SOURCE_DIR}/src/*.c")
 
 # Memory placement of the 48 kHz / 10 ms encoder hot path (see the .lf files):
 #   LC3_ENCODER_IRAM         hot encoder functions in IRAM    (~22.6 KB, ON)
-#   LC3_ENCODER_TABLES_DRAM  per-frame encoder tables in DRAM (~23 KB,  OFF)
+#   LC3_ENCODER_TABLES_DRAM  per-frame encoder tables in DRAM (~23 KB,  ON)
 # e.g. `idf.py -DLC3_ENCODER_TABLES_DRAM=ON build`
 option(LC3_ENCODER_IRAM "liblc3: encoder hot functions in IRAM" ON)
-option(LC3_ENCODER_TABLES_DRAM "liblc3: 48k/10ms encoder tables in DRAM" OFF)
+option(LC3_ENCODER_TABLES_DRAM "liblc3: 48k/10ms encoder tables in DRAM" ON)
 
 set(LC3_LDFRAGMENTS "")
 if(LC3_ENCODER_IRAM)
