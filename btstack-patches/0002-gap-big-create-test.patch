@@ -1,0 +1,206 @@
+diff --git a/src/gap.h b/src/gap.h
+index 6f23ad0..f01db7b 100644
+--- a/src/gap.h
++++ b/src/gap.h
+@@ -216,6 +216,16 @@ typedef struct {
+     uint8_t  broadcast_code[16];
+ } le_audio_big_params_t;
+ 
++// Additional parameters for HCI LE Create BIG Test (see gap_big_create_test)
++typedef struct {
++    uint16_t iso_interval_1250us;   // ISO_Interval, 0x0004..0x0C80 (x 1.25 ms)
++    uint8_t  nse;                   // NSE: subevents per BIS per BIG event (= BN x IRC + PTO groups)
++    uint16_t max_pdu;               // Max_PDU, 0x0000..0x00FB
++    uint8_t  bn;                    // BN: payloads per BIS per BIG event
++    uint8_t  irc;                   // IRC: repetitions of each payload
++    uint8_t  pto;                   // PTO: pre-transmission offset
++} le_audio_big_test_params_t;
++
+ typedef struct {
+     uint8_t  big_handle;
+     uint8_t  encryption;
+@@ -251,6 +261,8 @@ typedef struct {
+     uint8_t num_bis;
+     hci_con_handle_t bis_con_handles[MAX_NR_BIS];
+     const le_audio_big_params_t * params;
++    // NULL: HCI LE Create BIG, else HCI LE Create BIG Test with these parameters
++    const le_audio_big_test_params_t * test_params;
+     uint16_t iso_interval_1250us;
+     // request to send
+     bool can_send_now_requested;
+@@ -888,6 +900,21 @@ uint8_t gap_extended_advertising_remove(uint8_t advertising_handle);
+  */
+ uint8_t gap_big_create(le_audio_big_t * storage, le_audio_big_params_t * big_params);
+ 
++/**
++ * @brief Create Broadcast Isochronous Group (BIG) with explicit BIG layout via HCI LE Create BIG Test
++ * @note Same state machine as gap_big_create: ISO data paths are set up for all BIS, BIS handles
++ *       and outgoing packets are tracked, and the BIG is terminated with gap_big_terminate.
++ *       From big_params, max_transport_latency_ms and rtn are not used; the controller takes
++ *       ISO_Interval, NSE, Max_PDU, BN, IRC and PTO from test_params instead.
++ * @param storage to use by stack, needs to stay valid until BIG is terminated
++ * @param big_params needs to stay valid until BIG is terminated
++ * @param test_params needs to stay valid until BIG is terminated
++ * @return status
++ * @events GAP_SUBEVENT_BIG_CREATED unless interrupted by call to gap_big_terminate
++ */
++uint8_t gap_big_create_test(le_audio_big_t * storage, le_audio_big_params_t * big_params,
++                            const le_audio_big_test_params_t * test_params);
++
+ /**
+  * @brief Terminate Broadcast Isochronous Group (BIG)
+  * @param big_handle
+diff --git a/src/hci.c b/src/hci.c
+index 33e3214..244d506 100644
+--- a/src/hci.c
++++ b/src/hci.c
+@@ -3435,6 +3435,11 @@ static void handle_command_complete_event(uint8_t * packet, uint16_t size){
+                     }
+                     return;
+                 }
++                if (big->state == LE_AUDIO_BIG_STATE_W4_SETUP_ISO_PATH_THEN_TERMINATE){
++                    // gap_big_terminate called while an ISO data path setup was pending
++                    big->state = LE_AUDIO_BIG_STATE_TERMINATE;
++                    return;
++                }
+             }
+             btstack_linked_list_iterator_init(&it, &hci_stack->le_audio_big_syncs);
+             while (btstack_linked_list_iterator_has_next(&it)) {
+@@ -3454,6 +3459,11 @@ static void handle_command_complete_event(uint8_t * packet, uint16_t size){
+                     }
+                     return;
+                 }
++                if (big_sync->state == LE_AUDIO_BIG_STATE_W4_SETUP_ISO_PATH_THEN_TERMINATE){
++                    // gap_big_sync_terminate called while an ISO data path setup was pending
++                    big_sync->state = LE_AUDIO_BIG_STATE_TERMINATE;
++                    return;
++                }
+             }
+             // Lookup CIS via active group operation
+             if (hci_stack->iso_active_operation_type == HCI_ISO_TYPE_CIS){
+@@ -3669,6 +3679,7 @@ static void handle_command_status_event(uint8_t * packet, uint16_t size) {
+             }
+             break;
+         case HCI_OPCODE_HCI_LE_CREATE_BIG:
++        case HCI_OPCODE_HCI_LE_CREATE_BIG_TEST:
+             if (status != ERROR_CODE_SUCCESS){
+                 hci_stack->iso_active_operation_type = HCI_ISO_TYPE_INVALID;
+                 // get current big
+@@ -7819,6 +7830,26 @@ static bool hci_run_iso_tasks(void){
+                 hci_stack->iso_active_operation_group_id = big->params->big_handle;
+                 hci_stack->iso_active_operation_type = HCI_ISO_TYPE_BIS;
+                 big->state = LE_AUDIO_BIG_STATE_W4_ESTABLISHED;
++                if (big->test_params != NULL){
++                    hci_send_cmd(&hci_le_create_big_test,
++                                 big->params->big_handle,
++                                 big->params->advertising_handle,
++                                 big->params->num_bis,
++                                 big->params->sdu_interval_us,
++                                 big->test_params->iso_interval_1250us,
++                                 big->test_params->nse,
++                                 big->params->max_sdu,
++                                 big->test_params->max_pdu,
++                                 big->params->phy,
++                                 big->params->packing,
++                                 big->params->framing,
++                                 big->test_params->bn,
++                                 big->test_params->irc,
++                                 big->test_params->pto,
++                                 big->params->encryption,
++                                 big->params->broadcast_code);
++                    return true;
++                }
+                 hci_send_cmd(&hci_le_create_big,
+                              big->params->big_handle,
+                              big->params->advertising_handle,
+@@ -11604,15 +11635,18 @@ static uint8_t gap_big_setup_iso_streams(uint8_t num_bis, uint8_t big_handle){
+     return status;
+ }
+ 
+-uint8_t gap_big_create(le_audio_big_t * storage, le_audio_big_params_t * big_params){
++static uint8_t gap_big_create_internal(le_audio_big_t * storage, le_audio_big_params_t * big_params,
++                                       const le_audio_big_test_params_t * test_params){
+     uint8_t status = gap_big_setup_iso_streams(big_params->num_bis, big_params->big_handle);
+     if (status != ERROR_CODE_SUCCESS){
+         return status;
+     }
+ 
+     le_audio_big_t * big = storage;
++    memset(big, 0, sizeof(le_audio_big_t));
+     big->big_handle = big_params->big_handle;
+     big->params = big_params;
++    big->test_params = test_params;
+     big->state = LE_AUDIO_BIG_STATE_CREATE;
+     big->num_bis = big_params->num_bis;
+     big->iso_interval_1250us = 0;
+@@ -11623,6 +11657,18 @@ uint8_t gap_big_create(le_audio_big_t * storage, le_audio_big_params_t * big_par
+     return ERROR_CODE_SUCCESS;
+ }
+ 
++uint8_t gap_big_create(le_audio_big_t * storage, le_audio_big_params_t * big_params){
++    return gap_big_create_internal(storage, big_params, NULL);
++}
++
++uint8_t gap_big_create_test(le_audio_big_t * storage, le_audio_big_params_t * big_params,
++                            const le_audio_big_test_params_t * test_params){
++    if (test_params == NULL){
++        return ERROR_CODE_INVALID_HCI_COMMAND_PARAMETERS;
++    }
++    return gap_big_create_internal(storage, big_params, test_params);
++}
++
+ uint8_t gap_big_sync_create(le_audio_big_sync_t * storage, le_audio_big_sync_params_t * big_sync_params){
+     uint8_t status = gap_big_setup_iso_streams(big_sync_params->num_bis, big_sync_params->big_handle);
+     if (status != ERROR_CODE_SUCCESS){
+@@ -11694,6 +11740,29 @@ uint8_t gap_big_sync_terminate(uint8_t big_handle){
+     return ERROR_CODE_SUCCESS;
+ }
+ 
++uint8_t hci_iso_packets_completed(hci_con_handle_t con_handle, uint16_t num_packets){
++    hci_iso_stream_t * iso_stream = hci_iso_stream_for_con_handle(con_handle);
++    if (iso_stream == NULL){
++        return ERROR_CODE_UNKNOWN_CONNECTION_IDENTIFIER;
++    }
++    if (iso_stream->num_packets_sent >= num_packets) {
++        iso_stream->num_packets_sent -= num_packets;
++    } else {
++        iso_stream->num_packets_sent = 0;
++    }
++#ifdef ENABLE_ISO_BIG_TRANSMIT_TRACKING
++    if (iso_stream->iso_type == HCI_ISO_TYPE_BIS){
++        le_audio_big_t * big = hci_big_for_handle(iso_stream->group_id);
++        if (big != NULL){
++            big->num_completed_timestamp_current_valid = true;
++            big->num_completed_timestamp_current_ms = btstack_run_loop_get_time_ms();
++        }
++    }
++#endif
++    hci_iso_notify_can_send_now();
++    return ERROR_CODE_SUCCESS;
++}
++
+ uint8_t hci_request_bis_can_send_now_events(uint8_t big_handle){
+     le_audio_big_t * big = hci_big_for_handle(big_handle);
+     if (big == NULL){
+diff --git a/src/hci.h b/src/hci.h
+index e757704..5305e0c 100644
+--- a/src/hci.h
++++ b/src/hci.h
+@@ -1678,6 +1678,17 @@ uint8_t hci_send_sco_packet_buffer(int size);
+  */
+ uint8_t hci_request_bis_can_send_now_events(uint8_t big_handle);
+ 
++/**
++ * @brief Report ISO packets completed by the Controller outside of HCI Number Of Completed Packets
++ * @note For Controllers with vendor ISO flow control (e.g. Espressif "non-standard flow control",
++ *       which reports ISO TX completion through a Controller callback instead of the HCI event).
++ *       Same effect as a Number Of Completed Packets event for this handle. Call on the main thread.
++ * @param con_handle of BIS or CIS
++ * @param num_packets completed (transmitted or flushed)
++ * @return status ERROR_CODE_UNKNOWN_CONNECTION_IDENTIFIER if no ISO stream with this handle
++ */
++uint8_t hci_iso_packets_completed(hci_con_handle_t con_handle, uint16_t num_packets);
++
+ /**
+  * @brief Request emission of HCI_EVENT_CIS_CAN_SEND_NOW for all outgoing CIS of referenced CIG
+  *

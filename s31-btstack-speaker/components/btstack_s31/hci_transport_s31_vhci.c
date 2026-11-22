@@ -27,6 +27,7 @@
 #include "hci_transport_s31_vhci.h"
 
 #include "esp_bt.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -154,8 +155,41 @@ static void transport_register_packet_handler(void (*handler)(uint8_t, uint8_t *
     transport_packet_handler = handler;
 }
 
+static volatile uint32_t s_iso_alloc_fail, s_iso_tx_err;
+static volatile int s_iso_tx_last_err;
+extern int r_ble_hci_trans_hs_iso_tx(const uint8_t *data, uint16_t length, void *arg);
+
+/* ISO TX errors from the controller (-1 no BIS, -2 bad packet, -3 cannot send,
+ * -4 not ready / data path not set up, -5 fragment failed). */
+uint32_t hci_transport_s31_iso_tx_errors(int *last)
+{
+    if (last) {
+        *last = s_iso_tx_last_err;
+    }
+    return s_iso_tx_err + s_iso_alloc_fail;
+}
+
 static int transport_send_packet(uint8_t packet_type, uint8_t *packet, int size)
 {
+    if (packet_type == HCI_ISO_DATA_PACKET) {
+        /* ISO goes straight to the controller like Espressif's own ISO host
+         * (esp_ble_iso iso.c): r_ble_hci_trans_hs_iso_tx(pkt starting at the
+         * handle). Through VHCI the H4 type byte stays in front of the handle
+         * and the controller drops the SDU. The controller owns and free()s
+         * the buffer in every case, so it gets a heap copy. */
+        uint8_t *buf = heap_caps_malloc((size_t)size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (buf == NULL) {
+            s_iso_alloc_fail++;
+            return -1;
+        }
+        memcpy(buf, packet, (size_t)size);
+        int rc = r_ble_hci_trans_hs_iso_tx(buf, (uint16_t)size, NULL);
+        if (rc != 0) {
+            s_iso_tx_err++;
+            s_iso_tx_last_err = rc;
+        }
+        return 0;
+    }
     /* HCI_OUTGOING_PRE_BUFFER_SIZE (1) leaves room for the H4 type byte */
     packet--;
     *packet = packet_type;

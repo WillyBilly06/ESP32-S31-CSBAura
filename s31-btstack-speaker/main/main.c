@@ -26,6 +26,7 @@
 #include "nvs_flash.h"
 
 #include "a2dp_in.h"
+#include "auracast.h"
 
 static const char *TAG = "S31";
 /* #define S31_HCI_DUMP 1   bring-up: print every HCI packet */
@@ -33,16 +34,19 @@ static const char *TAG = "S31";
 #define LOCAL_NAME "S31 JBL Xtreme 5"
 
 extern uint32_t hci_transport_s31_vhci_rx_dropped(void);
+extern uint32_t hci_transport_s31_iso_tx_errors(int *last);
 static btstack_packet_callback_registration_t s_hci_reg;
 
 static void log_heap(void)
 {
-    ESP_LOGW(TAG, "HEAP: internal free %u KB (largest %u KB, lowest %u KB) | PSRAM free %u KB | VHCI rx drops %lu",
+    int iso_last = 0;
+    uint32_t iso_err = hci_transport_s31_iso_tx_errors(&iso_last);
+    ESP_LOGW(TAG, "HEAP: internal free %u KB (largest %u KB, lowest %u KB) | PSRAM free %u KB | VHCI rx drops %lu | ISO tx errors %lu (last %d)",
              (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) >> 10),
              (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) >> 10),
              (unsigned)(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL) >> 10),
              (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) >> 10),
-             (unsigned long)hci_transport_s31_vhci_rx_dropped());
+             (unsigned long)hci_transport_s31_vhci_rx_dropped(), (unsigned long)iso_err, iso_last);
 }
 
 static void stats_task(void *arg)
@@ -52,6 +56,7 @@ static void stats_task(void *arg)
     for (;;) {
         vTaskDelayUntil(&last, pdMS_TO_TICKS(2000));
         a2dp_in_log_stats();
+        auracast_log_stats();
         log_heap();
     }
 }
@@ -68,6 +73,8 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
         gap_local_bd_addr(a);
         ESP_LOGW(TAG, "BTstack up: '%s' at %s (BR/EDR A2DP sink, LE)", LOCAL_NAME, bd_addr_to_str(a));
         a2dp_in_on_hci_working();
+        auracast_on_hci_working();
+        auracast_host_start();
     }
 }
 
@@ -91,6 +98,7 @@ static void btstack_task(void *arg)
 
     gap_set_local_name(LOCAL_NAME);
     a2dp_in_setup();
+    auracast_setup();
 
     hci_power_control(HCI_POWER_ON);
     btstack_run_loop_execute();                 /* never returns */
