@@ -85,16 +85,19 @@ static void on_pcm(int16_t *data, int num_frames, int num_channels, int sample_r
         s_cfg_rate = (uint32_t)sample_rate;
     }
     /* clock recovery: hold the PCM ring at TARGET_MS by nudging the ratio
-     * (smoothed PI, +-500 ppm) - the phone's 44.1 kHz clock vs our BIG clock */
+     * (smoothed PI, +-1500 ppm) - the phone's 44.1 kHz clock vs our BIG clock */
     float fill = (float)ring_fill(&s_ring);
     s_fill_avg += (fill - s_fill_avg) * 0.002f;
     float err = (s_fill_avg - (float)MS_FRAMES(TARGET_MS)) * (1.0f / (float)MS_FRAMES(TARGET_MS));
     s_integ += err * 0.0005f;
-    if (s_integ > 0.25f) s_integ = 0.25f;
-    if (s_integ < -0.25f) s_integ = -0.25f;
+    /* +-1500 ppm: at +-500 the loop sat on the limit with the S26 Ultra (its
+     * A2DP clock vs our BIG clock), so the fill was not regulated and wandered
+     * 40-104 ms -> occasional underrun clicks */
+    if (s_integ > 0.75f) s_integ = 0.75f;
+    if (s_integ < -0.75f) s_integ = -0.75f;
     float e = 0.25f * err + s_integ;               /* +-1 = +-0.2 % */
-    if (e > 0.25f) e = 0.25f;                      /* +-500 ppm */
-    if (e < -0.25f) e = -0.25f;
+    if (e > 0.75f) e = 0.75f;
+    if (e < -0.75f) e = -0.75f;
     s_corr_ppm = (int32_t)(e * 2000.0f);
     uint64_t step = rs_step_q32(s_cfg_rate, OUT_RATE, e);
 
@@ -186,9 +189,111 @@ static void media_handler(uint8_t seid, uint8_t *packet, uint16_t size)
     }
 }
 
+/* ---- bench test signal (encoder task, core 0) ----------------------------------- */
+#if S31_TEST_SIGNAL
+#define TS_F0       50.0f
+#define TS_F1       18000.0f
+#define TS_SWEEP_S  9
+#define TS_CYCLE_S  20
+#define TS_AMP      8192.0f                  /* -12 dBFS */
+static rs_state_t s_trs;
+static uint32_t s_tfifo[480 + RS_OUT_MAX + 16];
+static int s_tfill;
+static uint32_t s_tout;                      /* 48 kHz frames into the cycle */
+static uint32_t s_tin;                       /* 44.1 kHz frames into the down-sweep */
+static float s_tph, s_tf;
+static int s_tphase = -1;
+
+static inline int16_t ts_sample(float fs)
+{
+    float v = sinf(6.2831853f * s_tph) * TS_AMP;
+    s_tph += s_tf / fs;
+    s_tph -= (float)(int)s_tph;
+    return (int16_t)v;
+}
+
+static void test_fill(int16_t *pcm, int n)
+{
+    static const float up = 1.0f, dn = -1.0f;
+    for (int k = 0; k < n;) {
+        uint32_t t = s_tout;
+        int ph = t < TS_SWEEP_S * 48000u ? 0 : t < 10 * 48000u ? 1 : t < (10 + TS_SWEEP_S) * 48000u ? 2 : 3;
+        if (ph != s_tphase) {
+            s_tphase = ph;
+            s_tph = 0;
+            if (ph == 0) {
+                s_tf = TS_F0;
+                ESP_LOGW(TAG, "TEST: UP-sweep 50 Hz -> 18 kHz, made at 48 kHz (encoder only)");
+            } else if (ph == 2) {
+                s_tf = TS_F1;
+                s_tin = 0;
+                s_tfill = 0;
+                rs_reset(&s_trs);
+                ESP_LOGW(TAG, "TEST: DOWN-sweep 18 kHz -> 50 Hz, made at 44.1 kHz through the resampler");
+            }
+        }
+        if (ph == 0) {
+            const float r = powf(TS_F1 / TS_F0, up / (TS_SWEEP_S * 48000.0f));
+            int16_t v = ts_sample(48000.0f);
+            s_tf *= r;
+            pcm[2 * k] = v;
+            pcm[2 * k + 1] = v;
+            k++;
+            s_tout++;
+        } else if (ph == 2) {
+            const float r = powf(TS_F1 / TS_F0, dn / (TS_SWEEP_S * 44100.0f));
+            while (s_tfill < n - k) {
+                int16_t in[2 * 128];
+                for (int j = 0; j < 128; j++) {
+                    int16_t v = s_tin < TS_SWEEP_S * 44100u ? ts_sample(44100.0f) : 0;
+                    if (s_tin < TS_SWEEP_S * 44100u) {
+                        s_tf *= r;
+                    }
+                    s_tin++;
+                    in[2 * j] = v;
+                    in[2 * j + 1] = v;
+                }
+                rs_push(&s_trs, in, 128);
+                s_tfill += rs_run(&s_trs, rs_step_q32(44100, OUT_RATE, 0), &s_tfifo[s_tfill], RS_OUT_MAX);
+            }
+            int take = n - k;
+            memcpy(pcm + 2 * k, s_tfifo, (size_t)take * 4);
+            memmove(s_tfifo, s_tfifo + take, (size_t)(s_tfill - take) * 4);
+            s_tfill -= take;
+            k += take;
+            s_tout += (uint32_t)take;
+        } else {
+            pcm[2 * k] = 0;
+            pcm[2 * k + 1] = 0;
+            k++;
+            s_tout++;
+        }
+        if (s_tout >= TS_CYCLE_S * 48000u) {
+            s_tout = 0;
+        }
+    }
+}
+#endif
+
+int a2dp_in_test_phase(void)
+{
+#if S31_TEST_SIGNAL
+    return s_tphase;
+#else
+    return -1;
+#endif
+}
+
 /* ---- encoder side --------------------------------------------------------------- */
 int a2dp_in_read(int16_t *pcm, int n)
 {
+#if S31_TEST_SIGNAL
+    if (s_streaming && s_primed) {
+        ring_read_upto(&s_ring, (uint32_t *)pcm, (uint32_t)n);   /* keep A2DP draining, discard */
+    }
+    test_fill(pcm, n);
+    return n;
+#endif
     if (!s_streaming || !s_primed) {
         memset(pcm, 0, (size_t)n * 4);
         return 0;
@@ -382,8 +487,8 @@ void a2dp_in_setup(void)
     gap_ssp_set_auto_accept(1);
     gap_set_bondable_mode(1);
     gap_set_class_of_device(0x240414);            /* audio, loudspeaker */
-    gap_discoverable_control(1);
-    gap_connectable_control(1);
+    gap_discoverable_control(!S31_QUIET_RADIO_TEST);
+    gap_connectable_control(!S31_QUIET_RADIO_TEST);
 
     s_hci_reg.callback = &hci_handler;
     hci_add_event_handler(&s_hci_reg);
@@ -412,6 +517,10 @@ static void reconnect_cb(btstack_timer_source_t *ts)
 
 void a2dp_in_on_hci_working(void)
 {
+    if (S31_QUIET_RADIO_TEST) {
+        ESP_LOGW(TAG, "QUIET RADIO TEST: BR/EDR off air (no scan, no call-back)");
+        return;
+    }
     nvs_handle_t h;
     size_t n = 6;
     if (nvs_open("s31", NVS_READONLY, &h) != ESP_OK) {

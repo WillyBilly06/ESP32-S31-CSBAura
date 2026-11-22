@@ -16,3 +16,21 @@ bool a2dp_in_connected(void);
 int a2dp_in_read(int16_t *pcm, int n);
 
 void a2dp_in_log_stats(void);
+
+/* Bench test: replace the phone audio with a 20 s cycle of
+ *   0-9 s   up-sweep 50 Hz -> 18 kHz made at 48 kHz (straight to the encoder)
+ *   10-19 s down-sweep 18 kHz -> 50 Hz made at 44.1 kHz and sent through the
+ *           A2DP resampler (fixed ratio, no clock recovery)
+ * at -12 dBFS, both channels, EQ bypassed. The phone stream is read and
+ * discarded so A2DP keeps running. 0 = normal. */
+#ifndef S31_TEST_SIGNAL
+#define S31_TEST_SIGNAL 0
+#endif
+/* Bench: radio as quiet as possible - BR/EDR not discoverable / connectable
+ * and no call-back of the phone, no JBL assistant scan. Only the broadcast,
+ * the PA and the JBL beacon stay on air. 0 = normal. */
+#ifndef S31_QUIET_RADIO_TEST
+#define S31_QUIET_RADIO_TEST 0
+#endif
+/* test cycle phase of the last frame read: 0 up-sweep, 1 gap, 2 down-sweep, 3 gap */
+int a2dp_in_test_phase(void);

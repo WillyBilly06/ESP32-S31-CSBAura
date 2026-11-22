@@ -37,6 +37,7 @@
 
 #include "jbl.h"
 #include "jbl_assist.h"
+#include "a2dp_in.h"
 #include "jbl_util.h"
 
 static const char *TAG = "JBL_ASSIST";
@@ -886,6 +887,9 @@ static void tick(btstack_timer_source_t *ts)
     uint32_t age = state_age();
     switch (s_state) {
     case ST_IDLE:
+        if (S31_QUIET_RADIO_TEST) {
+            break;                               /* bench: no scan */
+        }
         ESP_LOGI(TAG, "Hosting; watching for a JBL speaker whose Auracast button is pressed...");
         gap_set_scan_params(0 /* passive */, SCAN_INTERVAL, SCAN_WINDOW, 0);
         gap_set_scan_duplicate_filter(false);    /* partyInfo changes must be reported */

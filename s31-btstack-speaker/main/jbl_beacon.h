@@ -30,6 +30,9 @@ void jbl_beacon_start(uint16_t mac_crc, const jbl_beacon_state_t *st);
 /* Push a new state; only what changed is sent to the controller. */
 void jbl_beacon_update(const jbl_beacon_state_t *st);
 
+/* Bench: take the beacon off air / back on (BT thread). */
+void jbl_beacon_pause(bool pause);
+
 void jbl_beacon_log_stats(void);
 
 #ifdef __cplusplus

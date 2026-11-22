@@ -67,7 +67,9 @@ void lc3_i2s_player_init(void)
     ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &s_tx, NULL));
 
     i2s_std_config_t std = {
-        .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(48000),   /* placeholder; set in set_format */
+        .clk_cfg  = {   /* placeholder rate, set in set_format; APLL = exact MCLK, no fractional divider jitter */
+            .sample_rate_hz = 48000, .clk_src = I2S_CLK_SRC_APLL, .mclk_multiple = I2S_MCLK_MULTIPLE_256, .bclk_div = 8,
+        },
         .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO),
         .gpio_cfg = {
             .mclk = I2S_GPIO_UNUSED,
@@ -105,6 +107,7 @@ void lc3_i2s_player_set_format(int sr_hz, int frame_samples, int stereo)
     }
 
     i2s_std_clk_config_t clk = I2S_STD_CLK_DEFAULT_CONFIG(sr_hz);
+    clk.clk_src = I2S_CLK_SRC_APLL;               /* exact MCLK from the audio PLL */
     ESP_ERROR_CHECK(i2s_channel_reconfig_std_clock(s_tx, &clk));
 
     s_sr_hz         = sr_hz;

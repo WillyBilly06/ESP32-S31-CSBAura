@@ -313,3 +313,15 @@ void jbl_beacon_log_stats(void)
              (unsigned long)s_interval_changes, (unsigned long)s_peer_cons, (unsigned long)s_rearms,
              (unsigned long)s_scanners_seen);
 }
+
+void jbl_beacon_pause(bool pause)
+{
+    if (s_handle == 0xFF) {
+        return;
+    }
+    if (pause) {
+        gap_extended_advertising_stop(s_handle);
+    } else {
+        gap_extended_advertising_start(s_handle, 0, 0);
+    }
+}

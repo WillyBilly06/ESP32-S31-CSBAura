@@ -22,6 +22,7 @@
  *     7.5-15 ms phones use while discovering.
  */
 #include "link_tune.h"
+#include "a2dp_in.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -130,7 +131,7 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
         hci_con_handle_t h = hci_event_disconnection_complete_get_connection_handle(packet);
         if (h == s_acl) {
             s_acl = HCI_CON_HANDLE_INVALID;
-            gap_discoverable_control(1);
+            gap_discoverable_control(!S31_QUIET_RADIO_TEST);
             ESP_LOGW(TAG, "ACL gone: inquiry scan back on");
         }
         if (h == s_le) {

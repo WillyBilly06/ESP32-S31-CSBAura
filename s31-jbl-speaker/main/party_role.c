@@ -839,7 +839,9 @@ static void audio_out_start(uint32_t sr_hz)
         cc.dma_frame_num = 240;
         cc.auto_clear_after_cb = true;      /* underrun -> silence, not a repeated buffer */
         i2s_std_config_t std = {
-            .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(sr_hz),
+            .clk_cfg  = {   /* APLL: exact 12.288 MHz MCLK (256 x 48 kHz), not a fractional divider off the 40 MHz XTAL */
+                .sample_rate_hz = sr_hz, .clk_src = I2S_CLK_SRC_APLL, .mclk_multiple = I2S_MCLK_MULTIPLE_256, .bclk_div = 8,
+            },
             .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO),
             .gpio_cfg = {
                 .mclk = I2S_GPIO_UNUSED,

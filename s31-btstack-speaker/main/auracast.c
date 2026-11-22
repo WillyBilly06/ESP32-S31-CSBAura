@@ -108,7 +108,12 @@ extern uint16_t r_ble_ll_iso_free_buf_num_get(uint16_t conn_handle);
 #define AURA_ISO_QUEUE         (AURA_PIPELINE + 1) /* BTstack per-BIS cap (controller has 12 for all) */
 #define AURA_RQ_DEPTH          8                   /* ready queue, power of 2 */
 #define AURA_DEADLINE_MS       8                   /* after a completion: next event's SDUs must be in */
-#define AURA_WDOG_MS           30                  /* no grant this long while ON: keep PCM in real time */
+#define AURA_ISO_INTERVAL_MS   30                  /* s_big_test.iso_interval_1250us * 1.25 */
+/* No grant this long while ON: the BIG has stalled, keep PCM in real time.
+ * Grants come once per BIG event (every ISO interval), so this must be a few
+ * intervals: at 30 ms (= one interval) every bit of completion jitter fired it,
+ * threw 30 ms of audio away and made the next SDUs late (not transmitted). */
+#define AURA_WDOG_MS           (4 * AURA_ISO_INTERVAL_MS)
 
 #define AURA_ENC_STACK         12288
 #define AURA_ENC_PRIO          (configMAX_PRIORITIES - 4)
@@ -192,8 +197,8 @@ static const le_audio_big_test_params_t s_big_test = {
     .nse = 9,
     .max_pdu = AURA_SDU,
     .bn = AURA_BN,
-    .irc = 2,
-    .pto = 1,
+    .irc = 3,       /* no pre-transmission: with PTO 1 (phone: IRC 2 + PTO 1) the controller */
+    .pto = 0,       /* skipped 2 BIG events every 10-20 s (4-11 / 90 s), PTO 0: none in 150 s */
 };
 
 /* ---- state machine (BT thread) --------------------------------------------- */
@@ -356,13 +361,23 @@ static void pa_refresh(void)
     gap_periodic_advertising_set_data(s_adv_handle, s_pa_len, s_pa);
 }
 
+static int s_exp;                                 /* bench experiment phase (S31_TEST_SIGNAL) */
+#if S31_TEST_SIGNAL
+#define EXP_MS 90000
+#define AURA_EXP 0                                /* 1 = cycle the adv on/off experiments */
+static btstack_timer_source_t s_exp_timer;
+static void exp_handler(btstack_timer_source_t *ts);
+#endif
+
 static void pa_timer_handler(btstack_timer_source_t *ts)
 {
     if (s_phase == PH_OFF || s_phase == PH_ADV_OFF_WAIT) {
         return;
     }
     s_pa_nn++;
-    pa_refresh();
+    if (s_exp != 1) {
+        pa_refresh();
+    }
     btstack_run_loop_set_timer(ts, AURA_PA_UPDATE_MS);
     btstack_run_loop_add_timer(ts);
 }
@@ -371,12 +386,103 @@ static void pa_timer_handler(btstack_timer_source_t *ts)
 /* encoder (core 0)                                                          */
 /* ======================================================================== */
 
+/* Bench SDU dump: test signal -> one UP-sweep; otherwise 30 s of phone audio
+ * starting 1 s after A2DP streaming starts. 0 = off. */
+#ifndef AURA_SDU_DUMP
+#define AURA_SDU_DUMP 0
+#endif
+#if AURA_SDU_DUMP
+/* Bench: record the left SDUs of one whole UP-sweep (made at 48 kHz) and
+ * print them afterwards from a low-priority task as
+ * "LC3F <n> 0 0 <len> <base64>" (the s31-auracast-rx capture format). */
+#define DUMP_FRAMES (S31_TEST_SIGNAL ? 900 : 3000)
+static uint8_t *s_dump;
+static volatile int s_dump_n, s_dump_state;   /* 0 wait, 1 recording, 2 printing, 3 done */
+static TaskHandle_t s_dump_task;
+
+static void b64(const uint8_t *in, int n, char *out)
+{
+    static const char t[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    int o = 0;
+    for (int i = 0; i < n; i += 3) {
+        uint32_t v = (uint32_t)in[i] << 16 | (i + 1 < n ? (uint32_t)in[i + 1] << 8 : 0) | (i + 2 < n ? in[i + 2] : 0);
+        out[o++] = t[(v >> 18) & 63];
+        out[o++] = t[(v >> 12) & 63];
+        out[o++] = i + 1 < n ? t[(v >> 6) & 63] : '=';
+        out[o++] = i + 2 < n ? t[v & 63] : '=';
+    }
+    out[o] = 0;
+}
+
+static void dump_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    ESP_LOGW(TAG, "DUMP: %d frames follow", s_dump_n);
+    vTaskDelay(pdMS_TO_TICKS(50));
+    static char line[AURA_SDU * 4 / 3 + 8];
+    for (int i = 0; i < s_dump_n; i++) {
+        b64(s_dump + i * AURA_SDU, AURA_SDU, line);
+        printf("LC3F %d 0 0 %d %s\n", i, AURA_SDU, line);
+        if ((i & 3) == 3) {
+            vTaskDelay(1);
+        }
+    }
+    ESP_LOGW(TAG, "DUMP: end");
+    s_dump_state = 3;                             /* re-armed when the phone stream stops */
+    }
+}
+
+static void dump_frame(const uint8_t *sdu)
+{
+#if !S31_TEST_SIGNAL
+    static int streamed;
+    if (s_dump_state == 3 && !a2dp_in_streaming()) {
+        s_dump_n = 0;
+        s_dump_state = 0;
+    }
+    if (s_dump == NULL || s_dump_state >= 2) {
+        return;
+    }
+    streamed = a2dp_in_streaming() ? streamed + 1 : 0;
+    if (s_dump_state == 0 && streamed >= 100) {
+        s_dump_state = 1;
+        ESP_LOGW(TAG, "DUMP: recording %d frames of phone audio", DUMP_FRAMES);
+    }
+    if (s_dump_state == 1) {
+        memcpy(s_dump + s_dump_n * AURA_SDU, sdu, AURA_SDU);
+        if (++s_dump_n >= DUMP_FRAMES) {
+            s_dump_state = 2;
+            xTaskNotifyGive(s_dump_task);
+        }
+    }
+    return;
+#endif
+    static int prev = -1;
+    int ph = a2dp_in_test_phase();
+    if (s_dump_state == 0 && ph == 0 && prev == 3 && s_dump != NULL) {
+        s_dump_state = 1;                         /* second cycle onward: start of an UP-sweep */
+    }
+    prev = ph;
+    if (s_dump_state == 1) {
+        if (ph == 0 && s_dump_n < DUMP_FRAMES) {
+            memcpy(s_dump + s_dump_n * AURA_SDU, sdu, AURA_SDU);
+            s_dump_n++;
+        } else if (ph != 0) {
+            s_dump_state = 2;
+            xTaskNotifyGive(s_dump_task);
+        }
+    }
+}
+#endif
+
 static void enc_produce(sdu_pair_t *slot)
 {
     if (a2dp_in_read(s_pcm, AURA_FRAME_SAMPLES) < AURA_FRAME_SAMPLES && a2dp_in_streaming()) {
         st_pcm_underruns++;
     }
-    if (v5_eq_process != NULL) {
+    if (!S31_TEST_SIGNAL && v5_eq_process != NULL) {
         v5_eq_process(s_pcm, AURA_FRAME_SAMPLES);
     }
     int64_t t0 = esp_timer_get_time();
@@ -385,6 +491,9 @@ static void enc_produce(sdu_pair_t *slot)
             memcpy(slot->sdu[ch], s_silence, AURA_SDU);
         }
     }
+#if AURA_SDU_DUMP
+    dump_frame(slot->sdu[0]);
+#endif
     uint32_t us = (uint32_t)(esp_timer_get_time() - t0);
     st_enc_us_sum += us;
     st_enc_frames++;
@@ -642,6 +751,15 @@ static void on_hci_completed(const uint8_t *packet, uint16_t size)
     }
 }
 
+/* completion timing on BIS 0 (controller task writes, stats reads) */
+static volatile uint32_t ct_long_total;
+static volatile uint32_t sk_gap, sk_comp, sk_ntx, sk_cnt, sk_seq, sk_ts, sk_free, sk_infl;
+static volatile bool sk_new;
+static volatile uint32_t ct_n, ct_pkts, ct_gap_min = UINT32_MAX, ct_gap_max, ct_long, ct_cb_multi;
+static volatile uint64_t ct_gap_sum;
+static int64_t ct_last;
+static volatile uint32_t al_seq[AURA_NUM_BIS], al_ts[AURA_NUM_BIS], al_ref[AURA_NUM_BIS], al_cnt[AURA_NUM_BIS], al_pk[AURA_NUM_BIS];
+
 /* Controller task: vendor TX completion (non-standard flow control). Only
  * counts and wakes the BT thread; no locks held by the controller are taken. */
 static void ctl_tx_comp_cb(uint16_t conn_handle, void *info, size_t size)
@@ -652,6 +770,38 @@ static void ctl_tx_comp_cb(uint16_t conn_handle, void *info, size_t size)
     const ctl_iso_tx_info_t *ti = (const ctl_iso_tx_info_t *)info;
     for (int i = 0; i < AURA_NUM_BIS; i++) {
         if (conn_handle == s_bis_ctl[i]) {
+            if (ti->pkt_cnt > 0) {
+                al_seq[i] = ti->pkt[0].seq_num;
+                al_ts[i] = ti->pkt[0].tx_time_stamp;
+                al_ref[i] = ti->pkt[0].sdu_ref_time;
+                al_pk[i] = ti->pkt_cnt;
+                al_cnt[i]++;
+            }
+            if (i == 0) {
+                int64_t now = esp_timer_get_time();
+                if (ct_last != 0) {
+                    uint32_t g = (uint32_t)(now - ct_last);
+                    if (g > 1000) {                /* a new BIG event (not a 2nd callback of the same one) */
+                        ct_n++;
+                        ct_gap_sum += g;
+                        if (g < ct_gap_min) ct_gap_min = g;
+                        if (g > ct_gap_max) ct_gap_max = g;
+                        if (g > AURA_ISO_INTERVAL_MS * 1500) {
+                            ct_long++;
+                            ct_long_total++;
+                            sk_gap = g; sk_comp = ti->completed_pkts; sk_ntx = ti->not_txd_pkts;
+                            sk_cnt = ti->pkt_cnt; sk_seq = ti->pkt[0].seq_num; sk_ts = ti->pkt[0].tx_time_stamp;
+                            sk_free = r_ble_ll_iso_free_buf_num_get(s_bis_ctl[0]);
+                            sk_infl = s_sent[0] - s_done[0];
+                            sk_new = true;
+                        }
+                    } else {
+                        ct_cb_multi++;
+                    }
+                }
+                ct_last = now;
+                ct_pkts += ti->completed_pkts + ti->not_txd_pkts;
+            }
             __atomic_fetch_add(&s_comp_pending[i], (uint32_t)ti->completed_pkts + ti->not_txd_pkts,
                                __ATOMIC_RELEASE);
             st_not_txd += ti->not_txd_pkts;
@@ -896,6 +1046,15 @@ static void on_big_created(const uint8_t *packet)
              AURA_BROADCAST_NAME, (unsigned)AURA_BROADCAST_ID, s_bis[0], s_bis[1],
              gap_subevent_big_created_get_iso_interval_1250us(packet) * 1250u);
     notify(AURACAST_STATE_ON, 0);
+#if S31_TEST_SIGNAL
+    s_exp = 0;
+    btstack_run_loop_remove_timer(&s_exp_timer);
+    btstack_run_loop_set_timer_handler(&s_exp_timer, exp_handler);
+#if AURA_EXP
+    btstack_run_loop_set_timer(&s_exp_timer, EXP_MS);
+    btstack_run_loop_add_timer(&s_exp_timer);
+#endif
+#endif
     if (!s_want_on) {
         begin_big_terminate();
     }
@@ -1042,6 +1201,10 @@ void auracast_setup(void)
     s_enc_task = xTaskCreateStaticPinnedToCore(enc_task, "lc3_enc", AURA_ENC_STACK, NULL, AURA_ENC_PRIO,
                                                s_enc_stack, &s_enc_tcb, 0);
     btstack_assert(s_enc_task != NULL);
+#if AURA_SDU_DUMP
+    s_dump = heap_caps_malloc(DUMP_FRAMES * AURA_SDU, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    xTaskCreatePinnedToCore(dump_task, "sdu_dump", 4096, NULL, 1, &s_dump_task, 0);
+#endif
 
     s_hci_reg.callback = &hci_handler;
     hci_add_event_handler(&s_hci_reg);
@@ -1058,6 +1221,29 @@ void auracast_on_hci_working(void)
     r_ble_ll_isoal_tx_comp_cb_set((void *)ctl_tx_comp_cb);   /* after the controller is up */
     bt_sched_tune_init();                         /* MASTER profile = idle: BIS above the ACL */
 }
+
+#if S31_TEST_SIGNAL
+/* Bench: 90 s each - 0 normal, 1 PA data frozen, 2 JBL beacon off,
+ * 3 Auracast ext adv (set 2) off; BIG skips counted per phase. */
+#include "jbl_beacon.h"
+static void exp_handler(btstack_timer_source_t *ts)
+{
+    static uint32_t last;
+    static const char *names[] = { "normal", "PA data frozen", "JBL beacon off", "Auracast ext adv off" };
+    uint32_t n = ct_long_total;
+    ESP_LOGW(TAG, "EXP result: '%s' -> %lu BIG skips in %d s", names[s_exp], (unsigned long)(n - last), EXP_MS / 1000);
+    last = n;
+    /* undo the old phase */
+    if (s_exp == 2) jbl_beacon_pause(false);
+    if (s_exp == 3) gap_extended_advertising_start(s_adv_handle, 0, 0);
+    s_exp = (s_exp + 1) & 3;
+    if (s_exp == 2) jbl_beacon_pause(true);
+    if (s_exp == 3) gap_extended_advertising_stop(s_adv_handle);
+    ESP_LOGW(TAG, "EXP start: '%s'", names[s_exp]);
+    btstack_run_loop_set_timer(ts, EXP_MS);
+    btstack_run_loop_add_timer(ts);
+}
+#endif
 
 int auracast_host_start(void)
 {
@@ -1148,6 +1334,30 @@ void auracast_log_stats(void)
              (unsigned long)(ur - l_ur), (unsigned long)(wd - l_wdog), (unsigned long)st_rq_full,
              s_enc_task ? (unsigned)uxTaskGetStackHighWaterMark(s_enc_task) : 0u);
 
+    {
+        uint32_t n = ct_n, mn = ct_gap_min, mx2 = ct_gap_max, lg = ct_long, mc = ct_cb_multi, pk = ct_pkts;
+        uint64_t sum = ct_gap_sum;
+        ct_n = 0; ct_gap_sum = 0; ct_gap_min = UINT32_MAX; ct_gap_max = 0; ct_long = 0; ct_cb_multi = 0; ct_pkts = 0;
+        ESP_LOGW(TAG, "BIG timing (BIS0 completions): %lu events, gap avg %lu.%03lu ms min %lu us max %lu us, >1.5 itvl %lu, same-event cbs %lu, SDUs %lu (%lu.%02lu per event)",
+                 (unsigned long)n, (unsigned long)(n ? sum / n / 1000 : 0), (unsigned long)(n ? (sum / n) % 1000 : 0),
+                 (unsigned long)(n ? mn : 0), (unsigned long)mx2, (unsigned long)lg, (unsigned long)mc, (unsigned long)pk,
+                 (unsigned long)(n ? pk / n : 0), (unsigned long)(n ? (pk * 100 / n) % 100 : 0));
+    }
+    if (sk_new) {
+        sk_new = false;
+        ESP_LOGW(TAG, "SKIP: gap %lu us, then completed %lu not_txd %lu (pkt_cnt %lu, seq %lu tx %lu) | ctrl free %lu, host in flight %lu",
+                 (unsigned long)sk_gap, (unsigned long)sk_comp, (unsigned long)sk_ntx, (unsigned long)sk_cnt,
+                 (unsigned long)sk_seq, (unsigned long)sk_ts, (unsigned long)sk_free, (unsigned long)sk_infl);
+    }
+    {
+        uint32_t s0 = al_seq[0], t0 = al_ts[0], r0 = al_ref[0], s1 = al_seq[1], t1 = al_ts[1], r1 = al_ref[1];
+        /* L/R alignment: tx time of BIS1 minus BIS0, normalised to the same SDU (10 ms per seq) */
+        int32_t off = (int32_t)(t1 - t0) - (int32_t)(int16_t)(uint16_t)(s1 - s0) * AURA_FRAME_US;
+        int32_t roff = (int32_t)(r1 - r0) - (int32_t)(int16_t)(uint16_t)(s1 - s0) * AURA_FRAME_US;
+        ESP_LOGW(TAG, "L/R align: BIS0 seq %lu tx %lu ref %lu | BIS1 seq %lu tx %lu ref %lu | tx offset %ld us, ref offset %ld us (pkt_cnt %lu/%lu)",
+                 (unsigned long)s0, (unsigned long)t0, (unsigned long)r0, (unsigned long)s1, (unsigned long)t1, (unsigned long)r1,
+                 (long)off, (long)roff, (unsigned long)al_pk[0], (unsigned long)al_pk[1]);
+    }
     l_sent[0] = sent0; l_sent[1] = sent1; l_done[0] = done0; l_done[1] = done1;
     l_not_sent = ns; l_not_txd = ntx; l_late = late; l_trim = trim; l_ur = ur; l_wdog = wd; l_frames = fr; l_us = us;
 }
