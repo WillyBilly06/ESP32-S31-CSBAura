@@ -919,7 +919,14 @@ void lc3_spec_encode(lc3_bits_t *bits,
     bool lsb_mode = side->lsb_mode;
     int nq = side->nq;
 
+#if LC3_ENCODER_JBL_NF
+    /* The real JBL Xtreme 5 encoder sends noise factor 1 on every frame
+     * (captured broadcast, 2026-11-22); match it for its decoder. */
+    (void)estimate_noise;
+    put_noise_factor(bits, 1);
+#else
     put_noise_factor(bits, estimate_noise(dt, bw, lc3_hr(sr), x, nq));
+#endif
 
     put_quantized(bits, dt, sr, nbytes, x, nq, lsb_mode);
 

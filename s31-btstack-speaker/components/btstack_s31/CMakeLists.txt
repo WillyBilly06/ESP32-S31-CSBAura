@@ -32,6 +32,7 @@ set(core_srcs
     ${B}/src/hci_cmd.c
     ${B}/src/hci_dump.c
     ${B}/src/hci_event.c
+    ${B}/src/hci_event_builder.c
     ${B}/src/l2cap.c
     ${B}/src/l2cap_signaling.c
 )
@@ -93,3 +94,11 @@ idf_component_register(
 # third-party code: keep its warnings out of -Werror
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-error -Wno-unused-variable -Wno-unused-but-set-variable
                        -Wno-unused-function -Wno-format -Wno-implicit-fallthrough -O2)
+
+# BTstack's micro-ecc (single-curve API) next to the IDF bt component's own
+# micro-ecc (multi-curve API, other word size): rename ours inside this
+# component so neither the linker nor BTstack's SM can pick the wrong one.
+foreach(f compress compute_public_key decompress make_key set_rng shared_secret sign
+          sign_deterministic valid_public_key verify bytes curve)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE "uECC_${f}=btstack_uECC_${f}")
+endforeach()

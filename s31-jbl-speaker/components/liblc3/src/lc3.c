@@ -303,12 +303,15 @@ static void analyze(struct lc3_encoder *encoder,
 
     side->pitch_present =
         lc3_ltpf_analyse(dt, sr_pcm, &encoder->ltpf, xt, &side->ltpf);
-#if LC3_ENCODER_NO_LTPF
+#if LC3_ENCODER_NO_LTPF && !LC3_ENCODER_JBL_PITCH
     /* Send no pitch/LTPF data at all (not just "inactive"): some decoders may
      * run their postfilter whenever pitch data is present. Analysis still runs
      * so the encoder's LTPF state stays as upstream expects. */
     side->pitch_present = false;
 #endif
+/* LC3_ENCODER_JBL_PITCH: like the real Xtreme 5 encoder, send the pitch data
+ * the detector finds (80 % of music frames) but never activate LTPF (the
+ * NO_LTPF block below still forces active = 0). */
 
     memmove(xt - nt, xt + (ns-nt), nt * sizeof(*xt));
 

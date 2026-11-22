@@ -27,6 +27,7 @@
 
 #include "a2dp_in.h"
 #include "auracast.h"
+#include "jbl.h"
 
 static const char *TAG = "S31";
 /* #define S31_HCI_DUMP 1   bring-up: print every HCI packet */
@@ -57,6 +58,8 @@ static void stats_task(void *arg)
         vTaskDelayUntil(&last, pdMS_TO_TICKS(2000));
         a2dp_in_log_stats();
         auracast_log_stats();
+        jbl_set_streaming(a2dp_in_streaming());
+        jbl_log_stats();
         log_heap();
     }
 }
@@ -74,6 +77,7 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
         ESP_LOGW(TAG, "BTstack up: '%s' at %s (BR/EDR A2DP sink, LE)", LOCAL_NAME, bd_addr_to_str(a));
         a2dp_in_on_hci_working();
         auracast_on_hci_working();
+        jbl_on_hci_working();
         auracast_host_start();
     }
 }
@@ -99,6 +103,7 @@ static void btstack_task(void *arg)
     gap_set_local_name(LOCAL_NAME);
     a2dp_in_setup();
     auracast_setup();
+    jbl_setup();
 
     hci_power_control(HCI_POWER_ON);
     btstack_run_loop_execute();                 /* never returns */

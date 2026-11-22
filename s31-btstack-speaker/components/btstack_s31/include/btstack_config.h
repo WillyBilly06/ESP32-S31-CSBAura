@@ -30,6 +30,9 @@
 #define ENABLE_LE_PERIPHERAL
 #define ENABLE_LE_CENTRAL
 #define ENABLE_LE_SECURE_CONNECTIONS
+/* P-256 in software (the S31 controller has no HCI P-256 commands): BTstack's
+ * micro-ecc, compiled with its public symbols renamed (see the component's
+ * CMakeLists) because the IDF bt component links its own, ABI-incompatible copy. */
 #define ENABLE_MICRO_ECC_FOR_LE_SECURE_CONNECTIONS
 #define ENABLE_LE_DATA_LENGTH_EXTENSION
 #define ENABLE_LE_EXTENDED_ADVERTISING

@@ -1,0 +1,46 @@
+// JBL-speaker GATT database for the S31 (BTstack port of the Bluedroid build's
+// jbl_gatt.c), served on LE and on BR/EDR (ATT over L2CAP PSM 0x1F).
+//
+// Regenerate jbl_gatt_db.h after editing (from s31-btstack-speaker/main):
+//   python ../../third_party/btstack/tool/compile_gatt.py jbl.gatt jbl_gatt_db.h
+// (the Database Hash needs PyCryptodome or an `openssl` with CMAC on PATH;
+//  Git-for-Windows' openssl works). The generated header is committed, so the
+// firmware build does not run the tool.
+//
+// Service order as in the Bluedroid build: GATT, GAP, excelpoint.cnl,
+// excelpoint.com, Device Information. Bluedroid placed its app services from
+// handle 0x0028 (cnl 0x0028-0x002d, com 0x002e-0x0033, DIS 0x0034-0x003a);
+// BTstack numbers handles contiguously from 0x0001, so the absolute numbers
+// differ while the per-service layout (decl / value / CCCD / decl / value) is
+// identical.
+
+// ---- Generic Attribute: Service Changed (+ Database Hash for robust caching)
+PRIMARY_SERVICE, GATT_SERVICE
+CHARACTERISTIC, GATT_SERVICE_CHANGED, INDICATE | DYNAMIC,
+CHARACTERISTIC, GATT_DATABASE_HASH, READ,
+
+// ---- GAP
+PRIMARY_SERVICE, GAP_SERVICE
+CHARACTERISTIC, GAP_DEVICE_NAME, READ, "S31 JBL Xtreme 5"
+// Appearance 0x0885 (Audio Sink: speaker)
+CHARACTERISTIC, GAP_APPEARANCE, READ, 85 08
+
+// ---- "excelpoint.cnl" 65786365-6c70-6f69-6e74-2e636e6c0000 (copied from the Xtreme 5)
+PRIMARY_SERVICE, 65786365-6c70-6f69-6e74-2e636e6c0000
+//   ...0001 speaker -> peer (read + notify); Bluedroid served one 0x00 byte
+CHARACTERISTIC, 65786365-6c70-6f69-6e74-2e636e6c0001, READ | NOTIFY, 00
+//   ...0002 peer -> speaker (write, write without response)
+CHARACTERISTIC, 65786365-6c70-6f69-6e74-2e636e6c0002, WRITE | WRITE_WITHOUT_RESPONSE | DYNAMIC,
+
+// ---- "excelpoint.com" 65786365-6c70-6f69-6e74-2e636f6d0000: JBL V5 control channel
+PRIMARY_SERVICE, 65786365-6c70-6f69-6e74-2e636f6d0000
+//   ...0001 V5 replies / notifications to the JBL One app
+CHARACTERISTIC, 65786365-6c70-6f69-6e74-2e636f6d0001, READ | NOTIFY, 00
+//   ...0002 V5 commands from the app (long frames arrive as prepared writes)
+CHARACTERISTIC, 65786365-6c70-6f69-6e74-2e636f6d0002, WRITE | WRITE_WITHOUT_RESPONSE | DYNAMIC,
+
+// ---- Device Information
+PRIMARY_SERVICE, ORG_BLUETOOTH_SERVICE_DEVICE_INFORMATION
+CHARACTERISTIC, ORG_BLUETOOTH_CHARACTERISTIC_MANUFACTURER_NAME_STRING, READ, "HARMAN"
+CHARACTERISTIC, ORG_BLUETOOTH_CHARACTERISTIC_MODEL_NUMBER_STRING, READ, "JBL Xtreme 5"
+CHARACTERISTIC, ORG_BLUETOOTH_CHARACTERISTIC_FIRMWARE_REVISION_STRING, READ, "S31-1.0"
