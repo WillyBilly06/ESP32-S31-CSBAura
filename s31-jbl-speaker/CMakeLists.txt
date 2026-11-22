@@ -31,6 +31,12 @@ idf_build_set_property(COMPILE_DEFINITIONS "BTM_NO_ROLE_SWITCH=1" APPEND)
 # No sniff mode on BR/EDR (idf-patches/0007): sniff anchors phase-lock to the
 # 20 ms BIG and get starved -> supervision timeouts ~8 s after connect.
 idf_build_set_property(COMPILE_DEFINITIONS "BTM_NO_SNIFF_MODE=1" APPEND)
+# Core layout: Bluetooth (controller, Bluedroid, hciT, iso_task) on core 1,
+# all audio DSP (SBC decode + resampler, LC3 encode, LC3 decode) on core 0.
+# A2DP_DECODER is hard-pinned in btc_a2dp_sink.c; these override it. SBC only,
+# so 12 KB of stack instead of the 20 KB sized for libopus.
+idf_build_set_property(COMPILE_DEFINITIONS "A2DP_TASK_PINNED_TO_CORE=0" APPEND)
+idf_build_set_property(COMPILE_DEFINITIONS "A2DP_TASK_STACK_SIZE=12288" APPEND)
 # A2DP media MTU 675 = 2-DH5 payload (679) - L2CAP header (4): at bitpool 53
 # the phone packs 5 SBC frames (~608 B) per packet, so every media packet is
 # ONE baseband exchange that fits between BIG events (1008 needed two).

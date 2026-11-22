@@ -717,7 +717,7 @@ static void i2s_out(const int16_t *l, const int16_t *r, int fs)
  * analysis of a real JBL encoder (tools/lc3_dump_analyze.py). One line per
  * SDU: "LC3F <n> <len> <base64>" (len 0 = lost). ~16 KB/s of text at 921600. */
 #ifndef PARTY_LC3_DUMP
-#define PARTY_LC3_DUMP 1
+#define PARTY_LC3_DUMP 0   /* debug only: ~16 KB/s of UART text busy-waits CPU 1 */
 #endif
 #if PARTY_LC3_DUMP
 static void dump_frame(const sdu_t *it)
@@ -751,6 +751,11 @@ static void decode_task(void *arg)
         if (xQueueReceive(s_sdu_q, &it, pdMS_TO_TICKS(200)) != pdTRUE) {
             have[0] = have[1] = false;
             continue;
+        }
+        /* Behind (more than 4 SDUs = 40 ms queued): drop the oldest so the
+         * decoder never runs flat out and starves the idle task. */
+        while (uxQueueMessagesWaiting(s_sdu_q) > 4 && xQueueReceive(s_sdu_q, &it, 0) == pdTRUE) {
+            s_st.qdrops++;
         }
         xSemaphoreTake(s_dec_lock, portMAX_DELAY);
         struct sink_stream *ss = &s_snk[it.idx];
@@ -811,8 +816,13 @@ static bool rx_resources_init(void)
     if (s_sdu_q == NULL) {
         s_sdu_q = xQueueCreate(SDU_Q_LEN, sizeof(sdu_t));
     }
+    /* Static internal stack: created late, a heap stack landed in RTC RAM
+     * once internal RAM was short, and the decoder starved IDLE1 (task WDT). */
+    static StackType_t s_dec_stack[8192 / sizeof(StackType_t)];
+    static StaticTask_t s_dec_tcb;
     if (s_sdu_q == NULL ||
-        xTaskCreatePinnedToCore(decode_task, "lc3_dec", 8192, NULL, configMAX_PRIORITIES - 7, NULL, 1) != pdPASS) {
+        xTaskCreateStaticPinnedToCore(decode_task, "lc3_dec", sizeof(s_dec_stack) / sizeof(StackType_t), NULL,
+                                      configMAX_PRIORITIES - 8, s_dec_stack, &s_dec_tcb, 0) == NULL) {   /* core 0: DSP */
         ESP_LOGE(PTAG, "no memory for the LISTEN audio path");
         return false;
     }

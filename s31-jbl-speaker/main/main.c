@@ -222,7 +222,7 @@ static const uint8_t jbl_beacon_addr[6] = { 0xC4, 0x58, 0x34, 0x53, 0x31, 0x04 }
 /* Garble isolation: while the phone is paused, play S31-generated sweeps
  * (A: 48 kHz direct, B: 44.1 kHz through the resampler), no SBC. */
 #ifndef SWEEP_TEST
-#define SWEEP_TEST             1
+#define SWEEP_TEST             0
 #endif
 /* A/B test for the garble: record the last REPLAY_SECONDS of phone music (as
  * encoded) into PSRAM; when the phone pauses, loop it over Auracast while the
@@ -283,7 +283,7 @@ static volatile uint32_t g_enc_us_sum, g_enc_us_max, g_enc_n;
 /* LC3 loopback check (left channel): decode every encoded frame on the S31
  * and compare with the delayed input -> proves/disproves encoder bitstream
  * problems independently of the radio and the speaker. */
-#define LC3_LOOPBACK 1
+#define LC3_LOOPBACK 0
 static lc3_decoder_t g_lb_dec;
 static int g_lb_delay;
 static int16_t g_lb_hist[480 + 512];
@@ -340,6 +340,7 @@ static struct broadcast_source_stream {
     example_audio_tx_scheduler_t scheduler;
     uint32_t sent;                      /* SDUs handed to the host (lc3_enc task) */
     volatile uint32_t done;             /* completed + not-transmitted (iso_task, sent cb) */
+    volatile bool up;                   /* ISO stream started and not stopping: sends allowed */
 } streams[STREAM_COUNT];
 
 static uint32_t g_tx_fail_run;          /* consecutive refused sends (lc3_enc task only) */
@@ -400,6 +401,7 @@ static void stream_started_cb(esp_ble_audio_bap_stream_t *stream)
 
     source_stream->seq_num = 0;
     source_stream->sent = 0;
+    source_stream->up = true;
     __atomic_store_n(&source_stream->done, 0, __ATOMIC_RELEASE);
     g_tx_fail_run = g_tx_backoff = g_tx_blocked = 0;
     /* Stream 0 paces BOTH channels. */
@@ -430,6 +432,7 @@ static void stream_stopped_cb(esp_ble_audio_bap_stream_t *stream, uint8_t reason
                                                                  struct broadcast_source_stream,
                                                                  stream);
     ESP_LOGI(TAG, "[SRC #%d] Stream stopped, reason 0x%02x", stream_index(stream), reason);
+    source_stream->up = false;
     if (stream_index(stream) == 0) {
         g_iso_paced = false;
         xQueueReset(g_encode_sem);
@@ -443,6 +446,7 @@ static void stream_disconnected_cb(esp_ble_audio_bap_stream_t *stream, uint8_t r
                                                                  struct broadcast_source_stream,
                                                                  stream);
     ESP_LOGI(TAG, "[SRC #%d] ISO disconnected, reason 0x%02x", stream_index(stream), reason);
+    source_stream->up = false;
     if (stream_index(stream) == 0) {
         g_iso_paced = false;
         xQueueReset(g_encode_sem);
@@ -741,6 +745,11 @@ static void broadcast_source_tx(void)
             }
         }
 #endif
+        /* Only into a running stream: before 'started' and while host_stop()
+         * tears the BIG down the stack refuses with ChanNotConn. */
+        if (!s->up) {
+            continue;
+        }
         /* One attempt per SDU, never retried: a late SDU is worthless, and the
          * host copies s->data, so the buffer is free again on return. */
         if (esp_ble_audio_bap_stream_send(&s->stream, s->data, opf, streams[0].seq_num) != 0) {
@@ -1077,6 +1086,8 @@ static void pa_update_task(void *arg)
 /* HOST: broadcast advertising (ext + periodic on ADV_HANDLE) and the BAP
  * broadcast source (BIG). Called at boot and by the party role on every
  * LISTEN -> HOST switch; the source object itself is created once. */
+#define BIG_CREATE_MIN_FREE   (8 * 1024)
+#define BIG_CREATE_MIN_BLOCK  (2 * 1024)
 static int host_start(void)
 {
     static bool adv_added;
@@ -1121,6 +1132,21 @@ static int host_start(void)
             goto end;
         }
     }
+    {
+        /* The controller builds the BIG from INTERNAL|DMA heap inside HCI LE
+         * Create BIG Test and asserts (reboot) when an allocation fails. Never
+         * send it without headroom; the party role retries every 2 s. */
+        const uint32_t dma = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT | MALLOC_CAP_DMA;
+        size_t fr = heap_caps_get_free_size(dma), lb = heap_caps_get_largest_free_block(dma);
+        ESP_LOGW(TAG, "BIG create: internal DMA free %u KB, largest block %u KB",
+                 (unsigned)(fr >> 10), (unsigned)(lb >> 10));
+        if (fr < BIG_CREATE_MIN_FREE || lb < BIG_CREATE_MIN_BLOCK) {
+            ESP_LOGE(TAG, "BIG create skipped: internal DMA RAM too low (need %u/%u B) - retry later",
+                     (unsigned)BIG_CREATE_MIN_FREE, (unsigned)BIG_CREATE_MIN_BLOCK);
+            err = -ENOMEM;
+            goto end;
+        }
+    }
     if (s_src_started_sem != NULL) {
         xSemaphoreTake(s_src_started_sem, 0);
     }
@@ -1155,6 +1181,9 @@ static int host_stop(void)
 {
     int ret = 0;
 
+    for (size_t i = 0; i < ARRAY_SIZE(streams); i++) {
+        streams[i].up = false;          /* no more sends into a BIG being terminated */
+    }
     if (s_src_stopped_sem != NULL) {
         xSemaphoreTake(s_src_stopped_sem, 0);
     }
@@ -1363,6 +1392,18 @@ static esp_err_t tone_lc3_init(void)
  * drift-compensated scheduler via the semaphore. */
 /* 2 s stats, printed from its own low-priority task so UART logging never
  * delays an LC3 encode tick (the encoder must hand an SDU over every 10 ms). */
+extern void btc_a2dp_sink_stack_stats(uint32_t *total, uint32_t *free_min);
+
+static void log_heap(void)
+{
+    const uint32_t dma = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT | MALLOC_CAP_DMA;
+    ESP_LOGW(TAG, "HEAP 2s: internal DMA free %u KB (largest block %u KB, lowest ever %u KB) | PSRAM free %u KB",
+             (unsigned)(heap_caps_get_free_size(dma) >> 10),
+             (unsigned)(heap_caps_get_largest_free_block(dma) >> 10),
+             (unsigned)(heap_caps_get_minimum_free_size(dma) >> 10),
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) >> 10));
+}
+
 static void stats_task(void *arg)
 {
     TickType_t last = xTaskGetTickCount();
@@ -1374,6 +1415,7 @@ static void stats_task(void *arg)
         if (!party_role_is_hosting()) {
             /* party LISTEN: no broadcast of our own; show the sink side */
             party_role_log_stats();
+            log_heap();
             last_sent = g_frames_sent;
             g_iso_done = g_iso_not_txd = g_iso_drift = g_late_ticks = g_max_gap_us = 0;
             g_enc_us_sum = g_enc_us_max = g_enc_n = 0;
@@ -1399,7 +1441,10 @@ static void stats_task(void *arg)
                  (unsigned long)g_iso_backlog_drops, (unsigned long)g_send_backoffs,
                  (unsigned long)g_tick_skips, (unsigned long)g_iso_wdog_ticks);
         if (a2dp_bridge_streaming()) {
-            ESP_LOGW(TAG, "SBC 2s: clock corr %ld ppm | bitpool now %u (min %u, max %u), media pkts %lu, lost pkts %lu",
+            uint32_t stk_total = 0, stk_free = 0;
+            btc_a2dp_sink_stack_stats(&stk_total, &stk_free);
+            ESP_LOGW(TAG, "SBC 2s: A2DP_DECODER stack %lu B, min free %lu B | clock corr %ld ppm | bitpool now %u (min %u, max %u), media pkts %lu, lost pkts %lu",
+                     (unsigned long)stk_total, (unsigned long)stk_free,
                      (long)a2dp_bridge_clock_ppm(),
                      btc_a2dp_sink_bitpool_last,
                      btc_a2dp_sink_bitpool_min == 0xFF ? 0 : btc_a2dp_sink_bitpool_min,
@@ -1431,6 +1476,7 @@ static void stats_task(void *arg)
                      (unsigned long)g_q_raw[0], (unsigned long)g_q_raw[1], (unsigned long)g_q_raw[2], (unsigned long)g_q_raw[3]);
             g_q_sum = g_q_max = g_q_n = g_ref_sum = g_ref_max = 0;
         }
+        log_heap();
         ESP_LOGW(TAG, "RADIO 2s: BIG anchor steps 0ms %lu / 20ms %lu / 40ms %lu / >40ms %lu, missed-event jumps %lu, "
                  "worst anchor step %lu us, worst tx step %lu us | completion cb worst gap %lu us, gaps>30ms %lu",
                  (unsigned long)g_ref_hist[0], (unsigned long)g_ref_hist[1], (unsigned long)g_ref_hist[2],
@@ -1486,6 +1532,15 @@ static void encode_task(void *arg)
     }
 }
 
+/* Internal RAM at each init step (all S31 internal RAM is DMA-capable, and the
+ * BT controller allocates BIG state from it): finds what eats it. */
+static void heap_mark(const char *step)
+{
+    ESP_LOGW(TAG, "HEAP @ %-22s internal free %u KB (largest %u KB)", step,
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) >> 10),
+             (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) >> 10));
+}
+
 void app_main(void)
 {
     esp_err_t err;
@@ -1497,18 +1552,21 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(err);
 
+    heap_mark("start");
     err = bt_dual_mode_init();             /* BLE (Auracast) + BR/EDR (phones) */
     if (err) {
         ESP_LOGE(TAG, "Failed to initialize Bluetooth, err %d", err);
         return;
     }
     a2dp_bridge_on_phone_name(on_phone_name);
+    heap_mark("bt_dual_mode_init");
     v5_server_start(JBL_BREDR_NAME);
     err = a2dp_bridge_start(JBL_BREDR_NAME);
     if (err) {
         ESP_LOGE(TAG, "Failed to start A2DP sink, err %d", err);
         return;
     }
+    heap_mark("a2dp_bridge_start");
     err = app_host_init();
     if (err) {
         ESP_LOGE(TAG, "Failed to init host, err %d", err);
@@ -1521,26 +1579,31 @@ void app_main(void)
     esp_ble_audio_init_info_t audio_info = {
         .gap_cb = party_role_iso_gap_cb,
     };
+    heap_mark("app_host_init");
     err = esp_ble_audio_common_init(&audio_info);
     if (err) {
         ESP_LOGE(TAG, "Failed to initialize audio, err %d", err);
         return;
     }
+    heap_mark("ble_audio_common_init");
     err = broadcast_source_setup();
     if (err) {
         return;
     }
     /* Broadcast sink side (party LISTEN): PACS sink cap, scan delegator, sink callbacks */
+    heap_mark("broadcast_source_setup");
     err = party_role_init();
     if (err) {
         ESP_LOGE(TAG, "Party role (sink side) init failed, err %d - LISTEN mode will not work", err);
     }
+    heap_mark("party_role_init");
     err = esp_ble_audio_common_start(NULL);
     if (err) {
         ESP_LOGE(TAG, "Failed to start audio, err %d", err);
         return;
     }
 
+    heap_mark("ble_audio_common_start");
     err = tone_lc3_init();
     if (err) {
         ESP_LOGE(TAG, "Failed to init LC3 encoders, err %d", err);
@@ -1560,11 +1623,12 @@ void app_main(void)
         ESP_LOGE(TAG, "Failed to create encode semaphore");
         return;
     }
-    /* Core 0 with the Bluedroid host + iso_task (CONFIG_BT_BLUEDROID_PINNED_TO_CORE_0):
-     * core 1 is left to A2DP_DECODER (SBC + resampler, hard-pinned to core 1 in
-     * btc_a2dp_sink.c). Prio 21 = below btdm (23), esp_timer/hciT (22), above
-     * BTU/iso_task (20), so the controller is never delayed and the iso_task
-     * k_work tick that gives g_encode_sem is followed at once by the encode. */
+    /* Core 0 = audio DSP core: LC3 encode (21) > A2DP_DECODER SBC + resampler
+     * (19, moved to core 0 via A2DP_TASK_PINNED_TO_CORE; 75 KB PCM ring of
+     * slack) > lc3_dec (17, party LISTEN). Core 1 = Bluetooth: controller (23),
+     * hciT (22), BTU/iso_task (20), BTC (19) and the light app control tasks.
+     * The iso_task completion that gives g_encode_sem wakes us cross-core. */
+    heap_mark("lc3 encoders");
     xTaskCreatePinnedToCore(encode_task, "lc3_enc", 12288, NULL,
                             configMAX_PRIORITIES - 4, NULL, 0);
     /* Cold tasks (log / adv-data housekeeping, never touch flash) get their
@@ -1574,12 +1638,14 @@ void app_main(void)
 
     s_src_started_sem = xSemaphoreCreateBinary();
     s_src_stopped_sem = xSemaphoreCreateBinary();
+    heap_mark("tasks");
     err = host_start();
     if (err) {
         ESP_LOGE(TAG, "Failed to start broadcast, err %d", err);
         return;
     }
 
+    heap_mark("host_start (BIG up)");
     err = jbl_beacon_start();
     if (err) {
         ESP_LOGE(TAG, "Failed to start JBL host beacon, err %d", err);
@@ -1591,6 +1657,7 @@ void app_main(void)
     ESP_LOGW(TAG, "JBL party block in periodic data: %s", JBL_PA_BLOCK ? "ON" : "OFF");
 
     /* No app needed: the S31 itself tells a nearby Xtreme 5 to join us. */
+    heap_mark("beacon + pa task");
     jbl_assistant_start(jbl_beacon_build(), LOCAL_BROADCAST_NAME);
 
     /* JBL Xtreme 5 party behaviour: HOST while the phone streams, otherwise
@@ -1602,4 +1669,5 @@ void app_main(void)
     a2dp_bridge_on_audio_state(party_role_on_audio_state);
     party_role_start(&s_party_ops, jbl_beacon_build(), true);
 #endif
+    heap_mark("party_role_start");
 }
