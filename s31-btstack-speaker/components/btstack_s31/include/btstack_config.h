@@ -19,7 +19,6 @@
 #define ENABLE_CLASSIC
 #define ENABLE_GATT_OVER_CLASSIC
 #define ENABLE_CROSS_TRANSPORT_KEY_DERIVATION
-#define ENABLE_AVDTP_ACCEPTOR_EXPLICIT_START_STREAM_CONFIRMATION
 #define NVM_NUM_LINK_KEYS 16
 /* one 2-DH5 (679 B payload) per A2DP media packet: at bitpool 53 the phone packs
  * 5 SBC frames (~608 B), and each media packet is ONE baseband exchange that fits

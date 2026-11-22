@@ -25,6 +25,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "nvs.h"
 
 #include "a2dp_dsp.h"
 
@@ -233,6 +234,14 @@ static void a2dp_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet,
         }
         s_a2dp_cid = a2dp_subevent_signaling_connection_established_get_a2dp_cid(packet);
         s_connected = true;
+        {   /* remember the phone: called back at power-up */
+            nvs_handle_t h;
+            if (nvs_open("s31", NVS_READWRITE, &h) == ESP_OK) {
+                nvs_set_blob(h, "last_phone", s_peer, 6);
+                nvs_commit(h);
+                nvs_close(h);
+            }
+        }
         hci_con_handle_t h = a2dp_subevent_signaling_connection_established_get_con_handle(packet);
         hci_role_t role = gap_get_role(h);
         ESP_LOGW(TAG, "A2DP connected %s, role %s", bd_addr_to_str(s_peer),
@@ -284,6 +293,14 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
         gap_pin_code_response(a, "0000");
         break;
     }
+    case HCI_EVENT_SIMPLE_PAIRING_COMPLETE:
+        ESP_LOGW(TAG, "pairing %s (status 0x%02x)",
+                 hci_event_simple_pairing_complete_get_status(packet) ? "FAILED" : "complete",
+                 hci_event_simple_pairing_complete_get_status(packet));
+        break;
+    case HCI_EVENT_AUTHENTICATION_COMPLETE:
+        ESP_LOGW(TAG, "authentication status 0x%02x", hci_event_authentication_complete_get_status(packet));
+        break;
     case HCI_EVENT_DISCONNECTION_COMPLETE:
         ESP_LOGW(TAG, "ACL disconnected, reason 0x%02x",
                  hci_event_disconnection_complete_get_reason(packet));
@@ -350,6 +367,9 @@ void a2dp_in_setup(void)
     gap_set_allow_role_switch(false);
     hci_set_master_slave_policy(HCI_ROLE_MASTER);
     gap_ssp_set_io_capability(SSP_IO_CAPABILITY_NO_INPUT_NO_OUTPUT);
+    /* Just Works like a speaker: BTstack's default leaves the phone's User
+     * Confirmation Request unanswered, so pairing timed out (reason 0x15). */
+    gap_ssp_set_auto_accept(1);
     gap_set_bondable_mode(1);
     gap_set_class_of_device(0x240414);            /* audio, loudspeaker */
     gap_discoverable_control(1);
@@ -359,6 +379,40 @@ void a2dp_in_setup(void)
     hci_add_event_handler(&s_hci_reg);
 }
 
+/* Power-up: call the last phone back (like a real speaker), twice at most. */
+static btstack_timer_source_t s_reconn_timer;
+static int s_reconn_tries;
+static bd_addr_t s_last_phone;
+
+static void reconnect_cb(btstack_timer_source_t *ts)
+{
+    (void)ts;
+    if (s_connected || s_reconn_tries >= 2) {
+        return;
+    }
+    s_reconn_tries++;
+    ESP_LOGW(TAG, "power-up: calling back last phone %s (try %d/2)", bd_addr_to_str(s_last_phone), s_reconn_tries);
+    uint8_t st = a2dp_sink_establish_stream(s_last_phone, &s_a2dp_cid);
+    if (st != ERROR_CODE_SUCCESS) {
+        ESP_LOGW(TAG, "a2dp_sink_establish_stream: 0x%02x", st);
+    }
+    btstack_run_loop_set_timer(&s_reconn_timer, 10000);
+    btstack_run_loop_add_timer(&s_reconn_timer);
+}
+
 void a2dp_in_on_hci_working(void)
 {
+    nvs_handle_t h;
+    size_t n = 6;
+    if (nvs_open("s31", NVS_READONLY, &h) != ESP_OK) {
+        return;
+    }
+    esp_err_t err = nvs_get_blob(h, "last_phone", s_last_phone, &n);
+    nvs_close(h);
+    if (err != ESP_OK || n != 6) {
+        return;
+    }
+    btstack_run_loop_set_timer_handler(&s_reconn_timer, reconnect_cb);
+    btstack_run_loop_set_timer(&s_reconn_timer, 2000);
+    btstack_run_loop_add_timer(&s_reconn_timer);
 }
