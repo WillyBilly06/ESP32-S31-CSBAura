@@ -1,0 +1,112 @@
+--- a/components/bt/host/bluedroid/stack/a2dp/a2d_sbc_decoder.c
++++ b/components/bt/host/bluedroid/stack/a2dp/a2d_sbc_decoder.c
+@@ -14,9 +14,26 @@
+ #include "oi_codec_sbc.h"
+ #include "oi_status.h"
+ #include "osi/future.h"
++#if defined(A2D_SBC_DECODE_BATCH) && A2D_SBC_DECODE_BATCH
++#include "esp_heap_caps.h"
++#endif
+ 
+ #if (defined(SBC_DEC_INCLUDED) && SBC_DEC_INCLUDED == TRUE)
+ 
++#if defined(A2D_SBC_DECODE_BATCH) && A2D_SBC_DECODE_BATCH
++/* local patch (s31-jbl-speaker, idf-patches/0006): decode every SBC frame of a
++ * media packet into one buffer and call decode_callback ONCE per packet instead
++ * of once per SBC frame (~345 calls/s at 44.1 kHz). The caller's SBC scratch
++ * (BT_A2DP_SINK_BUF_SBC, 1 KB) only holds 2 frames, so this keeps its own:
++ * an SBC media packet carries at most 15 frames (4-bit count) of at most
++ * 16 blocks x 8 subbands x 2 ch x 2 B = 512 B of PCM. */
++#define A2D_SBC_MAX_FRAME_PCM_BYTES   (16 * 8 * 2 * 2)
++#ifndef A2D_SBC_DECODE_BATCH_BYTES
++#define A2D_SBC_DECODE_BATCH_BYTES    (15 * A2D_SBC_MAX_FRAME_PCM_BYTES)
++#endif
++static unsigned char *s_sbc_batch_buf = NULL;
++#endif
++
+ typedef struct {
+   OI_CODEC_SBC_DECODER_CONTEXT decoder_context;
+   OI_UINT32 context_data[CODEC_DATA_WORDS(2, SBC_CODEC_FAST_FILTER_BUFFERS)];
+@@ -42,6 +59,20 @@ bool a2dp_sbc_decoder_init(decoded_data_callback_t decode_callback) {
+   s_sbc_cb->pcmStride = 2;
+   a2dp_sbc_decoder_reset();
+   s_sbc_cb->decode_callback = decode_callback;
++#if defined(A2D_SBC_DECODE_BATCH) && A2D_SBC_DECODE_BATCH
++  if (!s_sbc_batch_buf) {
++    /* internal RAM first (the decoder writes it), PSRAM as a fallback; if both
++     * fail, decode_packet batches into the caller's smaller buffer instead. */
++    s_sbc_batch_buf = heap_caps_malloc(A2D_SBC_DECODE_BATCH_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
++    if (!s_sbc_batch_buf) {
++      s_sbc_batch_buf = heap_caps_malloc(A2D_SBC_DECODE_BATCH_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
++    }
++    if (!s_sbc_batch_buf) {
++      LOG_WARN("%s: no %u B SBC batch buffer, batching into the caller's buffer", __func__,
++               (unsigned)A2D_SBC_DECODE_BATCH_BYTES);
++    }
++  }
++#endif
+   return true;
+ }
+ 
+@@ -50,6 +81,12 @@ void a2dp_sbc_decoder_cleanup(void) {
+     free(s_sbc_cb);
+     s_sbc_cb = NULL;
+   }
++#if defined(A2D_SBC_DECODE_BATCH) && A2D_SBC_DECODE_BATCH
++  if (s_sbc_batch_buf) {
++    heap_caps_free(s_sbc_batch_buf);
++    s_sbc_batch_buf = NULL;
++  }
++#endif
+ }
+ 
+ bool a2dp_sbc_decoder_reset() {
+@@ -201,6 +238,40 @@ bool a2dp_sbc_decoder_decode_packet(BT_HDR* p_buf, unsigned char* buf, size_t bu
+ 
+     APPL_TRACE_DEBUG("Number of sbc frames %d, frame_len %d\n", num_frames, src_len);
+ 
++#if defined(A2D_SBC_DECODE_BATCH) && A2D_SBC_DECODE_BATCH
++    {
++        unsigned char *out = s_sbc_batch_buf ? s_sbc_batch_buf : buf;
++        size_t out_len = s_sbc_batch_buf ? A2D_SBC_DECODE_BATCH_BYTES : buf_len;
++        size_t used = 0;
++
++        for (count = 0; count < num_frames && src_len != 0; count ++) {
++            if (used != 0 && out_len - used < A2D_SBC_MAX_FRAME_PCM_BYTES) {
++                /* no room for another frame: hand over what we have */
++                s_sbc_cb->decode_callback((uint8_t*)out, used);
++                used = 0;
++            }
++            written = out_len - used;
++            dst = (OI_INT16*)(out + used);
++            status = OI_CODEC_SBC_DecodeFrame(&s_sbc_cb->decoder_context,
++                                              (const OI_BYTE **)&src,
++                                              (OI_UINT32 *)&src_len,
++                                              (OI_INT16 *)dst,
++                                              (OI_UINT32 *)&written);
++            if (!OI_SUCCESS(status)) {
++                APPL_TRACE_ERROR("Decoding failure: %d\n", status);
++                /* frames decoded before the bad one still go out, as they did per frame */
++                if (used > 0) {
++                    s_sbc_cb->decode_callback((uint8_t*)out, used);
++                }
++                return false;
++            }
++            used += written;
++        }
++        if (used > 0) {
++            s_sbc_cb->decode_callback((uint8_t*)out, used);
++        }
++    }
++#else
+     for (count = 0; count < num_frames && src_len != 0; count ++) {
+         written = buf_len;  /* Reset available space each frame */
+         dst = (OI_INT16*)buf;  /* Reset output position to start of buffer */
+@@ -218,6 +289,7 @@ bool a2dp_sbc_decoder_decode_packet(BT_HDR* p_buf, unsigned char* buf, size_t bu
+             s_sbc_cb->decode_callback((uint8_t*)buf, written);
+         }
+     }
++#endif
+ 
+     p_buf->offset = p_buf->offset + p_buf->len - src_len;
+     p_buf->len = src_len;

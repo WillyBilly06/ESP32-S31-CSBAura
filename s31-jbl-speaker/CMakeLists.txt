@@ -16,4 +16,7 @@ idf_build_set_property(COMPILE_DEFINITIONS "BTC_A2DP_SINK_BITPOOL_STATS=1" APPEN
 # Pin the phone's SBC bitpool at 53 (idf-patches/0005; this IDF fork ignores
 # esp_a2d_sink_register_stream_endpoint, so the stack's own sink caps are used).
 idf_build_set_property(COMPILE_DEFINITIONS "A2D_SBC_SINK_MIN_BITPOOL=53" APPEND)
+# Decode all SBC frames of a media packet, then call the A2DP data callback
+# once per packet instead of once per SBC frame (idf-patches/0006).
+idf_build_set_property(COMPILE_DEFINITIONS "A2D_SBC_DECODE_BATCH=1" APPEND)
 project(s31_jbl_speaker)
