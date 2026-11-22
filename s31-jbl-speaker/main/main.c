@@ -1143,6 +1143,14 @@ end:
 /* Stop hosting: BIG terminate (waits for the source's stopped callback), then
  * the broadcast's periodic + extended advertising, and deletes the source
  * object to free its ISO channels; host_start() creates it again. */
+/* HOST_CYCLE_TEST: stop/start hosting every 8 s without the party role, to
+ * reproduce the controller assert on the second BIG create. Cycles alternate
+ * between deleting the source (as the party role needs) and keeping it. */
+#ifndef HOST_CYCLE_TEST
+#define HOST_CYCLE_TEST 0
+#endif
+static bool s_keep_source;
+
 static int host_stop(void)
 {
     int ret = 0;
@@ -1163,7 +1171,7 @@ static int host_stop(void)
     /* CONFIG_BT_ISO_MAX_CHAN is 2 (the host's static limit): a created source
      * keeps both ISO channels bound even when stopped, and the party sink's BIG
      * sync then fails with BapBsnkNoIsoAvail. Delete it; host_start() recreates. */
-    if (broadcast_source != NULL) {
+    if (broadcast_source != NULL && !s_keep_source) {
         esp_err_t derr = esp_ble_audio_bap_broadcast_source_delete(broadcast_source);
         if (derr == ESP_OK) {
             broadcast_source = NULL;
@@ -1176,6 +1184,38 @@ static int host_stop(void)
     return ret;
 }
 
+#if HOST_CYCLE_TEST == 2
+extern volatile bool a2dp_bridge_fake_streaming;
+/* party role on; fake phone audio 6 s on / 9 s off -> HOST, LISTEN (scanning), HOST ... */
+static void host_cycle_task(void *arg)
+{
+    for (int n = 1;; n++) {
+        vTaskDelay(pdMS_TO_TICKS(9000));
+        ESP_LOGW(TAG, "PARTY CYCLE %d: fake phone audio ON", n);
+        a2dp_bridge_fake_streaming = true;
+        party_role_on_audio_state(true);
+        vTaskDelay(pdMS_TO_TICKS(6000));
+        ESP_LOGW(TAG, "PARTY CYCLE %d: fake phone audio OFF", n);
+        a2dp_bridge_fake_streaming = false;
+        party_role_on_audio_state(false);
+    }
+}
+#elif HOST_CYCLE_TEST
+static void host_cycle_task(void *arg)
+{
+    for (int n = 1;; n++) {
+        vTaskDelay(pdMS_TO_TICKS(8000));
+        s_keep_source = (n & 1) == 0;
+        ESP_LOGW(TAG, "HOST CYCLE %d: stop (%s source)", n, s_keep_source ? "keep" : "delete");
+        int r = host_stop();
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        ESP_LOGW(TAG, "HOST CYCLE %d: start (stop ret %d)", n, r);
+        r = host_start();
+        ESP_LOGW(TAG, "HOST CYCLE %d: started, ret %d", n, r);
+    }
+}
+#endif
+
 static void jbl_beacon_set_party_info(uint16_t pi)
 {
     uint8_t adv[4 + sizeof(jbl_beacon_payload)];
@@ -1187,7 +1227,7 @@ static void jbl_beacon_set_party_info(uint16_t pi)
     }
 }
 
-static const party_role_ops_t s_party_ops = {
+static const party_role_ops_t s_party_ops __attribute__((unused)) = {
     .host_start = host_start,
     .host_stop = host_stop,
     .set_party_info = jbl_beacon_set_party_info,
@@ -1555,6 +1595,11 @@ void app_main(void)
 
     /* JBL Xtreme 5 party behaviour: HOST while the phone streams, otherwise
      * (after PARTY_HOLDOFF_MS) LISTEN to another JBL master's Auracast. */
+#if HOST_CYCLE_TEST
+    xTaskCreatePinnedToCore(host_cycle_task, "host_cycle", 4096, NULL, 4, NULL, 1);
+#endif
+#if HOST_CYCLE_TEST != 1
     a2dp_bridge_on_audio_state(party_role_on_audio_state);
     party_role_start(&s_party_ops, jbl_beacon_build(), true);
+#endif
 }

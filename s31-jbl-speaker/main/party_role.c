@@ -55,8 +55,13 @@
 #define PTAG                    "PARTY"
 
 /* ---- tuning ----------------------------------------------------------------- */
-#define SCAN_ITVL               160     /* 100 ms */
-#define SCAN_WIN                80      /* 50 ms: finds an 80 ms ext adv in ~1 s, leaves room for the phone ACL */
+#ifndef PARTY_HOST_SETTLE_MS
+#define PARTY_HOST_SETTLE_MS    300
+#endif
+#define SCAN_ITVL               240     /* 150 ms */
+#define SCAN_WIN                48      /* 30 ms (20 % duty). 50/100 ms starved BR/EDR paging: the
+                                         * phone's reconnects failed ("page recycle resched failed")
+                                         * and its A2DP link dropped while LISTEN scanned. */
 #define PA_SYNC_SKIP            0
 #define PA_SYNC_TIMEOUT_10MS    200     /* 2 s supervision */
 #define T_PA_SYNC_MS            5000    /* create sync -> established */
@@ -1224,6 +1229,11 @@ static void go_host(const char *why)
     set_role(ROLE_LISTEN_STOPPING, why);
     listen_teardown(true);                              /* also bumps s_gen */
     set_role(ROLE_HOST_STARTING, "left the other broadcast");
+    /* Twice the controller asserted (ble/56.o, inside HCI LE Create BIG Test)
+     * when the BIG was created within a few ms of the phone's AVDTP start and
+     * the LE scan stop; the same switch without the phone link never failed.
+     * Let the A2DP stream and the scan teardown settle first. */
+    vTaskDelay(pdMS_TO_TICKS(PARTY_HOST_SETTLE_MS));
     s_host_try_t = xTaskGetTickCount();
     int err = s_ops->host_start();
     s_host_up = (err == 0);

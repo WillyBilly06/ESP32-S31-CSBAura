@@ -254,9 +254,13 @@ void a2dp_bridge_discard(int frames)
     ring_skip(&s_ring, fill < (uint32_t)frames ? fill : (uint32_t)frames);
 }
 
+/* Test hook (main.c HOST_CYCLE_TEST 2): pretend phone audio is streaming so
+ * the party role's LISTEN -> HOST path can be exercised without a phone. */
+volatile bool a2dp_bridge_fake_streaming;
+
 bool a2dp_bridge_streaming(void)
 {
-    return s_streaming;
+    return s_streaming || a2dp_bridge_fake_streaming;
 }
 
 bool a2dp_bridge_connected(void)
