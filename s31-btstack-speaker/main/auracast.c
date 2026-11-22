@@ -133,7 +133,7 @@ static const uint8_t jbl_pa_mfg_ad[] = {
 /* A/B test: 0 = periodic data carries the BASE only (no JBL party block whose
  * NN/YY bytes we can only imitate; the real master's YY is not a timer). */
 #ifndef AURA_JBL_PA_BLOCK
-#define AURA_JBL_PA_BLOCK      0
+#define AURA_JBL_PA_BLOCK      1
 #endif
 #define JBL_PA_NN_OFFSET       10
 #define JBL_PA_YY_OFFSET       17

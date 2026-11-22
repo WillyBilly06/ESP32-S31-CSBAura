@@ -41,4 +41,7 @@ idf_build_set_property(COMPILE_DEFINITIONS "A2DP_TASK_STACK_SIZE=12288" APPEND)
 # the phone packs 5 SBC frames (~608 B) per packet, so every media packet is
 # ONE baseband exchange that fits between BIG events (1008 needed two).
 idf_build_set_property(COMPILE_DEFINITIONS "BTA_AV_MAX_A2DP_MTU=675" APPEND)
+# BT controller LP timer on the main crystal (IDF fork btdm_lp.c): the default
+# 136 kHz RC is not accurate enough for BIG/ISO timing.
+idf_build_set_property(COMPILE_DEFINITIONS "BTDM_LPCLK_FORCE_MAIN_XTAL=1" APPEND)
 project(s31_jbl_speaker)
