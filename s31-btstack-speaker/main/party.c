@@ -770,18 +770,20 @@ static void tick(btstack_timer_source_t *ts)
         if (s_role == R_LISTEN || s_role == R_LISTEN_STOPPING) {
             set_role(R_OFF, "Auracast turned off");
             listen_reset("Auracast off");
-            jbl_assist_set_paused(false);
         } else {
             auracast_host_stop();
             set_role(R_OFF, "Auracast turned off");
         }
-        jbl_set_party_info(JBL_PARTY_INFO_HOST);
+        jbl_assist_set_paused(true);                  /* no party: don't pull speakers in */
+        jbl_set_party_info(JBL_PARTY_INFO_OFF);
     }
     switch (s_role) {
     case R_OFF:
         if (s_enabled && auracast_state() == AURACAST_STATE_OFF) {
-            int rc = auracast_host_start();               /* back on: host first, as at power-up */
+            int rc = auracast_host_start();               /* back on: host first */
             s_idle_ms = 0;
+            jbl_assist_set_paused(false);
+            jbl_set_party_info(JBL_PARTY_INFO_HOST);
             set_role(R_HOST, rc == 0 ? "Auracast turned on" : "Auracast turned on (host start error)");
         }
         break;
