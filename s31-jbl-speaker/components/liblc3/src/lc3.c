@@ -313,8 +313,19 @@ static void analyze(struct lc3_encoder *encoder,
     lc3_mdct_forward(dt, sr_pcm, sr, xs, xd, xf);
 
     bool nn_flag = lc3_energy_compute(dt, sr, xf, e);
+#if LC3_ENCODER_NO_LTPF
+    /* s31-jbl-speaker: never signal the long-term postfilter. At 48 kHz with
+     * <= 109 B/frame every decoder applies a pitch comb filter when the
+     * encoder flags it; on tones/sweeps the pitch tracker wanders and the
+     * comb filter warbles ("garble"): 19-28 dB SNR vs 63-75 dB without, same
+     * 100 B frames, same BASE (bench/: pristine liblc3 sweep test). The pitch
+     * data is still sent, so decoder PLC keeps working. */
+    (void)nn_flag;
+    lc3_ltpf_disable(&side->ltpf);
+#else
     if (nn_flag)
         lc3_ltpf_disable(&side->ltpf);
+#endif
 
     side->bw = lc3_bwdet_run(dt, sr, e);
 

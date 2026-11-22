@@ -30,4 +30,7 @@ void a2dp_bridge_on_phone_name(void (*cb)(const char *name));
 /* current phone-vs-S31 audio clock correction (ppm) */
 int32_t a2dp_bridge_clock_ppm(void);
 
+/* sweep test: S31-generated sweeps A (48 kHz direct) / B (44.1 kHz via resampler) */
+void a2dp_bridge_test_sweep(int16_t *pcm, int frames);
+
 void a2dp_bridge_stats(uint32_t *underruns, uint32_t *drops, uint32_t *skips, uint32_t *fill_ms);

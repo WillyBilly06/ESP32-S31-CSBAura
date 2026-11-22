@@ -215,6 +215,11 @@ static const uint8_t jbl_beacon_addr[6] = { 0xC4, 0x58, 0x34, 0x53, 0x31, 0x04 }
 
 /* 0 = silence when no phone is streaming; 1 = test beeps. */
 #define TEST_TONE              0
+/* Garble isolation: while the phone is paused, play S31-generated sweeps
+ * (A: 48 kHz direct, B: 44.1 kHz through the resampler), no SBC. */
+#ifndef SWEEP_TEST
+#define SWEEP_TEST             1
+#endif
 /* A/B test for the garble: record the last REPLAY_SECONDS of phone music (as
  * encoded) into PSRAM; when the phone pauses, loop it over Auracast while the
  * Classic link is idle. Clean replay => BR/EDR coexistence breaks the BIG.
@@ -256,7 +261,16 @@ static volatile uint32_t g_q_sum, g_q_max, g_q_n, g_ref_sum, g_ref_max;
 static volatile uint32_t g_q_raw[4];
 static volatile uint32_t g_late_ticks;      /* encode ticks > 15 ms after the previous one */
 static volatile uint32_t g_max_gap_us;      /* worst gap between encode ticks */
-static volatile uint32_t g_enc_us_sum, g_enc_us_max, g_enc_n;   /* lc3_encode time, both channels */
+static volatile uint32_t g_enc_us_sum, g_enc_us_max, g_enc_n;
+/* LC3 loopback check (left channel): decode every encoded frame on the S31
+ * and compare with the delayed input -> proves/disproves encoder bitstream
+ * problems independently of the radio and the speaker. */
+#define LC3_LOOPBACK 1
+static lc3_decoder_t g_lb_dec;
+static int g_lb_delay;
+static int16_t g_lb_hist[480 + 512];
+static volatile uint32_t g_lb_frames, g_lb_dec_err, g_lb_bad;
+static volatile float g_lb_sig, g_lb_err, g_lb_worst = 999.0f;   /* lc3_encode time, both channels */
 static volatile uint32_t g_iso_backlog_drops; /* SDU pairs not handed over: too many already in flight */
 static volatile uint32_t g_send_backoffs;     /* SDU pairs not attempted: backing off after repeated send errors */
 static volatile uint32_t g_tick_skips;        /* encode ticks dropped because the encoder fell behind */
@@ -281,6 +295,16 @@ static volatile uint32_t g_tick_skips;        /* encode ticks dropped because th
  * after ISO_TX_INFLIGHT_MAX dropped frames with completions still arriving,
  * the estimate is clamped back to half the cap. */
 #define ISO_TX_INFLIGHT_MAX     8
+/* ISO-clocked pacing: the next SDU is encoded when the controller reports one
+ * sent, so the queue stays at a constant depth locked to the BIG's own clock
+ * (no CPU-timer drift, no double sends, no skipped ticks). ISO_TX_PREROLL SDUs
+ * are queued at stream start; if completions stop for ISO_TX_WDOG_MS the
+ * encoder falls back to its own 10 ms pace so audio never freezes. */
+#define ISO_CLOCKED_PACING      1
+#define ISO_TX_PREROLL          2
+#define ISO_TX_WDOG_MS          30
+static volatile bool g_iso_paced;              /* stream 0 started, completion pacing active */
+static volatile uint32_t g_iso_wdog_ticks;     /* encodes forced by the watchdog (no completions) */
 /* After this many consecutive refused sends, skip ISO_TX_BACKOFF_TICKS ticks
  * before trying again: the host logs every refusal (ChanNotConn, IsoTxNoMem)
  * on the UART, 200 lines/s would be a log storm on core 0. */
@@ -360,14 +384,25 @@ static void stream_started_cb(esp_ble_audio_bap_stream_t *stream)
     source_stream->sent = 0;
     __atomic_store_n(&source_stream->done, 0, __ATOMIC_RELEASE);
     g_tx_fail_run = g_tx_backoff = g_tx_blocked = 0;
-    /* Stream 0's drift-compensated scheduler paces BOTH channels. */
+    /* Stream 0 paces BOTH channels. */
     if (idx == 0) {
+#if ISO_CLOCKED_PACING
+        (void)err;
+        xQueueReset(g_encode_sem);                    /* drop stale ticks from a previous run */
+        g_iso_paced = true;
+        for (int i = 0; i < ISO_TX_PREROLL; i++) {
+            xSemaphoreGive(g_encode_sem);
+        }
+        ESP_LOGW(TAG, "[SRC #0] ISO-clocked TX pacing: pre-roll %d SDUs, then one encode per completed SDU",
+                 ISO_TX_PREROLL);
+#else
         example_audio_tx_scheduler_reset(&source_stream->scheduler);
         err = example_audio_tx_scheduler_start(&source_stream->scheduler,
                                                preset_active.qos.interval);
         if (err) {
             ESP_LOGE(TAG, "[SRC #%d] Scheduler start failed, err %d", idx, err);
         }
+#endif
     }
 }
 
@@ -377,6 +412,10 @@ static void stream_stopped_cb(esp_ble_audio_bap_stream_t *stream, uint8_t reason
                                                                  struct broadcast_source_stream,
                                                                  stream);
     ESP_LOGI(TAG, "[SRC #%d] Stream stopped, reason 0x%02x", stream_index(stream), reason);
+    if (stream_index(stream) == 0) {
+        g_iso_paced = false;
+        xQueueReset(g_encode_sem);
+    }
     example_audio_tx_scheduler_stop(&source_stream->scheduler);
 }
 
@@ -386,6 +425,10 @@ static void stream_disconnected_cb(esp_ble_audio_bap_stream_t *stream, uint8_t r
                                                                  struct broadcast_source_stream,
                                                                  stream);
     ESP_LOGI(TAG, "[SRC #%d] ISO disconnected, reason 0x%02x", stream_index(stream), reason);
+    if (stream_index(stream) == 0) {
+        g_iso_paced = false;
+        xQueueReset(g_encode_sem);
+    }
     example_audio_tx_scheduler_stop(&source_stream->scheduler);
 }
 
@@ -401,6 +444,14 @@ static void stream_sent_cb(esp_ble_audio_bap_stream_t *stream, void *user_data)
         __atomic_fetch_add(&source_stream->done, (uint32_t)info->completed_pkts + info->not_txd_pkts,
                            __ATOMIC_RELEASE);
     }
+#if ISO_CLOCKED_PACING
+    if (info != NULL && stream_index(stream) == 0 && g_iso_paced) {
+        uint32_t c = (uint32_t)info->completed_pkts + info->not_txd_pkts;
+        while (c--) {
+            xSemaphoreGive(g_encode_sem);             /* one SDU left the queue -> make the next */
+        }
+    }
+#endif
     if (info != NULL && stream_index(stream) == 0) {
         g_iso_done += info->completed_pkts;
         g_iso_not_txd += info->not_txd_pkts;
@@ -499,7 +550,9 @@ static void broadcast_source_tx(void)
     }
     /* Phone music over A2DP when it streams; otherwise silence (set
      * TEST_TONE 1 to get the 440/660 Hz beeps back for testing). */
-    if (a2dp_bridge_read(pcm, fs)) {
+    if (SWEEP_TEST && !a2dp_bridge_streaming()) {
+        a2dp_bridge_test_sweep(pcm, fs);       /* phone paused: S31 sweep A/B test */
+    } else if (a2dp_bridge_read(pcm, fs)) {
         /* Glitch detector on the PCM we are about to encode: a jump between
          * frames far larger than the frame's own sample-to-sample motion means
          * the audio was damaged before Auracast (A2DP/resampler/buffer). */
@@ -616,6 +669,39 @@ static void broadcast_source_tx(void)
         if (lc3_encode(g_enc[ch], LC3_PCM_FORMAT_S16, pcm + ch, 2, opf, s->data) != 0) {
             continue;
         }
+#if LC3_LOOPBACK
+        if (ch == 0 && fs == 480) {
+            if (g_lb_dec == NULL) {
+                void *m = heap_caps_malloc(lc3_decoder_size(TONE_DT_US, TONE_SR_HZ), MALLOC_CAP_SPIRAM);
+                g_lb_dec = m ? lc3_setup_decoder(TONE_DT_US, TONE_SR_HZ, TONE_SR_HZ, m) : NULL;
+                g_lb_delay = lc3_delay_samples(TONE_DT_US, TONE_SR_HZ);
+                if (g_lb_delay < 0 || g_lb_delay > 512) g_lb_delay = 0;
+                ESP_LOGW(TAG, "LC3 loopback check on (decoder delay %d samples)", g_lb_delay);
+            }
+            if (g_lb_dec != NULL) {
+                static int16_t y[480];
+                /* history: [delay older samples][this frame] */
+                for (int n = 0; n < 480; n++) g_lb_hist[g_lb_delay + n] = pcm[2 * n];
+                int r = lc3_decode(g_lb_dec, s->data, opf, LC3_PCM_FORMAT_S16, y, 1);
+                if (r != 0) g_lb_dec_err++;
+                float fsig = 0.0f, ferr = 0.0f;
+                for (int n = 0; n < 480; n++) {
+                    float x = (float)g_lb_hist[n], d = (float)y[n] - x;
+                    fsig += x * x;
+                    ferr += d * d;
+                }
+                memmove(g_lb_hist, g_lb_hist + 480, (size_t)g_lb_delay * sizeof(int16_t));
+                if (fsig > 480.0f * 100.0f * 100.0f) {          /* skip near-silence */
+                    float snr = 10.0f * log10f(fsig / (ferr + 1.0f));
+                    g_lb_sig += fsig;
+                    g_lb_err += ferr;
+                    g_lb_frames++;
+                    if (snr < g_lb_worst) g_lb_worst = snr;
+                    if (snr < 10.0f) g_lb_bad++;
+                }
+            }
+        }
+#endif
         /* One attempt per SDU, never retried: a late SDU is worthless, and the
          * host copies s->data, so the buffer is free again on return. */
         if (esp_ble_audio_bap_stream_send(&s->stream, s->data, opf, streams[0].seq_num) != 0) {
@@ -1121,12 +1207,12 @@ static void stats_task(void *arg)
                  (unsigned long)ur, (unsigned long)dr, (unsigned long)sk,
                  (unsigned long)g_glitches, (unsigned long)g_clipped);
         ESP_LOGW(TAG, "ISO 2s: on-air %lu, NOT SENT %lu, drift %lu | encode ticks late %lu, worst gap %lu us | "
-                 "in flight %ld/%d, totals: backlog drops %lu, backoff %lu, ticks skipped %lu",
+                 "in flight %ld/%d, totals: backlog drops %lu, backoff %lu, ticks skipped %lu, watchdog encodes %lu",
                  (unsigned long)g_iso_done, (unsigned long)g_iso_not_txd, (unsigned long)g_iso_drift,
                  (unsigned long)g_late_ticks, (unsigned long)g_max_gap_us,
                  (long)(int32_t)(streams[0].sent - streams[0].done), ISO_TX_INFLIGHT_MAX,
                  (unsigned long)g_iso_backlog_drops, (unsigned long)g_send_backoffs,
-                 (unsigned long)g_tick_skips);
+                 (unsigned long)g_tick_skips, (unsigned long)g_iso_wdog_ticks);
         if (a2dp_bridge_streaming()) {
             ESP_LOGW(TAG, "SBC 2s: clock corr %ld ppm | bitpool now %u (min %u, max %u), media pkts %lu, lost pkts %lu",
                      (long)a2dp_bridge_clock_ppm(),
@@ -1139,6 +1225,18 @@ static void stats_task(void *arg)
         btc_a2dp_sink_bitpool_max = 0;
         btc_a2dp_sink_media_pkts = 0;
         btc_a2dp_sink_media_seq_gaps = 0;
+#if LC3_LOOPBACK
+        if (g_lb_frames || g_lb_dec_err) {
+            int avg10 = (int)(100.0f * log10f(g_lb_sig / (g_lb_err + 1.0f)));
+            int worst10 = (int)(10.0f * g_lb_worst);
+            ESP_LOGW(TAG, "LC3 loopback 2s: SNR avg %d.%d dB, worst frame %d.%d dB, frames <10 dB: %lu/%lu, decode errors %lu",
+                     avg10 / 10, abs(avg10 % 10), worst10 / 10, abs(worst10 % 10),
+                     (unsigned long)g_lb_bad, (unsigned long)g_lb_frames, (unsigned long)g_lb_dec_err);
+        }
+        g_lb_frames = g_lb_dec_err = g_lb_bad = 0;
+        g_lb_sig = g_lb_err = 0.0f;
+        g_lb_worst = 999.0f;
+#endif
         {
             uint32_t n = g_q_n;
             float inv = n ? 1.0f / (float)n : 0.0f;
@@ -1163,7 +1261,21 @@ static void stats_task(void *arg)
 static void encode_task(void *arg)
 {
     for (;;) {
+#if ISO_CLOCKED_PACING
+        if (g_iso_paced && xSemaphoreTake(g_encode_sem, pdMS_TO_TICKS(ISO_TX_WDOG_MS)) != pdTRUE) {
+            if (g_iso_paced) {                        /* no completions: keep audio flowing */
+                g_iso_wdog_ticks++;
+                broadcast_source_tx();
+            }
+            continue;
+        }
+        if (!g_iso_paced && xSemaphoreTake(g_encode_sem, pdMS_TO_TICKS(500)) != pdTRUE) {
+            continue;
+        }
+        {
+#else
         if (xSemaphoreTake(g_encode_sem, pdMS_TO_TICKS(500)) == pdTRUE) {
+#endif
             /* Late by more than ENC_MAX_BACKLOG ticks (core 0 overloaded):
              * drop the oldest ticks instead of bursting them all out late.
              * Sheds load exactly when there is none to spare, and keeps the

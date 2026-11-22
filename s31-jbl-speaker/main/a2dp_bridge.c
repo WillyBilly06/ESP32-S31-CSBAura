@@ -263,6 +263,80 @@ uint32_t a2dp_bridge_packets(void)
     return s_in_pkts;
 }
 
+/* ---- sweep test (isolates the garble) -------------------------------------
+ * While the phone is paused the encoder plays S31-generated log sweeps
+ * 20 Hz -> 20 kHz (10 s + 2 s silence), alternating:
+ *   A: synthesized at 48 kHz          -> straight to LC3/Auracast
+ *   B: synthesized at 44.1 kHz        -> the SAME resampler (own state, fixed
+ *      ratio, no clock correction)    -> LC3/Auracast
+ * No SBC in either. Called only from the encoder task. */
+static rs_state_t s_rs_test;
+static uint32_t s_test_out[RS_OUT_MAX + 1024];
+static int s_test_have;
+
+static float sweep_sample(float *phase, float *f, float fs, uint32_t *n)
+{
+    const uint32_t len = (uint32_t)(10.0f * fs), gap = (uint32_t)(2.0f * fs);
+    if (*n == 0) {
+        *f = 20.0f;
+        *phase = 0.0f;
+    }
+    float v = 0.0f;
+    if (*n < len) {
+        v = 0.5f * sinf(6.28318530718f * *phase);       /* -6 dBFS */
+        *phase += *f * (1.0f / fs);
+        if (*phase >= 1.0f) *phase -= 1.0f;
+        *f *= powf(1000.0f, 1.0f / (10.0f * fs));         /* 20 Hz .. 20 kHz in 10 s */
+    }
+    if (++*n >= len + gap) *n = 0;
+    return v;
+}
+
+void a2dp_bridge_test_sweep(int16_t *pcm, int frames)
+{
+    static int mode = -1;                 /* 0 = A (48 kHz direct), 1 = B (44.1 kHz via resampler) */
+    static uint32_t na, nb;
+    static float pa, fa, pb, fb;
+    static uint32_t frames_in_mode;
+    if (mode < 0 || frames_in_mode >= 48000u * 12u) {
+        mode = (mode == 0) ? 1 : 0;
+        frames_in_mode = 0;
+        na = nb = 0;
+        s_test_have = 0;
+        rs_reset(&s_rs_test);
+        ESP_LOGW(TAG, "SWEEP TEST %s: 20 Hz -> 20 kHz, 10 s (no SBC%s)",
+                 mode == 0 ? "A = generated at 48 kHz, direct to LC3" : "B = generated at 44.1 kHz, through the resampler",
+                 mode == 0 ? ", no resampler" : "");
+    }
+    frames_in_mode += frames;
+    if (mode == 0) {
+        for (int i = 0; i < frames; i++) {
+            int16_t v = (int16_t)(sweep_sample(&pa, &fa, 48000.0f, &na) * 32767.0f);
+            pcm[2 * i] = v;
+            pcm[2 * i + 1] = v;
+        }
+        return;
+    }
+    const uint64_t step = rs_step_q32(44100, OUT_RATE, 0.0f);
+    while (s_test_have < frames) {
+        int16_t in[2 * 128];
+        int m = rs_room(&s_rs_test);
+        if (m > 128) m = 128;
+        for (int i = 0; i < m; i++) {
+            int16_t v = (int16_t)(sweep_sample(&pb, &fb, 44100.0f, &nb) * 32767.0f);
+            in[2 * i] = v;
+            in[2 * i + 1] = v;
+        }
+        rs_push(&s_rs_test, in, m);
+        int room = (int)(sizeof(s_test_out) / sizeof(s_test_out[0])) - s_test_have;
+        if (room > RS_OUT_MAX) room = RS_OUT_MAX;
+        s_test_have += rs_run(&s_rs_test, step, s_test_out + s_test_have, room);
+    }
+    memcpy(pcm, s_test_out, (size_t)frames * 4);
+    s_test_have -= frames;
+    memmove(s_test_out, s_test_out + frames, (size_t)s_test_have * 4);
+}
+
 int32_t a2dp_bridge_clock_ppm(void)
 {
     return s_corr_ppm;

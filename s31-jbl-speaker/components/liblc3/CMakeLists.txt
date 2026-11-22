@@ -29,3 +29,7 @@ idf_component_register(SRCS ${LC3_SRCS}
 # liblc3 uses some aggressive float math; silence non-fatal warnings.
 # -O3 + unrolling: the encoder's MDCT/LTPF/SNS loops are the hot path on the S31's FPU.
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-error -ffast-math -O3 -funroll-loops)
+
+# Never signal LTPF from the encoder (see src/lc3.c): removes the decoder-side
+# pitch comb filter that garbles tones at <= 109 B/frame, keeping 100 B frames.
+target_compile_definitions(${COMPONENT_LIB} PRIVATE LC3_ENCODER_NO_LTPF=1)
