@@ -15,6 +15,8 @@
 #include "ble/le_device_db_tlv.h"
 #include "classic/btstack_link_key_db_tlv.h"
 #include "hci_transport_s31_vhci.h"
+#include "hci_dump.h"
+#include "hci_dump_embedded_stdout.h"
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -26,6 +28,7 @@
 #include "a2dp_in.h"
 
 static const char *TAG = "S31";
+/* #define S31_HCI_DUMP 1   bring-up: print every HCI packet */
 
 #define LOCAL_NAME "S31 JBL Xtreme 5"
 
@@ -74,6 +77,9 @@ static void btstack_task(void *arg)
     btstack_memory_init();
     btstack_run_loop_init(btstack_run_loop_freertos_get_instance());
     hci_init(hci_transport_s31_vhci_get_instance(), NULL);
+#ifdef S31_HCI_DUMP
+    hci_dump_init(hci_dump_embedded_stdout_get_instance());
+#endif
 
     const btstack_tlv_t *tlv = btstack_tlv_esp32_get_instance();
     btstack_tlv_set_instance(tlv, NULL);

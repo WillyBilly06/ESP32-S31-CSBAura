@@ -100,6 +100,15 @@ static void deliver_packets(void *context)
         }
         btstack_ring_buffer_read(&s_ring, s_rx, len, &n);
         xSemaphoreGive(s_ring_mutex);
+        /* The S31 controller reports LMP feature bit 37 "BR/EDR Not Supported"
+         * (features byte 4 = 0xF8) although it runs BR/EDR fine in BTDM mode
+         * (Bluedroid ignored the bit). BTstack honours it and would skip all
+         * Classic setup (scan enable, CoD, name, SSP) -> the phone cannot see
+         * us. Clear it in HCI Read Local Supported Features' response. */
+        if (len >= 15 && s_rx[0] == HCI_EVENT_PACKET && s_rx[1] == HCI_EVENT_COMMAND_COMPLETE &&
+            little_endian_read_16(s_rx, 4) == 0x1003 && s_rx[6] == 0) {
+            s_rx[7 + 4] &= (uint8_t)~0x20;     /* byte 4 bit 5 (feature bit 37) */
+        }
         transport_packet_handler(s_rx[0], &s_rx[1], (uint16_t)(len - 1));
         xSemaphoreTake(s_ring_mutex, portMAX_DELAY);
     }
