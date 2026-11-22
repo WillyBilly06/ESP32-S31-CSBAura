@@ -28,14 +28,15 @@
 #include "nvs.h"
 
 #include "a2dp_dsp.h"
+#include "bt_sched_tune.h"
 
 static const char *TAG = "A2DP";
 
 #define OUT_RATE        48000
 #define PKT_MAX         (AVDTP_L2CAP_MTU + 16)
 #define PKT_Q_LEN       24                    /* ~550 ms of 8-frame packets */
-#define RING_MS         220                   /* max S31-added delay: beyond it the OLDEST audio is dropped */
-#define TARGET_MS       120                    /* PCM fill the clock recovery aims at */
+#define RING_MS         500                   /* max S31-added delay: beyond it the OLDEST audio is dropped */
+#define TARGET_MS       250                    /* PCM fill the clock recovery aims at */
 #define PRIME_MS        TARGET_MS             /* start output at the target fill: no start-up underruns / integrator wind-up */
 #define MS_FRAMES(ms)   ((OUT_RATE / 1000) * (ms))
 
@@ -87,7 +88,7 @@ static void on_pcm(int16_t *data, int num_frames, int num_channels, int sample_r
     /* clock recovery: hold the PCM ring at TARGET_MS by nudging the ratio
      * (smoothed PI, +-1500 ppm) - the phone's 44.1 kHz clock vs our BIG clock */
     float fill = (float)ring_fill(&s_ring);
-    s_fill_avg += (fill - s_fill_avg) * 0.002f;
+    s_fill_avg += (fill - s_fill_avg) * 0.0005f;     /* ~6 s average: follow clock drift, not the phone's +-100 ms delivery bursts */
     float err = (s_fill_avg - (float)MS_FRAMES(TARGET_MS)) * (1.0f / (float)MS_FRAMES(TARGET_MS));
     s_integ += err * 0.0002f;
     /* +-1500 ppm: at +-500 the loop sat on the limit with the S26 Ultra (its
@@ -378,17 +379,25 @@ static void a2dp_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet,
         s_reset_dsp = true;
         s_streaming = true;
         gap_connectable_control(0);               /* no page scan while streaming: airtime for the BIS */
+        bt_sched_tune_streaming(true);            /* streaming profile (MASTER: same as idle, BIS copies above the ACL) */
+        {   /* A2DP buffer + Auracast presentation delay + encoder pipeline (~4 SDUs) */
+            uint16_t d = (uint16_t)((TARGET_MS + 80 + 40) * 10);
+            uint8_t st = a2dp_sink_delay_report(s_a2dp_cid, s_local_seid, d);
+            ESP_LOGW(TAG, "delay report %u.%u ms -> 0x%02x", d / 10, d % 10, st);
+        }
         ESP_LOGW(TAG, "A2DP audio STARTED");
         break;
     case A2DP_SUBEVENT_STREAM_SUSPENDED:
     case A2DP_SUBEVENT_STREAM_STOPPED:
         s_streaming = false;
+        bt_sched_tune_streaming(false);
         gap_connectable_control(!S31_QUIET_RADIO_TEST);
         ESP_LOGW(TAG, "A2DP audio %s", packet[2] == A2DP_SUBEVENT_STREAM_SUSPENDED ? "suspended" : "stopped");
         break;
     case A2DP_SUBEVENT_SIGNALING_CONNECTION_RELEASED:
         s_streaming = false;
         s_connected = false;
+        bt_sched_tune_streaming(false);
         gap_connectable_control(!S31_QUIET_RADIO_TEST);
         ESP_LOGW(TAG, "A2DP disconnected");
         break;
@@ -466,6 +475,7 @@ void a2dp_in_setup(void)
                                                                   s_sbc_caps, sizeof(s_sbc_caps),
                                                                   s_sbc_cfg, sizeof(s_sbc_cfg));
     s_local_seid = avdtp_local_seid(ep);
+    avdtp_sink_register_delay_reporting_category(s_local_seid);   /* tell the phone our latency (video lip sync) */
 
     a2dp_sink_create_sdp_record(s_sdp_a2dp, sdp_create_service_record_handle(),
                                 AVDTP_SINK_FEATURE_MASK_SPEAKER, NULL, NULL);

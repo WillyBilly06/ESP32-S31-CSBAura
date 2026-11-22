@@ -462,13 +462,24 @@ static void stream_sent_cb(esp_ble_audio_bap_stream_t *stream, void *user_data)
     char name[24];
 
     const esp_ble_iso_tx_cb_info_t *info = user_data;
+    /* IDF release/v6.1 c43d665a96+: versioned per-SDU TX info (no completed /
+     * not_txd counters). completions = reported + dropped entries; an SDU with
+     * no Data PDU sent counts as not transmitted. */
+    uint32_t comp = 0, ntx = 0, nlate = 0, cnt = 0;
     if (info != NULL) {
-        __atomic_fetch_add(&source_stream->done, (uint32_t)info->completed_pkts + info->not_txd_pkts,
-                           __ATOMIC_RELEASE);
+        cnt = info->sdu_cnt > BT_ISO_TX_CB_SDU_MAX ? BT_ISO_TX_CB_SDU_MAX : info->sdu_cnt;
+        comp = cnt + info->sdu_dropped;
+        if (info->framing == 0) {
+            for (uint32_t i = 0; i < cnt; i++) {
+                if (info->sdu[i].unf.txd_cnt == 0) ntx++;
+                if (info->sdu[i].unf.late) nlate++;
+            }
+        }
+        __atomic_fetch_add(&source_stream->done, comp, __ATOMIC_RELEASE);
     }
 #if ISO_CLOCKED_PACING
     if (info != NULL && stream_index(stream) == 0 && g_iso_paced) {
-        uint32_t c = (uint32_t)info->completed_pkts + info->not_txd_pkts;
+        uint32_t c = comp;
         while (c--) {
             xSemaphoreGive(g_encode_sem);             /* one SDU left the queue -> make the next */
         }
@@ -482,8 +493,8 @@ static void stream_sent_cb(esp_ble_audio_bap_stream_t *stream, void *user_data)
             if (gap > 30000) g_cb_gaps_30++;
         }
         g_cb_prev_us = now_us;
-        for (size_t i = 0; i < info->pkt_cnt && i < 2; i++) {
-            uint32_t ref = info->pkt[i].sdu_ref_time, tx = info->pkt[i].tx_time_stamp;
+        for (size_t i = 0; i < cnt; i++) {
+            uint32_t ref = info->sdu[i].sdu_ref_time, tx = info->sdu[i].tx_time_stamp;
             if (g_ref_prev) {
                 uint32_t step = ref - g_ref_prev, tstep = tx - g_tx_prev;
                 if (step < 5000000u) {
@@ -496,22 +507,23 @@ static void stream_sent_cb(esp_ble_audio_bap_stream_t *stream, void *user_data)
             g_ref_prev = ref;
             g_tx_prev = tx;
         }
-        g_iso_done += info->completed_pkts;
-        g_iso_not_txd += info->not_txd_pkts;
-        for (size_t i = 0; i < info->pkt_cnt && i < 2; i++) {
-            if (info->pkt[i].drift) {
-                g_iso_drift++;
-            }
-            uint32_t q = info->pkt[i].tx_time_stamp - info->pkt[i].sdu_rec_time;
-            uint32_t r = info->pkt[i].tx_time_stamp - info->pkt[i].sdu_ref_time;
+        g_iso_done += comp - ntx;
+        g_iso_not_txd += ntx;
+        g_iso_drift += nlate;                         /* was "drift"; now: SDUs handled late */
+        for (size_t i = 0; i < cnt; i++) {
+            uint32_t q = info->sdu[i].tx_time_stamp - info->sdu[i].sdu_rec_time;
+            uint32_t r = info->sdu[i].tx_time_stamp - info->sdu[i].sdu_ref_time;
             if (q < 5000000u) { g_q_sum += q; g_q_n++; if (q > g_q_max) g_q_max = q; }
             if (r < 5000000u) { g_ref_sum += r; if (r > g_ref_max) g_ref_max = r; }
-            g_q_raw[0] = info->pkt[i].tx_time_stamp; g_q_raw[1] = info->pkt[i].sdu_rec_time;
-            g_q_raw[2] = info->pkt[i].sdu_ref_time;  g_q_raw[3] = info->pkt[i].sdu_hdl_time;
+            g_q_raw[0] = info->sdu[i].tx_time_stamp; g_q_raw[1] = info->sdu[i].sdu_rec_time;
+            g_q_raw[2] = info->sdu[i].sdu_ref_time;  g_q_raw[3] = info->sdu[i].sdu_hdl_time;
         }
     }
     snprintf(name, sizeof(name), "SRC #%d", stream_index(stream));
-    example_audio_tx_scheduler_on_sent(&source_stream->scheduler, user_data, TAG, name);
+    static example_audio_tx_count_t s_txcount[8];
+    int si = stream_index(stream);
+    example_audio_tx_scheduler_on_sent(&source_stream->scheduler, user_data,
+                                       &s_txcount[si >= 0 && si < 8 ? si : 0], TAG, name);
 }
 
 static esp_ble_audio_bap_stream_ops_t stream_ops = {

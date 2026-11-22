@@ -71,6 +71,9 @@ static const prio_profile_t s_stream[3] = {
     /* AURACAST_FIRST: BIS first copy 15 > ACL 8..14 > repetitions 7 */
     [BT_SCHED_MODE_AURACAST_FIRST] = { 8, 15, 7, 7, 15 },
     /* MASTER: same as idle - stock ACL 2, all BIS copies above it */
+    /* MASTER while streaming = idle (ACL 2, every BIS copy above it). Tested:
+     * ACL 13 above the repetitions lost ~48 % of whole SDUs - the hardware does
+     * not cut an ACL exchange already in progress, so it also eats first copies. */
     [BT_SCHED_MODE_MASTER]         = { BT_SCHED_IDLE_ACL, BT_SCHED_IDLE_FIRST, BT_SCHED_IDLE_REP, BT_SCHED_IDLE_PTO, BT_SCHED_IDLE_FIRST },
 };
 

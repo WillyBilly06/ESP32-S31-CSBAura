@@ -32,4 +32,4 @@ target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-error -ffast-math -O3 -funr
 
 # Never signal LTPF from the encoder (see src/lc3.c): removes the decoder-side
 # pitch comb filter that garbles tones at <= 109 B/frame, keeping 100 B frames.
-target_compile_definitions(${COMPONENT_LIB} PRIVATE LC3_ENCODER_NO_LTPF=1 LC3_ENCODER_FULLBAND=0 LC3_ENCODER_JBL_COMPAT=1 LC3_ENCODER_JBL_NF=1 LC3_ENCODER_JBL_PITCH=1 LC3_ENCODER_STATS=1)
+target_compile_definitions(${COMPONENT_LIB} PRIVATE LC3_ENCODER_NO_LTPF=1 LC3_ENCODER_FULLBAND=0 LC3_ENCODER_JBL_COMPAT=0 LC3_ENCODER_JBL_NF=0 LC3_ENCODER_JBL_PITCH=1 LC3_ENCODER_STATS=1)

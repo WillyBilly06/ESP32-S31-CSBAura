@@ -131,10 +131,10 @@ extern uint16_t r_ble_ll_iso_free_buf_num_get(uint16_t conn_handle);
 #ifndef AURA_JBL_PROFILE
 #define AURA_JBL_PROFILE       (!AURA_GENERIC)
 #endif
-#define AURA_SDU               (AURA_JBL_PROFILE ? 100 : 120)   /* octets per LC3 frame = SDU */
+#define AURA_SDU               100        /* octets per LC3 frame = SDU (80 kbps/channel, as the real JBL master) */
 #define AURA_PD_US             80000
 #define AURA_BIG_HANDLE        0
-#define AURA_BN                (AURA_JBL_PROFILE ? 2 : 3)      /* SDUs per BIS per BIG event */
+#define AURA_BN                3          /* SDUs per BIS per BIG event (30 ms) */
 #define AURA_LOC_FL            0x00000001u
 #define AURA_LOC_FR            0x00000002u
 #define AURA_CONTEXT           0x0005u    /* Unspecified | Media, as the Xtreme 5 */
@@ -150,7 +150,7 @@ extern uint16_t r_ble_ll_iso_free_buf_num_get(uint16_t conn_handle);
 #define AURA_ISO_QUEUE         (AURA_PIPELINE + 1) /* BTstack per-BIS cap (controller has 12 for all) */
 #define AURA_RQ_DEPTH          8                   /* ready queue, power of 2 */
 #define AURA_DEADLINE_MS       8                   /* after a completion: next event's SDUs must be in */
-#define AURA_ISO_INTERVAL_MS   (AURA_JBL_PROFILE ? 20 : 30)    /* s_big_test.iso_interval_1250us * 1.25 */
+#define AURA_ISO_INTERVAL_MS   30         /* s_big_test.iso_interval_1250us * 1.25 */
 /* No grant this long while ON: the BIG has stalled, keep PCM in real time.
  * Grants come once per BIG event (every ISO interval), so this must be a few
  * intervals: at 30 ms (= one interval) every bit of completion jitter fired it,
@@ -240,11 +240,15 @@ static le_audio_big_params_t s_big_params = {
  * 2M. ~32 % airtime (the 120 B / 20 ms / IRC 4 layout took enough that the
  * phone's A2DP link starved). The old Xtreme 5 layout was 16/8/100/2/4/0. */
 static const le_audio_big_test_params_t s_big_test = {
-    .iso_interval_1250us = AURA_JBL_PROFILE ? 16 : 24,
-    .nse = AURA_JBL_PROFILE ? 8 : 9,       /* JBL master: NSE 8 / IRC 4 */
+    /* 20 ms / BN 2 / NSE 8 / IRC 4 / 100 B = the real Xtreme 5 master. Measured
+     * beside the phone's A2DP (controller Tpoll fixed 10 ms): this layout 0 underruns
+     * with a 120 ms A2DP buffer; 120 B + IRC 4 starves A2DP (54 % BIG duty); a 10 ms
+     * BIG starves it too (84-91 pkts / 2 s) and broke connection setup with 120 B. */
+    .iso_interval_1250us = 24,            /* 30 ms: one 14.3 ms BIG block + a 15.7 ms gap the phone's 3.56 ms exchanges always fit in */
+    .nse = 12,                            /* BN 3 x IRC 4: 4 copies of every frame */
     .max_pdu = AURA_SDU,
     .bn = AURA_BN,
-    .irc = AURA_JBL_PROFILE ? 4 : 3,
+    .irc = 4,
     .pto = 0,       /* skipped 2 BIG events every 10-20 s (4-11 / 90 s), PTO 0: none in 150 s */
 };
 
