@@ -38,6 +38,7 @@
 
 #include "jbl_assistant.h"
 #include "a2dp_bridge.h"
+#include "app_task.h"
 
 #define TAG "JBL_ASSIST"
 
@@ -657,7 +658,7 @@ esp_err_t jbl_assistant_start(uint16_t own_mac_crc, const char *own_broadcast_na
     esp_ble_gatt_set_local_mtu(247);
     esp_ble_gattc_register_callback(gattc_cb);
     esp_ble_gattc_app_register(GATTC_APP_ID);
-    xTaskCreatePinnedToCore(assistant_task, "jbl_assist", 4096, NULL, 5, NULL, 1);   /* core 1: keep core 0 for the BT controller */
+    app_task_cold("jbl_assist", assistant_task, 4096, 5);   /* core 1, PSRAM stack: state machine + GATTC calls only, no flash */
     ESP_LOGW(TAG, "JBL master mode: '%s' is hosting; press Auracast on an Xtreme 5 to join it",
              own_broadcast_name);
     return ESP_OK;

@@ -24,8 +24,11 @@
 #include "esp_gatts_api.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "esp_heap_caps.h"
 
 #include "jbl_v5_server.h"
+#include "app_task.h"
 
 #define TAG "JBL_V5"
 
@@ -86,13 +89,39 @@ void v5_server_set_mtu(uint16_t mtu)
     s_att_mtu = mtu;
 }
 
+/* ATT bearer congestion (ESP_GATTS_CONGEST_EVT). Notifications are never
+ * refused by Bluedroid: while congested they pile up in the L2CAP queue in
+ * internal heap. Replies to the app's Get/Set are few and bounded (<= 3
+ * packets per request) so they still go; the periodic heartbeat is optional
+ * and is skipped while congested. */
+static volatile bool s_congested;
+static volatile uint32_t s_hb_skipped;
+
+void v5_server_set_congested(uint16_t conn_id, bool congested)
+{
+    if (conn_id == s_conn_id && congested != s_congested) {
+        s_congested = congested;
+        ESP_LOGW(TAG, "JBL One link %s", congested ? "congested - holding heartbeats" : "uncongested");
+    }
+}
+
+/* send_frame runs in the BTC task (replies) and in v5_hb (heartbeat): one
+ * static frame buffer behind a mutex instead of 408 B on each stack (the BTC
+ * task has only CONFIG_BT_BTC_TASK_STACK_SIZE = 3 KB). */
+static SemaphoreHandle_t s_tx_lock;
+static uint8_t s_frame[8 + 400];
+
 /* One V5 message; split into pktCount packets when it doesn't fit one ATT
  * notification (the app reassembles until pktIdx == pktCount-1). */
 static void send_frame(uint16_t cmd, const uint8_t *payload, uint16_t len)
 {
-    uint8_t f[8 + 400];
+    uint8_t *f = s_frame;
     if (!s_linked || s_notify_handle == 0 || len > 400) {
         if (len > 400) ESP_LOGE(TAG, "V5 reply too long (%u B) - dropped", len);
+        return;
+    }
+    if (s_tx_lock == NULL || xSemaphoreTake(s_tx_lock, pdMS_TO_TICKS(200)) != pdTRUE) {
+        ESP_LOGE(TAG, "V5 frame 0x%04x dropped (tx busy)", cmd);
         return;
     }
     uint16_t room = s_att_mtu > 3 + 8 + 16 ? s_att_mtu - 3 - 8 : 160;   /* payload bytes per packet */
@@ -106,11 +135,14 @@ static void send_frame(uint16_t cmd, const uint8_t *payload, uint16_t len)
         f[4] = count; f[5] = idx;
         f[6] = n & 0xFF; f[7] = n >> 8;
         memcpy(f + 8, payload + o, n);
+        /* the API copies f into its BTC message before returning */
         esp_err_t e = esp_ble_gatts_send_indicate(s_gif, s_conn_id, s_notify_handle, 8 + n, f, false);
         if (e != ESP_OK) {
             ESP_LOGE(TAG, "V5 notify failed (%d), %u B", e, 8 + n);
+            break;                                /* rest of a split frame is useless now */
         }
     }
+    xSemaphoreGive(s_tx_lock);
 }
 
 /* append {id,len,value} */
@@ -260,7 +292,8 @@ static void notify_feature(uint16_t id)
 
 static void handle_get(const uint8_t *pl, uint16_t len)
 {
-    uint8_t out[400], v[64];
+    static uint8_t out[400];                      /* BTC task only: off its 3 KB stack */
+    uint8_t v[64];
     uint16_t off = 2;
     uint8_t miss[64];
     uint16_t nmiss = 0;
@@ -351,8 +384,10 @@ static void handle_set(const uint8_t *pl, uint16_t len)
     }
 }
 
-/* reassembly for multi-packet frames */
-static uint8_t s_rx[600];
+/* reassembly for multi-packet frames: cold (a few app commands per minute),
+ * so it lives in PSRAM, allocated on the first split frame */
+#define V5_RX_MAX 600
+static uint8_t *s_rx;
 static uint16_t s_rx_len;
 
 void v5_server_on_write(const uint8_t *d, uint16_t len)
@@ -368,8 +403,18 @@ void v5_server_on_write(const uint8_t *d, uint16_t len)
     uint16_t have = len - 8 < plen ? len - 8 : plen;
 
     if (cnt > 1) {                                /* split frame: collect */
+        if (s_rx == NULL) {
+            s_rx = heap_caps_malloc(V5_RX_MAX, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (s_rx == NULL) {
+                s_rx = heap_caps_malloc(V5_RX_MAX, MALLOC_CAP_8BIT);
+            }
+            if (s_rx == NULL) {
+                ESP_LOGE(TAG, "no RAM for V5 reassembly - split frame dropped");
+                return;
+            }
+        }
         if (idx == 0) s_rx_len = 0;
-        if (s_rx_len + have <= sizeof(s_rx)) {
+        if (s_rx_len + have <= V5_RX_MAX) {
             memcpy(s_rx + s_rx_len, pl, have);
             s_rx_len += have;
         }
@@ -404,6 +449,7 @@ void v5_server_on_disconnect(uint16_t conn_id)
     if (conn_id == s_conn_id) {
         s_linked = false;
         s_att_mtu = 0;
+        s_congested = false;
         ESP_LOGW(TAG, "JBL One control link down");
     }
 }
@@ -415,6 +461,10 @@ static void heartbeat_task(void *arg)
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(5000));
         if (s_linked) {
+            if (s_congested) {
+                s_hb_skipped++;                   /* optional traffic: never queue it behind a jam */
+                continue;
+            }
             send_frame(3, hb, sizeof(hb));
         }
     }
@@ -425,5 +475,6 @@ void v5_server_start(const char *device_name)
     if (device_name) {
         s_name = device_name;
     }
-    xTaskCreatePinnedToCore(heartbeat_task, "v5_hb", 3072, NULL, 3, NULL, 1);   /* core 1: keep core 0 for the BT controller */
+    s_tx_lock = xSemaphoreCreateMutex();
+    app_task_cold("v5_hb", heartbeat_task, 3072, 3);   /* core 1, PSRAM stack: only posts GATT notifications */
 }

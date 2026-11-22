@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <stdbool.h>
 #include "esp_gatts_api.h"
 
 /* JBL V5 protocol server for the JBL One app (device page, EQ, settings). */
@@ -9,6 +10,8 @@ void v5_server_set_notify_handle(uint16_t handle);
 void v5_server_on_connect(esp_gatt_if_t gif, uint16_t conn_id);
 void v5_server_on_disconnect(uint16_t conn_id);
 void v5_server_on_write(const uint8_t *data, uint16_t len);
+/* ESP_GATTS_CONGEST_EVT: optional traffic (heartbeat) is held while congested. */
+void v5_server_set_congested(uint16_t conn_id, bool congested);
 
 /* Apply the EQ the app set (7 JBL biquads) to stereo interleaved 48 kHz PCM. */
 void v5_server_set_mtu(uint16_t mtu);

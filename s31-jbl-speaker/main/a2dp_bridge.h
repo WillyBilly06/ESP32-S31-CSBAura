@@ -14,6 +14,10 @@ esp_err_t a2dp_bridge_start(const char *bredr_name);
  * no phone is streaming (or the buffer is still priming). */
 bool a2dp_bridge_read(int16_t *pcm, int frames);
 
+/* Consumer side: drop up to `frames` of buffered audio (an encode tick that
+ * is skipped), so the ring stays in step with the broadcast clock. */
+void a2dp_bridge_discard(int frames);
+
 bool a2dp_bridge_streaming(void);
 bool a2dp_bridge_connected(void);
 uint32_t a2dp_bridge_packets(void);
@@ -21,5 +25,6 @@ uint32_t a2dp_bridge_packets(void);
 /* Called with the connected phone's Bluetooth name (for the JBL beacon). */
 void a2dp_bridge_on_phone_name(void (*cb)(const char *name));
 
-/* Totals since boot, plus the current buffer fill. */
-void a2dp_bridge_stats(uint32_t *underruns, uint32_t *drops, uint32_t *fill_ms);
+/* Totals since boot, plus the current buffer fill. drops: packets the writer
+ * threw away (ring full); skips: times the reader cut latency back to target. */
+void a2dp_bridge_stats(uint32_t *underruns, uint32_t *drops, uint32_t *skips, uint32_t *fill_ms);

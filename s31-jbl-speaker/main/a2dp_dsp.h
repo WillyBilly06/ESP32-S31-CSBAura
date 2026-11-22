@@ -225,3 +225,13 @@ static inline void ring_read(spsc_ring_t *r, uint32_t *dst, uint32_t n)
     if (d >= r->slots) d -= r->slots;
     __atomic_store_n(&r->rd, d, __ATOMIC_RELEASE);
 }
+
+/* Consumer: drop the n oldest frames (n <= ring_fill()) without copying them.
+ * Only moves rd, so it is as lock-free as ring_read; ring_skip(r, ring_fill(r))
+ * flushes the ring from the consumer side. */
+static inline void ring_skip(spsc_ring_t *r, uint32_t n)
+{
+    uint32_t d = r->rd + n;
+    if (d >= r->slots) d -= r->slots;
+    __atomic_store_n(&r->rd, d, __ATOMIC_RELEASE);
+}
