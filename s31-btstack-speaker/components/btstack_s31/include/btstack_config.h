@@ -23,7 +23,7 @@
 /* one 2-DH5 (679 B payload) per A2DP media packet: at bitpool 53 the phone packs
  * 5 SBC frames (~608 B), and each media packet is ONE baseband exchange that fits
  * between Auracast BIG events (btstack-patches/0001 makes this overridable) */
-#define AVDTP_L2CAP_MTU 675
+#define AVDTP_L2CAP_MTU 1005   /* 8 SBC frames (bitpool 53) per 3-DH5; Android caps at 1005 with EDR 3M, 663 without */
 
 /* ---- LE: JBL beacon + V5 GATT, Auracast source/sink ---------------------- */
 #define ENABLE_BLE

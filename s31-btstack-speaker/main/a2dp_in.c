@@ -8,7 +8,7 @@
  *                      -> lock-free SPSC PCM ring in PSRAM (read by the encoder)
  *
  * Link policy as on the Bluedroid build: the S31 is BR/EDR master (accepts the
- * phone as master, never switches), no sniff, AVDTP MTU 675 (one 2-DH5 per
+ * phone as master, never switches), no sniff, AVDTP MTU 1005 (one 3-DH5 per
  * media packet), SBC bitpool pinned at 53.
  */
 #include "a2dp_in.h"
@@ -33,7 +33,7 @@ static const char *TAG = "A2DP";
 
 #define OUT_RATE        48000
 #define PKT_MAX         (AVDTP_L2CAP_MTU + 16)
-#define PKT_Q_LEN       24                    /* ~300 ms of 5-frame packets */
+#define PKT_Q_LEN       24                    /* ~550 ms of 8-frame packets */
 #define RING_MS         160                   /* max S31-added delay: beyond it the OLDEST audio is dropped */
 #define TARGET_MS       80                    /* PCM fill the clock recovery aims at */
 #define PRIME_MS        50                    /* start output once this much is buffered */
@@ -155,6 +155,9 @@ static void dsp_task(void *arg)
     }
 }
 
+static volatile uint32_t s_frames;
+static volatile uint16_t s_pkt_max;
+
 /* BT thread */
 static void media_handler(uint8_t seid, uint8_t *packet, uint16_t size)
 {
@@ -171,6 +174,10 @@ static void media_handler(uint8_t seid, uint8_t *packet, uint16_t size)
     last_seq = seq;
     have_seq = true;
     s_pkts++;
+    s_frames += packet[12] & 0x0F;          /* SBC media payload header: frame count */
+    if (size > s_pkt_max) {
+        s_pkt_max = size;
+    }
     static pkt_t p;
     p.len = size;
     memcpy(p.data, packet, size);
@@ -199,17 +206,22 @@ bool a2dp_in_connected(void) { return s_connected; }
 
 void a2dp_in_log_stats(void)
 {
-    static uint32_t last_pkts;
-    uint32_t pk = s_pkts;
-    ESP_LOGW(TAG, "A2DP 2s: %s, media pkts %lu (+%lu), q drops %lu, seq gaps %lu | bitpool %lu (min %lu max %lu) | "
+    static uint32_t last_pkts, last_frames;
+    uint32_t pk = s_pkts, fr = s_frames;
+    uint32_t dp = pk - last_pkts;
+    ESP_LOGW(TAG, "A2DP 2s: %s, media pkts %lu (+%lu, %lu.%lu SBC frames/pkt, max %u B), q drops %lu, seq gaps %lu | bitpool %lu (min %lu max %lu) | "
              "PCM %lu ms, underruns %lu, oldest dropped %lu, clock corr %ld ppm",
              s_streaming ? "STREAMING" : s_connected ? "connected" : "no phone",
-             (unsigned long)pk, (unsigned long)(pk - last_pkts), (unsigned long)s_pkt_drops,
+             (unsigned long)pk, (unsigned long)dp,
+             (unsigned long)(dp ? (fr - last_frames) / dp : 0), (unsigned long)(dp ? ((fr - last_frames) * 10 / dp) % 10 : 0),
+             (unsigned)s_pkt_max, (unsigned long)s_pkt_drops,
              (unsigned long)s_seq_gaps, (unsigned long)s_bitpool,
              (unsigned long)(s_bp_min == 0xff ? 0 : s_bp_min), (unsigned long)s_bp_max,
              (unsigned long)(ring_fill(&s_ring) / (OUT_RATE / 1000)), (unsigned long)s_underruns,
              (unsigned long)s_ring_drops, (long)s_corr_ppm);
     last_pkts = pk;
+    last_frames = fr;
+    s_pkt_max = 0;
     s_bp_min = 0xff;
     s_bp_max = 0;
 }

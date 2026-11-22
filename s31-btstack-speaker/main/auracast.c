@@ -92,7 +92,7 @@ extern uint16_t r_ble_ll_iso_free_buf_num_get(uint16_t conn_handle);
 #define AURA_SDU               120        /* octets per LC3 frame = SDU: 120 like the S26 Ultra broadcast (48_4), which the Xtreme 5 plays cleanly */
 #define AURA_PD_US             80000
 #define AURA_BIG_HANDLE        0
-#define AURA_BN                2
+#define AURA_BN                3          /* 3 SDUs per BIG event (30 ms) */
 #define AURA_LOC_FL            0x00000001u
 #define AURA_LOC_FR            0x00000002u
 #define AURA_CONTEXT           0x0005u    /* Unspecified | Media, as the Xtreme 5 */
@@ -103,10 +103,10 @@ extern uint16_t r_ble_ll_iso_free_buf_num_get(uint16_t conn_handle);
 #define AURA_BIG_MIN_BLOCK     (2 * 1024)
 
 /* ---- pacing ---------------------------------------------------------------- */
-#define AURA_PREROLL           2
+#define AURA_PREROLL           4          /* one BIG event (BN) + 1 ahead */
 #define AURA_PIPELINE          (AURA_PREROLL + 1)  /* SDU pairs encoded or in flight */
 #define AURA_ISO_QUEUE         (AURA_PIPELINE + 1) /* BTstack per-BIS cap (controller has 12 for all) */
-#define AURA_RQ_DEPTH          4                   /* ready queue, power of 2 */
+#define AURA_RQ_DEPTH          8                   /* ready queue, power of 2 */
 #define AURA_DEADLINE_MS       8                   /* after a completion: next event's SDUs must be in */
 #define AURA_WDOG_MS           30                  /* no grant this long while ON: keep PCM in real time */
 
@@ -183,14 +183,17 @@ static le_audio_big_params_t s_big_params = {
     .framing = 0,                                  /* unframed */
     .encryption = 0,
 };
-/* Xtreme 5 BIGInfo: ISO interval 20 ms, BN 2, IRC 4 -> NSE 8, PTO 0, PDU 100 */
+/* Layout of the S26 Ultra's own broadcast (its BIGInfo, which the Xtreme 5
+ * plays cleanly): ISO interval 30 ms, BN 3, IRC 2, PTO 1 -> NSE 9, PDU 120,
+ * 2M. ~32 % airtime (the 120 B / 20 ms / IRC 4 layout took enough that the
+ * phone's A2DP link starved). The old Xtreme 5 layout was 16/8/100/2/4/0. */
 static const le_audio_big_test_params_t s_big_test = {
-    .iso_interval_1250us = 16,
-    .nse = AURA_BN * 4,
+    .iso_interval_1250us = 24,
+    .nse = 9,
     .max_pdu = AURA_SDU,
     .bn = AURA_BN,
-    .irc = 4,
-    .pto = 0,
+    .irc = 2,
+    .pto = 1,
 };
 
 /* ---- state machine (BT thread) --------------------------------------------- */

@@ -28,6 +28,7 @@
 #include "a2dp_in.h"
 #include "auracast.h"
 #include "jbl.h"
+#include "link_tune.h"
 
 static const char *TAG = "S31";
 /* #define S31_HCI_DUMP 1   bring-up: print every HCI packet */
@@ -101,6 +102,7 @@ static void btstack_task(void *arg)
     hci_add_event_handler(&s_hci_reg);
 
     gap_set_local_name(LOCAL_NAME);
+    link_tune_setup();
     a2dp_in_setup();
     auracast_setup();
     jbl_setup();
