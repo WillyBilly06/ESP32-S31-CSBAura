@@ -48,10 +48,32 @@ CONFIG_BT_LE_MAX_EXT_ADV_INSTANCES=2
 
 # Coexistence tuning: max LE TX power for the Auracast stream, more BR/EDR RX buffers
 CONFIG_BT_LE_DFT_TX_POWER_LEVEL_P20=y
-CONFIG_BT_CTRL_BR_EDR_ACLU_RX_BUF_NB=10
+# (Kconfig range is 4..8: the old value 10 was rejected and silently fell back to 6)
+CONFIG_BT_CTRL_BR_EDR_ACLU_RX_BUF_NB=8
 
-# Controller (radio timing) alone on core 0; Bluedroid host + SBC decode on core 1
-CONFIG_BT_BLUEDROID_PINNED_TO_CORE_1=y
+# Core layout. Core 0: BT controller "btdm" (prio 23, highest on its core) +
+# esp_timer (22, drives the k_work TX scheduler) + Bluedroid hciT/BTU/BTC (22/20/19)
+# + iso_task (20, follows the Bluedroid core) + LC3 encoder "lc3_enc" (21, main.c).
+# Core 1: A2DP_DECODER (SBC decode + resampler; hard-pinned to core 1 in
+# btc_a2dp_sink.c) + the low-priority app tasks. With everything except the
+# controller on core 1, IDLE1 starved (task WDT) while core 0 sat idle.
+CONFIG_BT_BLUEDROID_PINNED_TO_CORE_0=y
+
+# HCI command buffer pool 5 -> 10. The crash after the WDT was assert(pkt) on the
+# CMD buffer alloc (hci_driver_standard.c:191). ~1.3 KB heap. Mitigation only;
+# the root cause was the core-1 overload.
+CONFIG_BT_CTRL_HCI_CMD_NUM=10
+
+# Execute in place from PSRAM: .text/.rodata are copied from flash to the octal
+# PSRAM (200 MHz DDR) at boot, so I-cache misses (16 KB I-cache vs ~1.5 MB of
+# Bluedroid + LE Audio + LC3 + SBC code) are filled from PSRAM, not DIO 80 MHz
+# flash (~20x the bandwidth), and flash writes (NVS bonding) no longer freeze the
+# cache on both cores. Costs ~1.8 MB of the 16 MB PSRAM and a slightly longer boot.
+CONFIG_SPIRAM_XIP_FROM_PSRAM=y
+
+# FreeRTOS kernel (queues, semaphores, context switch) in IRAM: it runs for every
+# A2DP packet, HCI packet and LC3 tick on both cores. +~17 KB IRAM.
+CONFIG_FREERTOS_IN_IRAM=y
 
 
 # Optimise for speed (-O2): the audio path (SBC decode, resampler, LC3) and Bluedroid
