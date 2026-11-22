@@ -29,6 +29,12 @@
 #include "auracast.h"
 #include "jbl.h"
 #include "link_tune.h"
+#include "sniffer.h"
+
+/* 1 = JBL party / Auracast sniffer only (no A2DP, no broadcast, no JBL GATT) */
+#ifndef S31_SNIFFER
+#define S31_SNIFFER 0
+#endif
 
 static const char *TAG = "S31";
 /* #define S31_HCI_DUMP 1   bring-up: print every HCI packet */
@@ -37,6 +43,7 @@ static const char *TAG = "S31";
 
 extern uint32_t hci_transport_s31_vhci_rx_dropped(void);
 extern uint32_t hci_transport_s31_iso_tx_errors(int *last);
+extern void hci_transport_s31_rx_counts(uint32_t *evt, uint32_t *acl, uint32_t *iso);
 static btstack_packet_callback_registration_t s_hci_reg;
 
 static void log_heap(void)
@@ -57,6 +64,14 @@ static void stats_task(void *arg)
     TickType_t last = xTaskGetTickCount();
     for (;;) {
         vTaskDelayUntil(&last, pdMS_TO_TICKS(2000));
+        if (S31_SNIFFER) {
+            uint32_t ev, acl, iso;
+            hci_transport_s31_rx_counts(&ev, &acl, &iso);
+            ESP_LOGW(TAG, "VHCI rx: events %lu, ACL %lu, ISO %lu", (unsigned long)ev, (unsigned long)acl, (unsigned long)iso);
+            sniffer_log_stats();
+            log_heap();
+            continue;
+        }
         a2dp_in_log_stats();
         auracast_log_stats();
         jbl_set_streaming(a2dp_in_streaming());
@@ -76,6 +91,10 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
         bd_addr_t a;
         gap_local_bd_addr(a);
         ESP_LOGW(TAG, "BTstack up: '%s' at %s (BR/EDR A2DP sink, LE)", LOCAL_NAME, bd_addr_to_str(a));
+        if (S31_SNIFFER) {
+            sniffer_start();
+            return;
+        }
         a2dp_in_on_hci_working();
         auracast_on_hci_working();
         jbl_on_hci_working();
@@ -102,10 +121,14 @@ static void btstack_task(void *arg)
     hci_add_event_handler(&s_hci_reg);
 
     gap_set_local_name(LOCAL_NAME);
-    link_tune_setup();
-    a2dp_in_setup();
-    auracast_setup();
-    jbl_setup();
+    if (S31_SNIFFER) {
+        sniffer_setup();
+    } else {
+        link_tune_setup();
+        a2dp_in_setup();
+        auracast_setup();
+        jbl_setup();
+    }
 
     hci_power_control(HCI_POWER_ON);
     btstack_run_loop_execute();                 /* never returns */

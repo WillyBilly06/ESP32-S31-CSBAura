@@ -32,6 +32,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_random.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "lc3.h"
@@ -89,10 +90,16 @@ extern uint16_t r_ble_ll_iso_free_buf_num_get(uint16_t conn_handle);
 #define AURA_SR_HZ             48000
 #define AURA_FRAME_US          10000
 #define AURA_FRAME_SAMPLES     480
-#define AURA_SDU               120        /* octets per LC3 frame = SDU: 120 like the S26 Ultra broadcast (48_4), which the Xtreme 5 plays cleanly */
+/* BIG profile: 1 = exactly the real Xtreme 5 master (its BIGInfo: 20 ms, BN 2,
+ * NSE 8, IRC 4, PTO 0, 100 B), 0 = the S26 Ultra's layout (30 ms, BN 3, 120 B,
+ * here with IRC 3 / PTO 0). Pair 1 with liblc3 LC3_ENCODER_JBL_COMPAT/JBL_NF. */
+#ifndef AURA_JBL_PROFILE
+#define AURA_JBL_PROFILE       1
+#endif
+#define AURA_SDU               (AURA_JBL_PROFILE ? 100 : 120)   /* octets per LC3 frame = SDU */
 #define AURA_PD_US             80000
 #define AURA_BIG_HANDLE        0
-#define AURA_BN                3          /* 3 SDUs per BIG event (30 ms) */
+#define AURA_BN                (AURA_JBL_PROFILE ? 2 : 3)      /* SDUs per BIS per BIG event */
 #define AURA_LOC_FL            0x00000001u
 #define AURA_LOC_FR            0x00000002u
 #define AURA_CONTEXT           0x0005u    /* Unspecified | Media, as the Xtreme 5 */
@@ -103,12 +110,12 @@ extern uint16_t r_ble_ll_iso_free_buf_num_get(uint16_t conn_handle);
 #define AURA_BIG_MIN_BLOCK     (2 * 1024)
 
 /* ---- pacing ---------------------------------------------------------------- */
-#define AURA_PREROLL           4          /* one BIG event (BN) + 1 ahead */
+#define AURA_PREROLL           (AURA_BN + 1)                   /* one BIG event (BN) + 1 ahead */
 #define AURA_PIPELINE          (AURA_PREROLL + 1)  /* SDU pairs encoded or in flight */
 #define AURA_ISO_QUEUE         (AURA_PIPELINE + 1) /* BTstack per-BIS cap (controller has 12 for all) */
 #define AURA_RQ_DEPTH          8                   /* ready queue, power of 2 */
 #define AURA_DEADLINE_MS       8                   /* after a completion: next event's SDUs must be in */
-#define AURA_ISO_INTERVAL_MS   30                  /* s_big_test.iso_interval_1250us * 1.25 */
+#define AURA_ISO_INTERVAL_MS   (AURA_JBL_PROFILE ? 20 : 30)    /* s_big_test.iso_interval_1250us * 1.25 */
 /* No grant this long while ON: the BIG has stalled, keep PCM in real time.
  * Grants come once per BIG event (every ISO interval), so this must be a few
  * intervals: at 30 ms (= one interval) every bit of completion jitter fired it,
@@ -127,13 +134,16 @@ static const uint8_t jbl_master_mfg_ad[] = {
     0xdf, 0xfd,
 };
 /* PA, after the BASE: Manufacturer Specific Data, company 0xFDDF, TLVs
- * [02 02 1f] [03 f0 11 NN] [12 11 <17-byte status, YY at +17>]. */
+ * [02 02 03] [03 f0 11 NN] [12 11 <17-byte status, YY at +17, TG at +20>].
+ * Byte-exact copy of a real Xtreme 5 party master sniffed on 2026-11-22
+ * (s31-btstack-speaker S31_SNIFFER): NN +1 per update, YY and TG (00/01) vary
+ * with no time pattern, updates every 400-1100 ms. */
 static const uint8_t jbl_pa_mfg_ad[] = {
     0x1d, 0xff, 0xdf, 0xfd,
-    0x02, 0x02, 0x1f,
+    0x02, 0x02, 0x03,
     0x03, 0xf0, 0x11, 0x02,
-    0x12, 0x11, 0x01, 0x01, 0x01, 0x00, 0x49, 0x00, 0x01, 0x01, 0x3c,
-                0x00, 0x00, 0x00, 0x00, 0x00, 0x24, 0xb9, 0x01,
+    0x12, 0x11, 0x01, 0x01, 0x01, 0x00, 0x43, 0x00, 0x01, 0x00, 0x3c,
+                0x00, 0xff, 0xff, 0xff, 0x00, 0x24, 0xb9, 0x00,
 };
 /* A/B test: 0 = periodic data carries the BASE only (no JBL party block whose
  * NN/YY bytes we can only imitate; the real master's YY is not a timer). */
@@ -142,6 +152,7 @@ static const uint8_t jbl_pa_mfg_ad[] = {
 #endif
 #define JBL_PA_NN_OFFSET       10
 #define JBL_PA_YY_OFFSET       17
+#define JBL_PA_TG_OFFSET       20
 
 /* ---- advertising / BIG storage (BT thread) --------------------------------- */
 static uint8_t s_ext_adv[7 + 6 + 4 + 2 * (2 + AURA_NAME_LEN) + sizeof(jbl_master_mfg_ad)];
@@ -193,11 +204,11 @@ static le_audio_big_params_t s_big_params = {
  * 2M. ~32 % airtime (the 120 B / 20 ms / IRC 4 layout took enough that the
  * phone's A2DP link starved). The old Xtreme 5 layout was 16/8/100/2/4/0. */
 static const le_audio_big_test_params_t s_big_test = {
-    .iso_interval_1250us = 24,
-    .nse = 9,
+    .iso_interval_1250us = AURA_JBL_PROFILE ? 16 : 24,
+    .nse = AURA_JBL_PROFILE ? 8 : 9,
     .max_pdu = AURA_SDU,
     .bn = AURA_BN,
-    .irc = 3,       /* no pre-transmission: with PTO 1 (phone: IRC 2 + PTO 1) the controller */
+    .irc = AURA_JBL_PROFILE ? 4 : 3,       /* no pre-transmission: with PTO 1 (phone: IRC 2 + PTO 1) the controller */
     .pto = 0,       /* skipped 2 BIG events every 10-20 s (4-11 / 90 s), PTO 0: none in 150 s */
 };
 
@@ -323,12 +334,14 @@ static void ext_adv_build(void)
 static void pa_build(void)
 {
     static const uint8_t codec_id[5] = { HCI_AUDIO_CODING_FORMAT_LC3, 0, 0, 0, 0 };
-    /* subgroup: 48 kHz, 10 ms, FL|FR, 100 octets (frames per SDU 1 = omitted) */
+    /* subgroup, exactly as the real master: 48 kHz, 10 ms, octets, 1 frame block
+     * per SDU - and NO subgroup-level channel allocation (we used to send FL|FR
+     * here, i.e. "2 channels per BIS" to a receiver that reads the subgroup) */
     static const uint8_t cc_subgroup[] = {
         0x02, 0x01, 0x08,
         0x02, 0x02, 0x01,
-        0x05, 0x03, 0x03, 0x00, 0x00, 0x00,
         0x03, 0x04, AURA_SDU, 0x00,
+        0x02, 0x05, 0x01,
     };
     static const uint8_t metadata[] = { 0x03, 0x02, AURA_CONTEXT & 0xff, AURA_CONTEXT >> 8 };
     static const uint8_t cc_bis_fl[] = { 0x05, 0x03, 0x01, 0x00, 0x00, 0x00 };
@@ -356,8 +369,10 @@ static void pa_refresh(void)
 #if !AURA_JBL_PA_BLOCK
     return;
 #endif
+    uint32_t r = esp_random();
     s_pa[s_pa_jbl_pos + JBL_PA_NN_OFFSET] = s_pa_nn;
-    s_pa[s_pa_jbl_pos + JBL_PA_YY_OFFSET] = (uint8_t)(btstack_run_loop_get_time_ms() / 10);
+    s_pa[s_pa_jbl_pos + JBL_PA_YY_OFFSET] = (uint8_t)r;
+    s_pa[s_pa_jbl_pos + JBL_PA_TG_OFFSET] = ((r >> 8) % 10) < 6 ? 1 : 0;
     gap_periodic_advertising_set_data(s_adv_handle, s_pa_len, s_pa);
 }
 
@@ -378,7 +393,7 @@ static void pa_timer_handler(btstack_timer_source_t *ts)
     if (s_exp != 1) {
         pa_refresh();
     }
-    btstack_run_loop_set_timer(ts, AURA_PA_UPDATE_MS);
+    btstack_run_loop_set_timer(ts, 400 + 100 * (esp_random() % 7));   /* 400-1000 ms, like the master */
     btstack_run_loop_add_timer(ts);
 }
 

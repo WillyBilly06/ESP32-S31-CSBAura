@@ -1,0 +1,16 @@
+diff --git a/components/bt/porting_btdm/transport/src/hci_transport.c b/components/bt/porting_btdm/transport/src/hci_transport.c
+index 6674e619..a5e22628 100644
+--- a/components/bt/porting_btdm/transport/src/hci_transport.c
++++ b/components/bt/porting_btdm/transport/src/hci_transport.c
+@@ -173,7 +173,10 @@ hci_transport_controller_le_iso_tx(const uint8_t *data, uint16_t len, void *arg)
+ #if CONFIG_BT_NIMBLE_ENABLED
+     return s_hci_transport_env.driver_ops->hci_driver_tx(HCI_DRIVER_TYPE_ISO, (uint8_t *)data, len,
+                                                          HCI_DRIVER_DIR_LEC2H);
+-#elif CONFIG_BT_BLUEDROID_ENABLED
++#else
++    /* Bluedroid and controller-only (external host on VHCI): hand the ISO
++     * packet to the registered callback, then free it. Controller-only used to
++     * fall through here and drop + leak every received ISO packet. */
+     if (ble_host_iso_rx_cb) {
+         ble_host_iso_rx_cb((uint8_t *)data, len);
+     }

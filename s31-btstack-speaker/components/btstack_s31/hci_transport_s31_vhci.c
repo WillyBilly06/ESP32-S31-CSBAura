@@ -30,6 +30,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_rom_sys.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
@@ -46,6 +47,7 @@ static uint8_t s_rx_with_pre[HCI_INCOMING_PRE_BUFFER_SIZE + HCI_INCOMING_PACKET_
 static uint8_t *const s_rx = &s_rx_with_pre[HCI_INCOMING_PRE_BUFFER_SIZE];
 static SemaphoreHandle_t s_ring_mutex;
 static volatile uint32_t s_rx_dropped;
+static volatile uint32_t s_rx_type[6];
 
 static void deliver_packets(void *context);
 static btstack_context_callback_registration_t s_deliver_cb = { .callback = deliver_packets };
@@ -63,6 +65,14 @@ static void host_send_pkt_available_cb(void)
 /* controller task */
 static int host_recv_pkt_cb(uint8_t *data, uint16_t len)
 {
+    if (len > 0 && data[0] < 6) {
+        s_rx_type[data[0]]++;
+        if (data[0] == 5 && s_rx_type[5] <= 3) {
+            esp_rom_printf("VHCI ISO rx #%u len %u: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                           (unsigned)s_rx_type[5], len, data[1], data[2], data[3], data[4], data[5], data[6],
+                           data[7], data[8], data[9], data[10], data[11], data[12]);
+        }
+    }
     xSemaphoreTake(s_ring_mutex, portMAX_DELAY);
     if (btstack_ring_buffer_bytes_free(&s_ring) < (uint32_t)len + 2) {
         xSemaphoreGive(s_ring_mutex);
@@ -77,6 +87,28 @@ static int host_recv_pkt_cb(uint8_t *data, uint16_t len)
     btstack_run_loop_execute_on_main_thread(&s_deliver_cb);
     return 0;
 }
+
+/* controller task: received ISO data (BIS sync) does not go through VHCI; the
+ * controller hands it here (idf-patches/0010) starting at the ISO handle and
+ * frees it after we return. Queue it like the VHCI packets, with the H4 type. */
+static void iso_rx_cb(uint8_t *data, uint16_t len)
+{
+    s_rx_type[5]++;
+    xSemaphoreTake(s_ring_mutex, portMAX_DELAY);
+    if (btstack_ring_buffer_bytes_free(&s_ring) < (uint32_t)len + 3) {
+        xSemaphoreGive(s_ring_mutex);
+        s_rx_dropped++;
+        return;
+    }
+    uint8_t tag[3];
+    little_endian_store_16(tag, 0, (uint16_t)(len + 1));
+    tag[2] = HCI_ISO_DATA_PACKET;
+    btstack_ring_buffer_write(&s_ring, tag, sizeof(tag));
+    btstack_ring_buffer_write(&s_ring, data, len);
+    xSemaphoreGive(s_ring_mutex);
+    btstack_run_loop_execute_on_main_thread(&s_deliver_cb);
+}
+extern void ble_host_register_rx_iso_data_cb(void *cb);
 
 static const esp_vhci_host_callback_t s_vhci_cb = {
     .notify_host_send_available = host_send_pkt_available_cb,
@@ -141,6 +173,7 @@ static int transport_open(void)
         controller_up = true;
     }
     esp_vhci_host_register_callback(&s_vhci_cb);
+    ble_host_register_rx_iso_data_cb((void *)iso_rx_cb);
     ESP_LOGI(TAG, "controller up (BR/EDR + LE), VHCI ring %u B", (unsigned)sizeof(s_ring_storage));
     return 0;
 }
@@ -209,6 +242,13 @@ static const hci_transport_t s_transport = {
 const hci_transport_t *hci_transport_s31_vhci_get_instance(void)
 {
     return &s_transport;
+}
+
+void hci_transport_s31_rx_counts(uint32_t *evt, uint32_t *acl, uint32_t *iso)
+{
+    *evt = s_rx_type[4];
+    *acl = s_rx_type[2];
+    *iso = s_rx_type[5];
 }
 
 uint32_t hci_transport_s31_vhci_rx_dropped(void)
