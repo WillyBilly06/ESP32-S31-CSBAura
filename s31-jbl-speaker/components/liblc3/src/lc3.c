@@ -333,11 +333,35 @@ static void analyze(struct lc3_encoder *encoder,
         lc3_ltpf_disable(&side->ltpf);
 #endif
 
+#if LC3_ENCODER_FULLBAND
+    /* Always signal the full audio bandwidth. The bandwidth detector flips
+     * between NB and FB frame to frame on a sweep whose harmonics/noise sit
+     * near its thresholds (1.7-7 kHz here); every flip moves the decoder's
+     * TNS and noise-filling ranges, and some receivers' decoders warble on it.
+     * The detector is an encoder-side choice; FB is always a valid answer. */
+    side->bw = sr <= LC3_SRATE_48K ? (enum lc3_bandwidth)sr : lc3_bwdet_run(dt, sr, e);
+#else
     side->bw = lc3_bwdet_run(dt, sr, e);
+#endif
+
+#if LC3_ENCODER_STATS
+    {   /* on-device view of the per-frame encoder decisions (read by main.c) */
+        extern volatile uint32_t lc3_enc_stat[5];
+        static enum lc3_bandwidth last_bw;
+        lc3_enc_stat[0]++;
+        lc3_enc_stat[1] += side->bw != (enum lc3_bandwidth)(sr <= LC3_SRATE_48K ? sr : LC3_SRATE_48K);
+        lc3_enc_stat[2] += side->bw != last_bw;
+        lc3_enc_stat[4] += att;
+        last_bw = side->bw;
+    }
+#endif
 
     lc3_sns_analyze(dt, sr, nbytes, e, att, &side->sns, xf, xf);
 
     lc3_tns_analyze(dt, side->bw, nn_flag, nbytes, &side->tns, xf);
+#if LC3_ENCODER_STATS
+    { extern volatile uint32_t lc3_enc_stat[5]; lc3_enc_stat[3] += side->tns.rc_order[0] > 0 || (side->tns.nfilters > 1 && side->tns.rc_order[1] > 0); }
+#endif
 
     lc3_spec_analyze(dt, sr,
         nbytes, side->pitch_present, &side->tns,

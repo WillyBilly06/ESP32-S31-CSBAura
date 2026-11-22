@@ -261,6 +261,20 @@ static volatile uint32_t g_q_sum, g_q_max, g_q_n, g_ref_sum, g_ref_max;
 static volatile uint32_t g_q_raw[4];
 static volatile uint32_t g_late_ticks;      /* encode ticks > 15 ms after the previous one */
 static volatile uint32_t g_max_gap_us;      /* worst gap between encode ticks */
+
+/* Radio-stall probes (stream 0). The controller stamps each SDU with the BIG
+ * anchor it went out on (sdu_ref_time) and its transmit time; with a 20 ms
+ * ISO interval and BN 2 consecutive anchors must be 0 or 20 ms apart. A larger
+ * step means BIG events went out without our audio (the radio was busy, or
+ * the SDU was late) - receivers then hear PLC. Completion callback gaps show
+ * stalls on the host side of HCI. */
+static volatile uint32_t g_ref_prev, g_tx_prev;
+static volatile uint32_t g_ref_jumps, g_ref_step_max;   /* anchor steps > 20 ms (missed BIG events) */
+static volatile uint32_t g_tx_step_max;                 /* worst tx timestamp step */
+static volatile int64_t  g_cb_prev_us;
+static volatile uint32_t g_cb_gap_max, g_cb_gaps_30;    /* completion callback gaps */
+static volatile uint32_t g_ref_hist[4];                 /* anchor step: 0, 20 ms, 40 ms, >40 ms */
+volatile uint32_t lc3_enc_stat[5];                       /* liblc3: frames, bw<FB, bw changes, TNS on, attack */
 static volatile uint32_t g_enc_us_sum, g_enc_us_max, g_enc_n;
 /* LC3 loopback check (left channel): decode every encoded frame on the S31
  * and compare with the delayed input -> proves/disproves encoder bitstream
@@ -453,6 +467,27 @@ static void stream_sent_cb(esp_ble_audio_bap_stream_t *stream, void *user_data)
     }
 #endif
     if (info != NULL && stream_index(stream) == 0) {
+        int64_t now_us = esp_timer_get_time();
+        if (g_cb_prev_us) {
+            uint32_t gap = (uint32_t)(now_us - g_cb_prev_us);
+            if (gap > g_cb_gap_max) g_cb_gap_max = gap;
+            if (gap > 30000) g_cb_gaps_30++;
+        }
+        g_cb_prev_us = now_us;
+        for (size_t i = 0; i < info->pkt_cnt && i < 2; i++) {
+            uint32_t ref = info->pkt[i].sdu_ref_time, tx = info->pkt[i].tx_time_stamp;
+            if (g_ref_prev) {
+                uint32_t step = ref - g_ref_prev, tstep = tx - g_tx_prev;
+                if (step < 5000000u) {
+                    if (step > g_ref_step_max) g_ref_step_max = step;
+                    g_ref_hist[step < 10000 ? 0 : step < 30000 ? 1 : step < 50000 ? 2 : 3]++;
+                    if (step >= 30000) g_ref_jumps++;
+                }
+                if (tstep < 5000000u && tstep > g_tx_step_max) g_tx_step_max = tstep;
+            }
+            g_ref_prev = ref;
+            g_tx_prev = tx;
+        }
         g_iso_done += info->completed_pkts;
         g_iso_not_txd += info->not_txd_pkts;
         for (size_t i = 0; i < info->pkt_cnt && i < 2; i++) {
@@ -1246,6 +1281,17 @@ static void stats_task(void *arg)
                      (unsigned long)g_q_raw[0], (unsigned long)g_q_raw[1], (unsigned long)g_q_raw[2], (unsigned long)g_q_raw[3]);
             g_q_sum = g_q_max = g_q_n = g_ref_sum = g_ref_max = 0;
         }
+        ESP_LOGW(TAG, "RADIO 2s: BIG anchor steps 0ms %lu / 20ms %lu / 40ms %lu / >40ms %lu, missed-event jumps %lu, "
+                 "worst anchor step %lu us, worst tx step %lu us | completion cb worst gap %lu us, gaps>30ms %lu",
+                 (unsigned long)g_ref_hist[0], (unsigned long)g_ref_hist[1], (unsigned long)g_ref_hist[2],
+                 (unsigned long)g_ref_hist[3], (unsigned long)g_ref_jumps, (unsigned long)g_ref_step_max,
+                 (unsigned long)g_tx_step_max, (unsigned long)g_cb_gap_max, (unsigned long)g_cb_gaps_30);
+        g_ref_hist[0] = g_ref_hist[1] = g_ref_hist[2] = g_ref_hist[3] = 0;
+        g_ref_jumps = g_ref_step_max = g_tx_step_max = g_cb_gap_max = g_cb_gaps_30 = 0;
+        ESP_LOGW(TAG, "ENC 2s: %lu ch-frames, bandwidth below full %lu, bandwidth changes %lu, TNS on %lu, attack %lu",
+                 (unsigned long)lc3_enc_stat[0], (unsigned long)lc3_enc_stat[1], (unsigned long)lc3_enc_stat[2],
+                 (unsigned long)lc3_enc_stat[3], (unsigned long)lc3_enc_stat[4]);
+        memset((void *)lc3_enc_stat, 0, sizeof(lc3_enc_stat));
         {
             /* 200 encodes per 2 s: avg = sum / n via the reciprocal of n */
             uint32_t n = g_enc_n, avg = n ? (uint32_t)((float)g_enc_us_sum * (1.0f / (float)n)) : 0;
