@@ -1,0 +1,430 @@
+﻿/*
+ * BR/EDR side of the S31 "JBL speaker":
+ *   - dual-mode controller (BLE for Auracast + Classic for phones)
+ *   - discoverable as a loudspeaker, A2DP sink (SBC)
+ *   - decoded phone audio is resampled to 48 kHz and handed to the Auracast
+ *     encoder, so music played to the S31 is re-broadcast, like the Xtreme 5
+ *     does when it hosts.
+ */
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+#include <math.h>
+
+#include "esp_log.h"
+#include "esp_bt.h"
+#include "esp_bt_main.h"
+#include "esp_bt_device.h"
+#include "esp_gap_ble_api.h"
+#include "esp_gap_bt_api.h"
+#include "esp_a2dp_api.h"
+#include "esp_a2dp_legacy_api.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/ringbuf.h"
+#include "freertos/task.h"
+#include "esp_heap_caps.h"
+#include "nvs.h"
+#include "esp_memory_utils.h"
+
+#include "a2dp_bridge.h"
+
+#define TAG "JBL_BREDR"
+
+#define OUT_RATE        48000
+#define MS_BYTES(ms)    (OUT_RATE * 4 / 1000 * (ms))
+#define RB_BYTES        MS_BYTES(400)           /* 400 ms of 48 kHz stereo s16 */
+#define PRIME_BYTES     MS_BYTES(120)           /* start reading after 120 ms */
+#define TARGET_BYTES    MS_BYTES(150)           /* steady-state fill the drift control aims for */
+
+static volatile uint32_t s_underruns;           /* encoder found too little phone audio */
+static volatile uint32_t s_drops;               /* phone audio dropped (buffer full) */
+
+static RingbufHandle_t s_rb;
+static volatile uint32_t s_src_rate = 44100;
+static volatile bool s_streaming;
+static volatile bool s_primed;
+static volatile uint32_t s_in_pkts;
+static volatile bool s_a2dp_connected;
+static uint8_t s_peer[6];                   /* the one phone we're attached to */
+static volatile bool s_have_peer;
+static volatile bool s_retry_after_loss;
+
+static void remember_phone(const uint8_t *a);
+static void (*s_name_cb)(const char *name);
+
+void a2dp_bridge_on_phone_name(void (*cb)(const char *name))
+{
+    s_name_cb = cb;
+}
+
+/* Linear resampler state (stereo). */
+static float s_pos;               /* read position; -1 == previous chunk's last sample */
+static int16_t s_prev[2];
+
+static uint8_t s_out_buf[4096 * 2];
+
+/* ---- audio path --------------------------------------------------------- */
+
+static void a2d_data_cb(const uint8_t *data, uint32_t len)
+{
+    const int16_t *in = (const int16_t *)data;
+    const int n = len / 4;                 /* stereo frames */
+    if (n <= 0 || s_rb == NULL) {
+        return;
+    }
+    s_in_pkts++;
+
+    int16_t *out = (int16_t *)s_out_buf;
+    const int out_max = sizeof(s_out_buf) / 4;
+    int o = 0;
+
+    {
+        /* Drift control: nudge the resampling ratio (max +-0.2 %) so the
+         * buffer hovers around TARGET_BYTES; the phone's clock and ours differ. */
+        float fill = (float)(RB_BYTES - xRingbufferGetCurFreeSize(s_rb));
+        float e = (fill - (float)TARGET_BYTES) / (float)TARGET_BYTES;
+        if (e > 1.0f) e = 1.0f;
+        if (e < -1.0f) e = -1.0f;
+        const float step = ((float)s_src_rate / (float)OUT_RATE) * (1.0f + 0.002f * e);
+        float pos = s_pos;
+        while (pos < (float)(n - 1) && o < out_max) {
+            int i = (int)floorf(pos);       /* -1 .. n-2 */
+            float frac = pos - (float)i;
+            for (int ch = 0; ch < 2; ch++) {
+                int16_t a = (i < 0) ? s_prev[ch] : in[2 * i + ch];
+                int16_t b = in[2 * (i + 1) + ch];
+                out[2 * o + ch] = (int16_t)((float)a + ((float)b - (float)a) * frac);
+            }
+            o++;
+            pos += step;
+        }
+        s_pos = pos - (float)n;            /* re-base so index -1 is this chunk's last frame */
+        s_prev[0] = in[2 * (n - 1)];
+        s_prev[1] = in[2 * (n - 1) + 1];
+    }
+
+    /* Drop if the encoder falls behind (keeps latency bounded). */
+    if (o > 0 && xRingbufferSend(s_rb, out, o * 4, 0) != pdTRUE) {
+        s_drops++;
+    }
+}
+
+bool a2dp_bridge_read(int16_t *pcm, int frames)
+{
+    size_t want = frames * 4;
+    if (s_rb == NULL || !s_streaming) {
+        s_primed = false;
+        if (s_a2dp_connected) {
+            memset(pcm, 0, want);          /* phone connected but paused: silence, like a real speaker */
+            return true;
+        }
+        return false;                      /* no phone at all: caller plays the test tone */
+    }
+    size_t buffered = RB_BYTES - xRingbufferGetCurFreeSize(s_rb);
+    if (!s_primed) {
+        if (buffered < PRIME_BYTES) {
+            memset(pcm, 0, want);          /* streaming but still filling: silence */
+            return true;
+        }
+        s_primed = true;
+    }
+    if (buffered < want) {
+        /* Underrun mid-song: play silence and re-prime; never fall back to the tone. */
+        s_primed = false;
+        s_underruns++;
+        memset(pcm, 0, want);
+        return true;
+    }
+
+    uint8_t *dst = (uint8_t *)pcm;
+    size_t got = 0;
+    while (got < want) {
+        size_t sz = 0;
+        uint8_t *p = xRingbufferReceiveUpTo(s_rb, &sz, 0, want - got);
+        if (p == NULL) {
+            break;
+        }
+        memcpy(dst + got, p, sz);
+        vRingbufferReturnItem(s_rb, p);
+        got += sz;
+    }
+    if (got < want) {
+        memset(dst + got, 0, want - got);
+    }
+    return true;
+}
+
+bool a2dp_bridge_streaming(void)
+{
+    return s_streaming;
+}
+
+bool a2dp_bridge_connected(void)
+{
+    return s_a2dp_connected;
+}
+
+uint32_t a2dp_bridge_packets(void)
+{
+    return s_in_pkts;
+}
+
+void a2dp_bridge_stats(uint32_t *underruns, uint32_t *drops, uint32_t *fill_ms)
+{
+    *underruns = s_underruns;
+    *drops = s_drops;
+    *fill_ms = s_rb ? (RB_BYTES - xRingbufferGetCurFreeSize(s_rb)) / MS_BYTES(1) : 0;
+}
+
+/* ---- profiles ------------------------------------------------------------ */
+
+static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *p)
+{
+    switch (event) {
+    case ESP_A2D_CONNECTION_STATE_EVT: {
+        static const char *st[] = {"Disconnected", "Connecting", "Connected", "Disconnecting"};
+        uint8_t *a = p->conn_stat.remote_bda;
+        ESP_LOGW(TAG, "A2DP %s [%02x:%02x:%02x:%02x:%02x:%02x]%s", st[p->conn_stat.state],
+                 a[0], a[1], a[2], a[3], a[4], a[5],
+                 p->conn_stat.state == ESP_A2D_CONNECTION_STATE_DISCONNECTED
+                     ? (p->conn_stat.disc_rsn == ESP_A2D_DISC_RSN_NORMAL ? " (normal)" : " (ABNORMAL - link lost)")
+                     : "");
+        bool is_current = s_have_peer && memcmp(a, s_peer, 6) == 0;
+
+        /* One audio source at a time, like a real speaker: a second device that
+         * shows up while a phone is attached gets dropped straight away. */
+        if (s_have_peer && !is_current &&
+            (p->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTING ||
+             p->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTED)) {
+            ESP_LOGW(TAG, "  second audio source - refusing it (one phone at a time)");
+            esp_a2d_sink_disconnect(a);
+            break;
+        }
+        if (s_have_peer && !is_current) {
+            break;                       /* events from the refused device */
+        }
+
+        if (p->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTED) {
+            memcpy(s_peer, a, 6);
+            s_have_peer = true;
+            s_a2dp_connected = true;
+            remember_phone(a);
+            esp_bt_gap_read_remote_name(a);   /* phone name -> CRC in the JBL beacon */
+            /* stop inquiry/page scanning while a phone is attached: frees radio time */
+            esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
+        } else if (p->conn_stat.state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
+            bool lost = p->conn_stat.disc_rsn != ESP_A2D_DISC_RSN_NORMAL;
+            s_have_peer = false;
+            s_a2dp_connected = false;
+            s_streaming = false;
+            esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+            if (lost) {
+                s_retry_after_loss = true;   /* reconnect_task calls the phone back */
+            }
+        }
+        break;
+    }
+    case ESP_A2D_AUDIO_STATE_EVT:
+        s_streaming = (p->audio_stat.state == ESP_A2D_AUDIO_STATE_STARTED);
+        s_pos = 0;
+        ESP_LOGW(TAG, "A2DP audio %s", s_streaming ? "STARTED -> re-broadcasting on Auracast"
+                                                   : "suspended -> broadcasting silence");
+        break;
+    case ESP_A2D_AUDIO_CFG_EVT: {
+        const esp_a2d_mcc_t *m = &p->audio_cfg.mcc;
+        uint32_t r = 44100;
+        if (m->type == ESP_A2D_MCT_SBC) {
+            if (m->cie.sbc_info.samp_freq & ESP_A2D_SBC_CIE_SF_48K)      r = 48000;
+            else if (m->cie.sbc_info.samp_freq & ESP_A2D_SBC_CIE_SF_44K) r = 44100;
+            else if (m->cie.sbc_info.samp_freq & ESP_A2D_SBC_CIE_SF_32K) r = 32000;
+            else                                                        r = 16000;
+        }
+        s_src_rate = r;
+        ESP_LOGW(TAG, "A2DP codec configured: type %d, %lu Hz -> resampled to 48000 Hz",
+                 m->type, (unsigned long)r);
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+static void gap_bt_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *p)
+{
+    switch (event) {
+    case ESP_BT_GAP_AUTH_CMPL_EVT:
+        ESP_LOGW(TAG, "Paired with '%s' (status %d)", p->auth_cmpl.device_name, p->auth_cmpl.stat);
+        break;
+    case ESP_BT_GAP_CFM_REQ_EVT:
+        ESP_LOGI(TAG, "SSP confirm %06lu -> accept", (unsigned long)p->cfm_req.num_val);
+        esp_bt_gap_ssp_confirm_reply(p->cfm_req.bda, true);
+        break;
+    case ESP_BT_GAP_READ_REMOTE_NAME_EVT:
+        if (p->read_rmt_name.stat == ESP_BT_STATUS_SUCCESS && s_name_cb) {
+            s_name_cb((const char *)p->read_rmt_name.rmt_name);
+        }
+        break;
+    case ESP_BT_GAP_PIN_REQ_EVT: {
+        esp_bt_pin_code_t pin = {'0', '0', '0', '0'};
+        esp_bt_gap_pin_reply(p->pin_req.bda, true, 4, pin);
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+/* The last phone that streamed to us, kept in NVS. */
+static void remember_phone(const uint8_t *a)
+{
+    nvs_handle_t h;
+    if (nvs_open("jbl", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_blob(h, "last_phone", a, 6);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+static bool recall_phone(uint8_t out[6])
+{
+    nvs_handle_t h;
+    size_t len = 6;
+    bool ok = false;
+    if (nvs_open("jbl", NVS_READONLY, &h) == ESP_OK) {
+        ok = nvs_get_blob(h, "last_phone", out, &len) == ESP_OK && len == 6;
+        nvs_close(h);
+    }
+    return ok;
+}
+
+/* Like a real speaker: on power-up (and after a lost link) call back the LAST
+ * phone only - never cycle through every device ever paired. */
+static void call_back_last_phone(const char *why)
+{
+    uint8_t a[6];
+    if (!recall_phone(a)) {
+        ESP_LOGI(TAG, "no previous phone - connect to 'S31 JBL Xtreme 5' from the phone's Bluetooth settings");
+        return;
+    }
+    for (int attempt = 0; attempt < 3 && !s_a2dp_connected; attempt++) {
+        ESP_LOGW(TAG, "%s: calling back last phone %02x:%02x:%02x:%02x:%02x:%02x (try %d/3)",
+                 why, a[0], a[1], a[2], a[3], a[4], a[5], attempt + 1);
+        esp_a2d_sink_connect(a);
+        for (int w = 0; w < 8 && !s_a2dp_connected; w++) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+    }
+}
+
+static void reconnect_task(void *arg)
+{
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    call_back_last_phone("power-up");
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        if (s_retry_after_loss && !s_a2dp_connected) {
+            s_retry_after_loss = false;
+            vTaskDelay(pdMS_TO_TICKS(1500));
+            call_back_last_phone("link lost");
+        }
+    }
+}
+
+/* ---- bring-up ------------------------------------------------------------ */
+
+esp_err_t bt_dual_mode_init(void)
+{
+    esp_err_t ret;
+
+    esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+    ret = esp_bt_controller_init(&bt_cfg);
+    if (ret) {
+        ESP_LOGE(TAG, "controller init failed %d", ret);
+        return ret;
+    }
+    ret = esp_bt_controller_enable(ESP_BT_MODE_BTDM);
+    if (ret) {
+        ESP_LOGE(TAG, "controller enable (dual mode) failed %d", ret);
+        return ret;
+    }
+    esp_bluedroid_config_t cfg = BT_BLUEDROID_INIT_CONFIG_DEFAULT();
+    ret = esp_bluedroid_init_with_cfg(&cfg);
+    if (ret) {
+        return ret;
+    }
+    ret = esp_bluedroid_enable();
+    if (ret) {
+        return ret;
+    }
+
+    /* LE security as in the BLE-audio examples (Just Works, SC + bond). */
+    esp_ble_auth_req_t auth_req = ESP_LE_AUTH_REQ_SC_BOND;
+    esp_ble_io_cap_t iocap = ESP_IO_CAP_NONE;
+    uint8_t key_size = 16;
+    uint8_t init_key = ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK;
+    uint8_t rsp_key = ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK;
+    esp_ble_gap_set_security_param(ESP_BLE_SM_AUTHEN_REQ_MODE, &auth_req, sizeof(auth_req));
+    esp_ble_gap_set_security_param(ESP_BLE_SM_IOCAP_MODE, &iocap, sizeof(iocap));
+    esp_ble_gap_set_security_param(ESP_BLE_SM_MAX_KEY_SIZE, &key_size, sizeof(key_size));
+    esp_ble_gap_set_security_param(ESP_BLE_SM_SET_INIT_KEY, &init_key, sizeof(init_key));
+    esp_ble_gap_set_security_param(ESP_BLE_SM_SET_RSP_KEY, &rsp_key, sizeof(rsp_key));
+    return ESP_OK;
+}
+
+esp_err_t a2dp_bridge_start(const char *bredr_name)
+{
+    /* Phone-audio buffer lives in PSRAM when there is one (frees internal SRAM
+     * for Bluetooth and the LC3 encoder); falls back to internal RAM. */
+    s_rb = xRingbufferCreateWithCaps(RB_BYTES, RINGBUF_TYPE_BYTEBUF, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (s_rb == NULL) {
+        s_rb = xRingbufferCreate(RB_BYTES, RINGBUF_TYPE_BYTEBUF);
+    }
+    if (s_rb == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    ESP_LOGW(TAG, "audio buffer %u KB in %s; free internal %u KB, PSRAM %u KB", RB_BYTES / 1024,
+             esp_ptr_external_ram(s_rb) ? "PSRAM" : "internal RAM",
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
+
+    esp_bt_gap_register_callback(gap_bt_cb);
+    esp_bt_sp_param_t sp = ESP_BT_SP_IOCAP_MODE;
+    esp_bt_io_cap_t io = ESP_BT_IO_CAP_NONE;
+    esp_bt_gap_set_security_param(sp, &io, sizeof(io));
+
+    esp_bt_gap_set_device_name(bredr_name);
+
+    /* Class of Device: Audio/Video - Loudspeaker, services Audio + Rendering. */
+    esp_bt_cod_t cod = {0};
+    cod.major = ESP_BT_COD_MAJOR_DEV_AV;
+    cod.minor = 0x05;                                  /* Loudspeaker */
+    cod.service = ESP_BT_COD_SRVC_AUDIO | ESP_BT_COD_SRVC_RENDERING;
+    esp_bt_gap_set_cod(cod, ESP_BT_INIT_COD);
+
+    esp_a2d_register_callback(a2d_cb);
+    ESP_ERROR_CHECK(esp_a2d_sink_init());
+    esp_a2d_sink_register_data_callback(a2d_data_cb);
+
+    esp_a2d_mcc_t mcc = {0};
+    mcc.type = ESP_A2D_MCT_SBC;
+    mcc.cie.sbc_info.samp_freq = ESP_A2D_SBC_CIE_SF_32K | ESP_A2D_SBC_CIE_SF_44K | ESP_A2D_SBC_CIE_SF_48K;
+    mcc.cie.sbc_info.ch_mode = ESP_A2D_SBC_CIE_CH_MODE_MONO | ESP_A2D_SBC_CIE_CH_MODE_DUAL_CHANNEL |
+                               ESP_A2D_SBC_CIE_CH_MODE_STEREO | ESP_A2D_SBC_CIE_CH_MODE_JOINT_STEREO;
+    mcc.cie.sbc_info.block_len = ESP_A2D_SBC_CIE_BLOCK_LEN_4 | ESP_A2D_SBC_CIE_BLOCK_LEN_8 |
+                                 ESP_A2D_SBC_CIE_BLOCK_LEN_12 | ESP_A2D_SBC_CIE_BLOCK_LEN_16;
+    mcc.cie.sbc_info.num_subbands = ESP_A2D_SBC_CIE_NUM_SUBBANDS_4 | ESP_A2D_SBC_CIE_NUM_SUBBANDS_8;
+    mcc.cie.sbc_info.alloc_mthd = ESP_A2D_SBC_CIE_ALLOC_MTHD_SRN | ESP_A2D_SBC_CIE_ALLOC_MTHD_LOUDNESS;
+    mcc.cie.sbc_info.min_bitpool = 2;
+    mcc.cie.sbc_info.max_bitpool = 53;   /* full SBC High Quality, as before */
+    esp_a2d_sink_register_stream_endpoint(0, &mcc);
+
+    esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+
+    const uint8_t *a = esp_bt_dev_get_address();
+    ESP_LOGW(TAG, "BR/EDR speaker '%s' discoverable at %02x:%02x:%02x:%02x:%02x:%02x (A2DP sink)",
+             bredr_name, a[0], a[1], a[2], a[3], a[4], a[5]);
+    xTaskCreatePinnedToCore(reconnect_task, "a2dp_reconn", 3072, NULL, 4, NULL, 1);   /* core 1: keep core 0 for the BT controller */
+    return ESP_OK;
+}

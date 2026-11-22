@@ -1,0 +1,55 @@
+# This file was generated using idf.py save-defconfig. It can be edited manually.
+# Espressif IoT Development Framework (ESP-IDF) Project Minimal Configuration
+#
+
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=n
+CONFIG_BT_BLUEDROID_ENABLED=y
+# Dual mode: BLE for Auracast + BR/EDR for phones (A2DP sink), like a JBL speaker
+CONFIG_BTDM_CTRL_MODE_BTDM=y
+CONFIG_BT_CLASSIC_ENABLED=y
+CONFIG_BT_A2DP_ENABLE=y
+CONFIG_BT_SSP_ENABLED=y
+CONFIG_BT_CONTROLLER_ENABLED=y
+CONFIG_BT_BLE_ENABLED=y
+CONFIG_BT_BLE_50_FEATURES_SUPPORTED=y
+CONFIG_BT_ACL_CONNECTIONS=4
+CONFIG_BT_BLE_FEAT_ISO_EN=y
+
+CONFIG_BT_ISO_MAX_CHAN=2
+# Lets us set the BIG layout explicitly (ISO interval, NSE, BN, IRC, PTO) to
+# match the real Xtreme 5, via HCI LE Create BIG Test.
+CONFIG_BT_ISO_TEST_PARAMS=y
+
+CONFIG_BT_BAP_BROADCAST_SOURCE=y
+# Stereo: one subgroup, two BIS (Front-Left + Front-Right), like a JBL broadcast.
+CONFIG_BT_BAP_BROADCAST_SRC_SUBGROUP_COUNT=1
+CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT=2
+
+# PSRAM for audio buffers; small/time-critical allocations stay in internal SRAM.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=65536
+CONFIG_SPIRAM_IGNORE_NOTFOUND=y
+
+# 16 MB flash on the S31 board; dual-mode Bluetooth needs a bigger app slot
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+CONFIG_FREERTOS_HZ=1000
+
+# BASE metadata headroom (phones/finders send rich metadata)
+CONFIG_BT_AUDIO_CODEC_CFG_MAX_METADATA_SIZE=128
+
+# Two advertisers: Auracast broadcast + JBL host beacon
+CONFIG_BT_LE_MAX_EXT_ADV_INSTANCES=2
+
+# Coexistence tuning: max LE TX power for the Auracast stream, more BR/EDR RX buffers
+CONFIG_BT_LE_DFT_TX_POWER_LEVEL_P20=y
+CONFIG_BT_CTRL_BR_EDR_ACLU_RX_BUF_NB=10
+
+# Controller (radio timing) alone on core 0; Bluedroid host + SBC decode on core 1
+CONFIG_BT_BLUEDROID_PINNED_TO_CORE_1=y
+
