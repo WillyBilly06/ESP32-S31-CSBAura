@@ -71,8 +71,35 @@ static esp_ble_audio_bap_stream_t *streams_p[ARRAY_SIZE(streams)];
 typedef struct {
     struct broadcast_sink_stream *ss;
     uint16_t len;
+    uint16_t seq;
+    uint32_t ts;
+    uint8_t  flags;
     uint8_t  data[MAX_SDU_BYTES];
 } decode_item_t;
+
+/* LC3 frame dump for host analysis (tools/lc3_dump_analyze.py): one line per
+ * SDU of BIS 1, "LC3F <seq> <ts> <flags> <len> <base64>". ~16 KB/s of text,
+ * needs the 921600 console. */
+#ifndef LC3_FRAME_DUMP
+#define LC3_FRAME_DUMP 1
+#endif
+static void dump_frame(const decode_item_t *it)
+{
+    static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    char out[4 * (MAX_SDU_BYTES / 3 + 1) + 1];
+    int o = 0;
+    for (int i = 0; i < it->len; i += 3) {
+        uint32_t v = (uint32_t)it->data[i] << 16;
+        if (i + 1 < it->len) v |= (uint32_t)it->data[i + 1] << 8;
+        if (i + 2 < it->len) v |= it->data[i + 2];
+        out[o++] = b64[(v >> 18) & 63];
+        out[o++] = b64[(v >> 12) & 63];
+        out[o++] = i + 1 < it->len ? b64[(v >> 6) & 63] : '=';
+        out[o++] = i + 2 < it->len ? b64[v & 63] : '=';
+    }
+    out[o] = 0;
+    printf("LC3F %u %lu %u %u %s\n", it->seq, (unsigned long)it->ts, it->flags, it->len, out);
+}
 static QueueHandle_t s_decode_q;
 
 static const esp_ble_audio_bap_scan_delegator_recv_state_t *req_recv_state;
@@ -507,6 +534,9 @@ static void stream_recv_cb(esp_ble_audio_bap_stream_t *stream,
         decode_item_t item;
         item.ss  = sink_stream;
         item.len = len;
+        item.seq = info ? info->seq_num : 0;
+        item.ts = info ? info->ts : 0;
+        item.flags = info ? info->flags : 0;
         memcpy(item.data, data, len);
         xQueueSend(s_decode_q, &item, 0);   /* drop on full; never block the ISO task */
     }
@@ -538,6 +568,11 @@ static void decode_task(void *arg)
         if (ss == NULL || ss->nch <= 0 || ss->opf <= 0) {
             continue;   /* stream torn down (nch cleared before decoders freed) */
         }
+#if LC3_FRAME_DUMP
+        if (stream_index(&ss->stream) == 0) {
+            dump_frame(&item);
+        }
+#endif
 
         int fs = ss->frame_samples;
         if (fs > 480) {

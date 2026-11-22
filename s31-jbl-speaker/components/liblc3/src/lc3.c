@@ -358,7 +358,18 @@ static void analyze(struct lc3_encoder *encoder,
 
     lc3_sns_analyze(dt, sr, nbytes, e, att, &side->sns, xf, xf);
 
+#if LC3_ENCODER_JBL_COMPAT
+    /* Match the real JBL Xtreme 5 encoder (its Auracast stream captured on the
+     * S31, 2026-11-21): bandwidth always signalled as NB and TNS never used
+     * (rc_order 0 on every frame). The coded spectrum still covers the full
+     * band - in LC3 the bandwidth field only sets the noise-filling range and
+     * the TNS filter count. With TNS on, our filters change every frame on a
+     * sweep and the Xtreme 5's decoder warbles; tones keep them constant. */
+    side->bw = LC3_BANDWIDTH_NB;
+    lc3_tns_analyze(dt, side->bw, true, nbytes, &side->tns, xf);   /* nn_flag -> every order 0 */
+#else
     lc3_tns_analyze(dt, side->bw, nn_flag, nbytes, &side->tns, xf);
+#endif
 #if LC3_ENCODER_STATS
     { extern volatile uint32_t lc3_enc_stat[5]; lc3_enc_stat[3] += side->tns.rc_order[0] > 0 || (side->tns.nfilters > 1 && side->tns.rc_order[1] > 0); }
 #endif

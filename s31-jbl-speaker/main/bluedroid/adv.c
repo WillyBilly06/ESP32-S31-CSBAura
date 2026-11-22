@@ -27,13 +27,24 @@
 
 #include "adv.h"
 #include "../jbl_assistant.h"
+#include "../party_role.h"
 
 static SemaphoreHandle_t adv_sem;
+/* Serialises the blocking helpers below: they share adv_sem, and since the
+ * party-role switch they are called from several tasks (jbl_pa, party). */
+static SemaphoreHandle_t adv_lock;
 
 /* Controller status latched by gap_event_handler for EXAMPLE_WAIT_API_CHECK. */
 static esp_bt_status_t adv_op_status;
 
 #define WAIT_API(_call) EXAMPLE_WAIT_API_CHECK(_call, adv_sem, portMAX_DELAY, adv_op_status)
+
+/* Wrap a helper body (which returns on error from inside WAIT_API) in adv_lock. */
+#define ADV_LOCKED(_body_fn, ...) ({                                \
+        xSemaphoreTake(adv_lock, portMAX_DELAY);                    \
+        int _r = _body_fn(__VA_ARGS__);                             \
+        xSemaphoreGive(adv_lock);                                   \
+        _r; })
 
 static esp_ble_gap_ext_adv_params_t ext_adv_params = {
     .type = ESP_BLE_GAP_SET_EXT_ADV_PROP_NONCONN_NONSCANNABLE_UNDIRECTED,
@@ -115,6 +126,14 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event,
         adv_op_status = param->period_adv_start.status;
         xSemaphoreGive(adv_sem);
         break;
+    case ESP_GAP_BLE_PERIODIC_ADV_STOP_COMPLETE_EVT:
+        adv_op_status = param->period_adv_stop.status;
+        xSemaphoreGive(adv_sem);
+        break;
+    case ESP_GAP_BLE_EXT_ADV_STOP_COMPLETE_EVT:
+        adv_op_status = param->ext_adv_stop.status;
+        xSemaphoreGive(adv_sem);
+        break;
     case ESP_GAP_BLE_SCAN_REQ_RECEIVED_EVT: {
         /* Log each scanner address the first time it is seen. */
         static uint8_t seen[32][6];
@@ -150,7 +169,9 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event,
         }
         break;
     default:
-        /* scan reports, scan start, pairing -> auto-join assistant */
+        /* scan params/start/stop complete -> party role (LISTEN scanner);
+         * scan reports, scan start, pairing -> auto-join assistant */
+        party_role_gap_event(event, param);
         jbl_assistant_gap_event(event, param);
         break;
     }
@@ -160,8 +181,9 @@ int app_host_init(void)
 {
     esp_err_t err;
 
+    adv_lock = xSemaphoreCreateMutex();
     adv_sem = xSemaphoreCreateBinary();
-    if (adv_sem == NULL) {
+    if (adv_sem == NULL || adv_lock == NULL) {
         ESP_LOGE(TAG, "Failed to create adv semaphore");
         return -1;
     }
@@ -176,8 +198,22 @@ int app_host_init(void)
     return 0;
 }
 
-int ext_adv_start(const uint8_t *ext_data, uint8_t ext_len,
-                  const uint8_t *per_data, uint8_t per_len)
+/* Like WAIT_API, but a failure is only logged and the wait is bounded: used
+ * for "stop" commands, which must not abort a teardown or an interval change
+ * (e.g. the beacon set may already be stopped by an incoming connection). */
+#define WAIT_API_SOFT(_call) do {                                           \
+        esp_err_t _e = (_call);                                             \
+        if (_e != ESP_OK) {                                                 \
+            ESP_LOGW(TAG, #_call " failed, err %d", _e);                    \
+        } else if (xSemaphoreTake(adv_sem, pdMS_TO_TICKS(1000)) != pdTRUE) { \
+            ESP_LOGW(TAG, #_call " timed out");                             \
+        } else if (adv_op_status != ESP_BT_STATUS_SUCCESS) {                \
+            ESP_LOGW(TAG, #_call " ctrl status %d", adv_op_status);         \
+        }                                                                   \
+    } while (0)
+
+static int ext_adv_start_impl(const uint8_t *ext_data, uint8_t ext_len,
+                              const uint8_t *per_data, uint8_t per_len)
 {
     WAIT_API(esp_ble_gap_ext_adv_set_params(ADV_HANDLE, &ext_adv_params));
     WAIT_API(esp_ble_gap_config_ext_adv_data_raw(ADV_HANDLE, ext_len, ext_data));
@@ -195,9 +231,30 @@ int ext_adv_start(const uint8_t *ext_data, uint8_t ext_len,
     return 0;
 }
 
-int beacon_adv_start(const uint8_t *adv, uint8_t adv_len,
-                     const uint8_t *rsp, uint8_t rsp_len,
-                     const uint8_t rand_addr[6])
+int ext_adv_start(const uint8_t *ext_data, uint8_t ext_len,
+                  const uint8_t *per_data, uint8_t per_len)
+{
+    return ADV_LOCKED(ext_adv_start_impl, ext_data, ext_len, per_data, per_len);
+}
+
+static int ext_adv_stop_impl(void)
+{
+    uint8_t h = ADV_HANDLE;
+
+    WAIT_API_SOFT(esp_ble_gap_periodic_adv_stop(ADV_HANDLE));
+    WAIT_API_SOFT(esp_ble_gap_ext_adv_stop(1, &h));
+    ESP_LOGI(TAG, "Broadcast advertising stopped (handle %u)", ADV_HANDLE);
+    return 0;
+}
+
+int ext_adv_stop(void)
+{
+    return ADV_LOCKED(ext_adv_stop_impl);
+}
+
+static int beacon_adv_start_impl(const uint8_t *adv, uint8_t adv_len,
+                                 const uint8_t *rsp, uint8_t rsp_len,
+                                 const uint8_t rand_addr[6])
 {
     esp_bd_addr_t addr;
 
@@ -216,7 +273,14 @@ int beacon_adv_start(const uint8_t *adv, uint8_t adv_len,
     return 0;
 }
 
-int per_adv_data_update(const uint8_t *per_data, uint8_t per_len)
+int beacon_adv_start(const uint8_t *adv, uint8_t adv_len,
+                     const uint8_t *rsp, uint8_t rsp_len,
+                     const uint8_t rand_addr[6])
+{
+    return ADV_LOCKED(beacon_adv_start_impl, adv, adv_len, rsp, rsp_len, rand_addr);
+}
+
+static int per_adv_data_update_impl(const uint8_t *per_data, uint8_t per_len)
 {
 #if CONFIG_BT_BLE_FEAT_PERIODIC_ADV_ENH
     WAIT_API(esp_ble_gap_config_periodic_adv_data_raw(ADV_HANDLE, per_len, per_data, false));
@@ -226,25 +290,41 @@ int per_adv_data_update(const uint8_t *per_data, uint8_t per_len)
     return 0;
 }
 
+int per_adv_data_update(const uint8_t *per_data, uint8_t per_len)
+{
+    return ADV_LOCKED(per_adv_data_update_impl, per_data, per_len);
+}
+
 /* Replace the beacon's advertising data while it runs (blocking; app task only). */
-int beacon_adv_data_update(const uint8_t *adv, uint8_t adv_len)
+static int beacon_adv_data_update_impl(const uint8_t *adv, uint8_t adv_len)
 {
     WAIT_API(esp_ble_gap_config_ext_adv_data_raw(BEACON_HANDLE, adv_len, adv));
     return 0;
 }
 
-/* Change the beacon interval: stop, re-param, restart (blocking; app task only). */
-int beacon_set_interval(uint16_t ms)
+int beacon_adv_data_update(const uint8_t *adv, uint8_t adv_len)
+{
+    return ADV_LOCKED(beacon_adv_data_update_impl, adv, adv_len);
+}
+
+/* Change the beacon interval: stop, re-param, restart (blocking; app task only).
+ * The stop is waited for now: its STOP_COMPLETE event gives adv_sem, and an
+ * unwaited give would let the next WAIT_API return early. */
+static int beacon_set_interval_impl(uint16_t ms)
 {
     uint8_t h = BEACON_HANDLE;
-    esp_ble_gap_ext_adv_stop(1, &h);
-    vTaskDelay(pdMS_TO_TICKS(20));
+    WAIT_API_SOFT(esp_ble_gap_ext_adv_stop(1, &h));
     beacon_adv_params.interval_min = ESP_BLE_GAP_ADV_ITVL_MS(ms);
     beacon_adv_params.interval_max = ESP_BLE_GAP_ADV_ITVL_MS(ms);
     WAIT_API(esp_ble_gap_ext_adv_set_params(BEACON_HANDLE, &beacon_adv_params));
     WAIT_API(esp_ble_gap_ext_adv_start(1, beacon_adv_inst));
     ESP_LOGI(TAG, "JBL beacon interval now %u ms", ms);
     return 0;
+}
+
+int beacon_set_interval(uint16_t ms)
+{
+    return ADV_LOCKED(beacon_set_interval_impl, ms);
 }
 
 void beacon_adv_restart(void)

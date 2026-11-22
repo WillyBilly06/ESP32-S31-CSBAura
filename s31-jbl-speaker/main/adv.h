@@ -28,6 +28,11 @@ int app_host_init(void);
 int ext_adv_start(const uint8_t *ext_data, uint8_t ext_len,
                   const uint8_t *per_data, uint8_t per_len);
 
+/* Stop the broadcast's periodic + extended advertising on ADV_HANDLE (the set
+ * stays configured, so ext_adv_start() can bring it back). Blocking; errors
+ * are logged, not returned. All helpers here are serialised by one mutex. */
+int ext_adv_stop(void);
+
 /* Start the JBL host beacon on BEACON_HANDLE with its own random static address. */
 int beacon_adv_start(const uint8_t *adv, uint8_t adv_len,
                      const uint8_t *rsp, uint8_t rsp_len,
