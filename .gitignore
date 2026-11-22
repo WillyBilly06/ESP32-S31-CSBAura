@@ -21,3 +21,6 @@ tools/jadx/
 Thumbs.db
 desktop.ini
 __pycache__/
+
+# Claude Code agent worktrees
+.claude/
