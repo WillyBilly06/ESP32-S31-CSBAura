@@ -245,6 +245,7 @@ static volatile uint32_t g_iso_not_txd;     /* SDUs the controller could NOT put
 static volatile uint32_t g_iso_drift;       /* SDUs flagged as drifted vs the BIG anchor */
 static volatile uint32_t g_late_ticks;      /* encode ticks > 15 ms after the previous one */
 static volatile uint32_t g_max_gap_us;      /* worst gap between encode ticks */
+static volatile uint32_t g_enc_us_sum, g_enc_us_max, g_enc_n;   /* lc3_encode time, both channels */
 
 #define STREAM_COUNT            CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT
 #define SUBGROUP_COUNT          CONFIG_BT_BAP_BROADCAST_SRC_SUBGROUP_COUNT
@@ -494,6 +495,7 @@ static void broadcast_source_tx(void)
     /* JBL One EQ (7 JBL biquads), applied before encoding like the real speaker */
     v5_eq_process(pcm, fs);
 
+    int64_t enc_t0 = esp_timer_get_time();
     for (int ch = 0; ch < 2 && ch < (int)ARRAY_SIZE(streams); ch++) {
         struct broadcast_source_stream *s = &streams[ch];
         if (g_enc[ch] == NULL || s->data == NULL ||
@@ -507,6 +509,12 @@ static void broadcast_source_tx(void)
         if (esp_ble_audio_bap_stream_send(&s->stream, s->data, opf, streams[0].seq_num) != 0) {
             g_send_errors++;
         }
+    }
+    {
+        uint32_t us = (uint32_t)(esp_timer_get_time() - enc_t0);   /* encode + hand-off, 2 channels */
+        g_enc_us_sum += us;
+        g_enc_n++;
+        if (us > g_enc_us_max) g_enc_us_max = us;
     }
     streams[0].seq_num++;
     g_frames_sent++;
@@ -604,7 +612,12 @@ static esp_err_t broadcast_source_setup(void)
     create_param.params = subgroup_param;
     create_param.qos = &preset_active.qos;
     create_param.encryption = (strlen(LOCAL_BROADCAST_CODE) > 0);
-    create_param.packing = ESP_BLE_ISO_PACKING_SEQUENTIAL;
+    /* Interleaved: L0 R0 L1 R1 | L2 R2 ... -> both channels' first copies (prio 9)
+     * go out back-to-back at the start of each BIG event; the A2DP link (prio 8)
+     * can only take later repetitions (prio 7), never a first copy. With
+     * sequential packing a 5-slot EDR packet won over L's repetitions and ran
+     * into R's first copies (26% of SDUs never sent). */
+    create_param.packing = ESP_BLE_ISO_PACKING_INTERLEAVED;
     if (create_param.encryption) {
         memcpy(create_param.broadcast_code, LOCAL_BROADCAST_CODE, strlen(LOCAL_BROADCAST_CODE));
     }
