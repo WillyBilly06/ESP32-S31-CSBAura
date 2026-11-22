@@ -61,7 +61,7 @@ enum lc3_bandwidth lc3_bwdet_run(
         { { 41, 49+1 }, { 51, 55+1 }, { 57, 60+1 }, { 61, 63+1 } },
     };
 
-    static const struct region (*bws_table[])[LC3_BANDWIDTH_SWB+1] = {
+    static const struct region (* const bws_table[])[LC3_BANDWIDTH_SWB+1] = {
         [LC3_DT_2M5] = LC3_IF_PLUS(bws_table_2m5,  NULL),
         [LC3_DT_5M ] = LC3_IF_PLUS(bws_table_5m ,  NULL),
         [LC3_DT_7M5] = bws_table_7m5,

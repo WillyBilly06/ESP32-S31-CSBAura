@@ -33,8 +33,13 @@
  */
 #ifndef fft_5
 LC3_HOT static inline void fft_5(
-    const struct lc3_complex *x, struct lc3_complex *y, int n)
+    const struct lc3_complex * restrict x,
+    struct lc3_complex * restrict y, int n)
 {
+    /* Note: `x` and `y` never overlap (ping-pong buffers), the `restrict`
+     * qualifiers let the compiler keep the operands in registers instead
+     * of reloading them after each store.  Expressions are unchanged. */
+
     static const float cos1 =  0.3090169944;  /* cos(-2Pi 1/5) */
     static const float cos2 = -0.8090169944;  /* cos(-2Pi 2/5) */
 
@@ -43,43 +48,46 @@ LC3_HOT static inline void fft_5(
 
     for (int i = 0; i < n; i++, x++, y+= 5) {
 
+        const struct lc3_complex x0 = x[0  ], x1 = x[1*n];
+        const struct lc3_complex x2 = x[2*n], x3 = x[3*n], x4 = x[4*n];
+
         struct lc3_complex s14 =
-            { x[1*n].re + x[4*n].re, x[1*n].im + x[4*n].im };
+            { x1.re + x4.re, x1.im + x4.im };
         struct lc3_complex d14 =
-            { x[1*n].re - x[4*n].re, x[1*n].im - x[4*n].im };
+            { x1.re - x4.re, x1.im - x4.im };
 
         struct lc3_complex s23 =
-            { x[2*n].re + x[3*n].re, x[2*n].im + x[3*n].im };
+            { x2.re + x3.re, x2.im + x3.im };
         struct lc3_complex d23 =
-            { x[2*n].re - x[3*n].re, x[2*n].im - x[3*n].im };
+            { x2.re - x3.re, x2.im - x3.im };
 
-        y[0].re = x[0].re + s14.re + s23.re;
+        y[0].re = x0.re + s14.re + s23.re;
 
-        y[0].im = x[0].im + s14.im + s23.im;
+        y[0].im = x0.im + s14.im + s23.im;
 
-        y[1].re = x[0].re + s14.re * cos1 - d14.im * sin1
-                          + s23.re * cos2 - d23.im * sin2;
+        y[1].re = x0.re + s14.re * cos1 - d14.im * sin1
+                        + s23.re * cos2 - d23.im * sin2;
 
-        y[1].im = x[0].im + s14.im * cos1 + d14.re * sin1
-                          + s23.im * cos2 + d23.re * sin2;
+        y[1].im = x0.im + s14.im * cos1 + d14.re * sin1
+                        + s23.im * cos2 + d23.re * sin2;
 
-        y[2].re = x[0].re + s14.re * cos2 - d14.im * sin2
-                          + s23.re * cos1 + d23.im * sin1;
+        y[2].re = x0.re + s14.re * cos2 - d14.im * sin2
+                        + s23.re * cos1 + d23.im * sin1;
 
-        y[2].im = x[0].im + s14.im * cos2 + d14.re * sin2
-                          + s23.im * cos1 - d23.re * sin1;
+        y[2].im = x0.im + s14.im * cos2 + d14.re * sin2
+                        + s23.im * cos1 - d23.re * sin1;
 
-        y[3].re = x[0].re + s14.re * cos2 + d14.im * sin2
-                          + s23.re * cos1 - d23.im * sin1;
+        y[3].re = x0.re + s14.re * cos2 + d14.im * sin2
+                        + s23.re * cos1 - d23.im * sin1;
 
-        y[3].im = x[0].im + s14.im * cos2 - d14.re * sin2
-                          + s23.im * cos1 + d23.re * sin1;
+        y[3].im = x0.im + s14.im * cos2 - d14.re * sin2
+                        + s23.im * cos1 + d23.re * sin1;
 
-        y[4].re = x[0].re + s14.re * cos1 + d14.im * sin1
-                          + s23.re * cos2 + d23.im * sin2;
+        y[4].re = x0.re + s14.re * cos1 + d14.im * sin1
+                        + s23.re * cos2 + d23.im * sin2;
 
-        y[4].im = x[0].im + s14.im * cos1 - d14.re * sin1
-                          + s23.im * cos2 - d23.re * sin2;
+        y[4].im = x0.im + s14.im * cos1 - d14.re * sin1
+                        + s23.im * cos2 - d23.re * sin2;
     }
 }
 #endif /* fft_5 */
@@ -93,7 +101,8 @@ LC3_HOT static inline void fft_5(
 #ifndef fft_bf3
 LC3_HOT static inline void fft_bf3(
     const struct lc3_fft_bf3_twiddles *twiddles,
-    const struct lc3_complex *x, struct lc3_complex *y, int n)
+    const struct lc3_complex * restrict x,
+    struct lc3_complex * restrict y, int n)
 {
     int n3 = twiddles->n3;
     const struct lc3_complex (*w0)[2] = twiddles->t;
@@ -105,23 +114,28 @@ LC3_HOT static inline void fft_bf3(
     for (int i = 0; i < n; i++, y0 += 3*n3, y1 += 3*n3, y2 += 3*n3)
         for (int j = 0; j < n3; j++, x0++, x1++, x2++) {
 
-            y0[j].re = x0->re + x1->re * w0[j][0].re - x1->im * w0[j][0].im
-                              + x2->re * w0[j][1].re - x2->im * w0[j][1].im;
+            const struct lc3_complex a = *x0, b = *x1, c = *x2;
+            const struct lc3_complex w00 = w0[j][0], w01 = w0[j][1];
+            const struct lc3_complex w10 = w1[j][0], w11 = w1[j][1];
+            const struct lc3_complex w20 = w2[j][0], w21 = w2[j][1];
 
-            y0[j].im = x0->im + x1->im * w0[j][0].re + x1->re * w0[j][0].im
-                              + x2->im * w0[j][1].re + x2->re * w0[j][1].im;
+            y0[j].re = a.re + b.re * w00.re - b.im * w00.im
+                            + c.re * w01.re - c.im * w01.im;
 
-            y1[j].re = x0->re + x1->re * w1[j][0].re - x1->im * w1[j][0].im
-                              + x2->re * w1[j][1].re - x2->im * w1[j][1].im;
+            y0[j].im = a.im + b.im * w00.re + b.re * w00.im
+                            + c.im * w01.re + c.re * w01.im;
 
-            y1[j].im = x0->im + x1->im * w1[j][0].re + x1->re * w1[j][0].im
-                              + x2->im * w1[j][1].re + x2->re * w1[j][1].im;
+            y1[j].re = a.re + b.re * w10.re - b.im * w10.im
+                            + c.re * w11.re - c.im * w11.im;
 
-            y2[j].re = x0->re + x1->re * w2[j][0].re - x1->im * w2[j][0].im
-                              + x2->re * w2[j][1].re - x2->im * w2[j][1].im;
+            y1[j].im = a.im + b.im * w10.re + b.re * w10.im
+                            + c.im * w11.re + c.re * w11.im;
 
-            y2[j].im = x0->im + x1->im * w2[j][0].re + x1->re * w2[j][0].im
-                              + x2->im * w2[j][1].re + x2->re * w2[j][1].im;
+            y2[j].re = a.re + b.re * w20.re - b.im * w20.im
+                            + c.re * w21.re - c.im * w21.im;
+
+            y2[j].im = a.im + b.im * w20.re + b.re * w20.im
+                            + c.im * w21.re + c.re * w21.im;
         }
 }
 #endif /* fft_bf3 */
@@ -135,7 +149,8 @@ LC3_HOT static inline void fft_bf3(
 #ifndef fft_bf2
 LC3_HOT static inline void fft_bf2(
     const struct lc3_fft_bf2_twiddles *twiddles,
-    const struct lc3_complex *x, struct lc3_complex *y, int n)
+    const struct lc3_complex * restrict x,
+    struct lc3_complex * restrict y, int n)
 {
     int n2 = twiddles->n2;
     const struct lc3_complex *w = twiddles->t;
@@ -147,11 +162,13 @@ LC3_HOT static inline void fft_bf2(
 
         for (int j = 0; j < n2; j++, x0++, x1++) {
 
-            y0[j].re = x0->re + x1->re * w[j].re - x1->im * w[j].im;
-            y0[j].im = x0->im + x1->im * w[j].re + x1->re * w[j].im;
+            const struct lc3_complex a = *x0, b = *x1, wj = w[j];
 
-            y1[j].re = x0->re - x1->re * w[j].re + x1->im * w[j].im;
-            y1[j].im = x0->im - x1->im * w[j].re - x1->re * w[j].im;
+            y0[j].re = a.re + b.re * wj.re - b.im * wj.im;
+            y0[j].im = a.im + b.im * wj.re + b.re * wj.im;
+
+            y1[j].re = a.re - b.re * wj.re + b.im * wj.im;
+            y1[j].im = a.im - b.im * wj.re - b.re * wj.im;
         }
     }
 }

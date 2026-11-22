@@ -1,0 +1,28 @@
+# liblc3: 48 kHz / 10 ms ENCODER hot functions in internal RAM (IRAM).
+#
+# These run on every frame (x2 channels) and account for ~80 % of the
+# encoder cycles.  Placed in IRAM, they no longer depend on the flash cache,
+# which Bluedroid / SBC / resampler code keeps evicting on the same core.
+# Cost: ~22.6 KB of internal SRAM (IRAM and DRAM share the same pool).
+# Everything else (decoder, PLC, other samplerates, SNS analysis) stays in
+# flash.  Disable with `idf.py -DLC3_ENCODER_IRAM=OFF build`.
+
+[mapping:liblc3_iram]
+archive: libliblc3.a
+entries:
+    lc3:lc3_encode (noflash_text)
+    lc3:load_s16 (noflash_text)
+    ltpf:resample_48k_12k8 (noflash_text)
+    ltpf:correlate (noflash_text)
+    ltpf:interpolate (noflash_text)
+    mdct:fft (noflash_text)
+    mdct:lc3_mdct_forward (noflash_text)
+    energy:lc3_energy_compute (noflash_text)
+    sns:unquantize (noflash_text)
+    spec:estimate_gain (noflash_text)
+    spec:quantize (noflash_text)
+    spec:compute_nbits (noflash_text)
+    spec:lc3_spec_analyze (noflash_text)
+    spec:lc3_spec_encode (noflash_text)
+    bits:lc3_put_bits_generic (noflash_text)
+    bits:lc3_ac_write_renorm (noflash_text)

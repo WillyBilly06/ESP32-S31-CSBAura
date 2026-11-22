@@ -367,7 +367,47 @@ LC3_HOT static void resample_24k_12k8(
 LC3_HOT static void resample_48k_12k8(
     struct lc3_ltpf_hp50_state *hp50, const int16_t *x, int16_t *y, int n)
 {
-    resample_x192k_12k8(4, h_48k_12k8_q15, hp50, x, y, n);
+    /* Same arithmetic as `resample_x192k_12k8(4, ...)`, reordered :
+     *
+     * Output `i` uses phase `(15 i) % 4` and the input window starting
+     * at `(15 i) / 4`.  Outputs `i`, `i+4`, `i+8` and `i+12` share the
+     * same phase (coefficients), with windows 15 samples apart.
+     * Computing them together loads each coefficient once for 4 products.
+     * The FIR sums are exact integers (wrap-around as the reference), so
+     * the order does not matter; the high-pass filter is then run in order.
+     *
+     * `n` is a multiple of 16 (32, 64, 96 or 128). */
+
+    const int w = 2*(120 / 4);
+    const int16_t *h = h_48k_12k8_q15;
+
+    x -= w - 1;
+
+    for (int g = 0; g < n; g += 16, x += 60) {
+        int32_t un[16];
+
+        for (int p = 0; p < 4; p++) {
+            const int16_t *hn = h + ((15*p) % 4) * w;
+            const int16_t *x0 = x + (15*p) / 4;
+            int32_t u0 = 0, u1 = 0, u2 = 0, u3 = 0;
+
+            for (int k = 0; k < w; k++) {
+                int32_t hk = hn[k];
+                u0 += x0[k     ] * hk;
+                u1 += x0[k + 15] * hk;
+                u2 += x0[k + 30] * hk;
+                u3 += x0[k + 45] * hk;
+            }
+
+            un[p+ 0] = u0; un[p+ 4] = u1;
+            un[p+ 8] = u2; un[p+12] = u3;
+        }
+
+        for (int i = 0; i < 16; i++) {
+            int32_t yn = filter_hp50(hp50, un[i]);
+            *(y++) = (yn + (1 << 15)) >> 16;
+        }
+    }
 }
 #endif /* resample_48k_12k8 */
 
@@ -435,17 +475,46 @@ static void (* const resample_12k8[])
  * The size `n` of vectors must be multiple of 16, and less or equal to 128
 */
 #ifndef dot
+
+/**
+ * Exact `(sum + 32) >> 6` of 16x16 products, without 64 bits accumulation
+ *
+ * The reference accumulates the products `p` on 64 bits, and returns
+ * `(int32_t)((sum + 32) >> 6)`.  On 32 bits cores (RV32), each 64 bits
+ * accumulation costs 5 instructions (add, sltu, srai, add, add).
+ *
+ * We accumulate instead, with wrap-around 32 bits arithmetic :
+ *   w = sum( p )        mod 2^32
+ *   h = sum( p >> 6 )   mod 2^32
+ *
+ * The true sum is `64 * H + L` with `L = sum(p & 63)`, `0 <= L < 64 n`,
+ * then `L = w - 64 h` exactly (computed mod 2^32, and L < 2^32), and :
+ *   (sum + 32) >> 6  =  H + ((L + 32) >> 6)
+ * which is bit-exact, mod 2^32, with the reference conversion to int32.
+ */
+
+struct dot_acc { uint32_t w, h; };
+
+#define DOT_ACC(acc, a, b) do { \
+    int32_t p_ = (int32_t)(a) * (b); \
+    (acc).w += (uint32_t)p_; (acc).h += (uint32_t)(p_ >> 6); } while (0)
+
+static inline float dot_acc_result(struct dot_acc acc)
+{
+    uint32_t l = acc.w - (acc.h << 6);
+    return (float)(int32_t)(acc.h + ((l + 32) >> 6));
+}
+
 LC3_HOT static inline float dot(const int16_t *a, const int16_t *b, int n)
 {
-    int64_t v = 0;
+    struct dot_acc acc = { 0, 0 };
 
-    for (int i = 0; i < (n >> 4); i++)
-        for (int j = 0; j < 16; j++)
-            v += *(a++) * *(b++);
+    for (int i = 0; i < n; i++)
+        DOT_ACC(acc, a[i], b[i]);
 
-    int32_t v32 = (v + (1 << 5)) >> 6;
-    return (float)v32;
+    return dot_acc_result(acc);
 }
+
 #endif /* dot */
 
 /**
@@ -457,10 +526,102 @@ LC3_HOT static inline float dot(const int16_t *a, const int16_t *b, int n)
  * The size `n` of vectors is multiple of 16, and less or equal to 128
  */
 #ifndef correlate
+
+/**
+ * Result of `dot()` when the exact sum is known to fit on 32 bits
+ */
+static inline float dot32_result(uint32_t w)
+{
+    int32_t s = (int32_t)w;
+    return (float)((s >> 6) + (((s & 63) + 32) >> 6));
+}
+
+/**
+ * Square, scaled down by 2^8, used to bound energies (`v * v < 2^8 (q + 1)`)
+ */
+static inline uint32_t sq8(int32_t v)
+{
+    return (uint32_t)(v * v) >> 8;
+}
+
 LC3_HOT static void correlate(
     const int16_t *a, const int16_t *b, int n, float *y, int nc)
 {
-    for (const float *ye = y + nc; y < ye; )
+    /* --- 4 lags at a time ---
+     * y[k+j] = sum( a[i] * b[i-k-j] ), j = [0..3]
+     * `a[i]` is shared and `b` is a sliding window kept in registers,
+     * 2 loads for 4 products instead of 8 loads.
+     *
+     * --- Fast path ---
+     * By Cauchy-Schwarz, |sum(a b)| <= sqrt(Ea Eb), with `Ea`, `Eb` the
+     * energies of the vectors.  When Ea Eb < 2^62, the exact sum fits on
+     * 32 bits and the wrap-around 32 bits sum is exact (no need of `h`).
+     * The energies are bounded with `Ex < 2^8 (Qx + n)`, `Qx = sum(sq8(x))`
+     * (exact integers, no overflow for n <= 128), so the test is :
+     *   (Qa + n) (Qb + n) < 2^46  <=>  mulhu(Qa + n, Qb + n) < 2^14
+     * `Qb` is updated incrementally while sliding the lags. */
+
+    uint32_t qa = n, qb = n;
+
+    for (int i = 0; i < n; i++)
+        qa += sq8(a[i]), qb += sq8(b[i]);
+
+    for ( ; nc >= 4; nc -= 4, y += 4, b -= 4) {
+
+        uint32_t q0 = qb;
+        uint32_t q1 = q0 + sq8(b[-1]) - sq8(b[n-1]);
+        uint32_t q2 = q1 + sq8(b[-2]) - sq8(b[n-2]);
+        uint32_t q3 = q2 + sq8(b[-3]) - sq8(b[n-3]);
+        uint32_t qm = LC3_MAX(LC3_MAX(q0, q1), LC3_MAX(q2, q3));
+
+        if (nc > 4)
+            qb = q3 + sq8(b[-4]) - sq8(b[n-4]);
+
+        if ((uint32_t)(((uint64_t)qa * qm) >> 32) < (1u << 14)) {
+            uint32_t r0 = 0, r1 = 0, r2 = 0, r3 = 0;
+            int32_t b1 = b[-1], b2 = b[-2], b3 = b[-3];
+
+            for (int i = 0; i < n; i++) {
+                int32_t ai = a[i], b0 = b[i];
+
+                r0 += (uint32_t)(ai * b0);
+                r1 += (uint32_t)(ai * b1);
+                r2 += (uint32_t)(ai * b2);
+                r3 += (uint32_t)(ai * b3);
+
+                b3 = b2, b2 = b1, b1 = b0;
+            }
+
+            y[0] = dot32_result(r0);
+            y[1] = dot32_result(r1);
+            y[2] = dot32_result(r2);
+            y[3] = dot32_result(r3);
+            continue;
+        }
+
+        struct dot_acc r0 = { 0, 0 }, r1 = { 0, 0 },
+                       r2 = { 0, 0 }, r3 = { 0, 0 };
+
+        int32_t b1 = b[-1], b2 = b[-2], b3 = b[-3];
+
+        for (int i = 0; i < n; i++) {
+            int32_t ai = a[i], b0 = b[i];
+
+            DOT_ACC(r0, ai, b0);
+            DOT_ACC(r1, ai, b1);
+            DOT_ACC(r2, ai, b2);
+            DOT_ACC(r3, ai, b3);
+
+            b3 = b2, b2 = b1, b1 = b0;
+        }
+
+        y[0] = dot_acc_result(r0);
+        y[1] = dot_acc_result(r1);
+        y[2] = dot_acc_result(r2);
+        y[3] = dot_acc_result(r3);
+    }
+
+    for ( ; nc > 0; nc--)
         *(y++) = dot(a, b--, n);
 }
 #endif /* correlate */
@@ -597,11 +758,17 @@ static bool detect_pitch(struct lc3_ltpf_analysis *ltpf,
     const int16_t *x1 = x - (r0 + t1);
     const int16_t *x2 = x - (r0 + t2);
 
-    float nc1 = rm1 <= 0 ? 0 :
-        rm1 / sqrtf(dot(x, x, n) * dot(x1, x1, n));
+    /* `dot(x, x, n)` is computed once, and when the two candidates are
+     * the same lag (`rm2 == rm1`), so is the normalized correlation
+     * (saves a dot product, a square root and a division). */
 
-    float nc2 = rm2 <= 0 ? 0 :
-        rm2 / sqrtf(dot(x, x, n) * dot(x2, x2, n));
+    float x0x0 = (rm1 > 0 || rm2 > 0) ? dot(x, x, n) : 0;
+
+    float nc1 = rm1 <= 0 ? 0 :
+        rm1 / sqrtf(x0x0 * dot(x1, x1, n));
+
+    float nc2 = t2 == t1 ? nc1 : rm2 <= 0 ? 0 :
+        rm2 / sqrtf(x0x0 * dot(x2, x2, n));
 
     int t1sel = nc2 <= 0.85f * nc1;
     ltpf->tc = (t1sel ? t1 : t2);

@@ -50,6 +50,50 @@ LC3_HOT static inline float dot(const float *a, const float *b, int n)
 }
 
 /**
+ * Autocorrelation for lags 0 to 8
+ * x, n            The vector of size `n` (n > 8)
+ * c               Output `c[k] = dot(x, x + k, n - k)`, k = [0..8]
+ *
+ * Bit-exact with 9 calls to `dot()`: each lag keeps its own accumulator,
+ * summed in the same (ascending) order.  Interleaving the 9 lags shares
+ * the loads of `x` (sliding window in registers) and hides the latency
+ * of the dependent multiply-accumulate chain, which dominates on
+ * in-order FPUs such as the RV32F cores.
+ */
+LC3_HOT static void autocorr_9(const float *x, int n, float *c)
+{
+    float c0 = 0, c1 = 0, c2 = 0, c3 = 0, c4 = 0, c5 = 0, c6 = 0, c7 = 0, c8 = 0;
+    float x1 = x[1], x2 = x[2], x3 = x[3], x4 = x[4],
+          x5 = x[5], x6 = x[6], x7 = x[7], x8;
+    float x0 = x[0];
+    int i;
+
+    for (i = 0; i < n - 8; i++) {
+        x8 = x[i+8];
+
+        c0 += x0 * x0; c1 += x0 * x1; c2 += x0 * x2;
+        c3 += x0 * x3; c4 += x0 * x4; c5 += x0 * x5;
+        c6 += x0 * x6; c7 += x0 * x7; c8 += x0 * x8;
+
+        x0 = x1, x1 = x2, x2 = x3, x3 = x4;
+        x4 = x5, x5 = x6, x6 = x7, x7 = x8;
+    }
+
+    /* --- Tail, i = [n-8..n-1], lag `k` stops at i = n-1-k --- */
+
+    float t[8] = { x0, x1, x2, x3, x4, x5, x6, x7 };
+    float acc[8] = { c0, c1, c2, c3, c4, c5, c6, c7 };
+
+    for (int j = 0; j < 8; j++)
+        for (int k = 0; k < 8 - j; k++)
+            acc[k] += t[j] * t[j+k];
+
+    for (int k = 0; k < 8; k++)
+        c[k] = acc[k];
+    c[8] = c8;
+}
+
+/**
  * LPC Coefficients
  * dt, bw          Duration and bandwidth of the frame
  * maxorder        Maximum order of filter
@@ -132,6 +176,14 @@ LC3_HOT static void compute_lpc_coeffs(
 
         for (int s = 0; s < nsubdivisions; s++) {
             xs = xe, xe = x + *(++sub);
+
+            if (maxorder == 8 && xe - xs > 8) {
+                float ck[9];
+                autocorr_9(xs, xe - xs, ck);
+                for (int k = 0; k <= 8; k++)
+                    c[k][s] = ck[k];
+                continue;
+            }
 
             for (int k = 0; k <= maxorder; k++)
                 c[k][s] = dot(xs, xs + k, (xe - xs) - k);
@@ -244,7 +296,7 @@ static void quantize_rc(const float *rc, int maxorder, int *order, int *rc_q)
     /* Quantization table, sin(delta * (i + 0.5)), delta = Pi / 17,
      * rounded to fixed point Q15 value (LC3-Plus HR requirements). */
 
-    static float q_thr[] = {
+    static const float q_thr[] = {
         0x0bcfp-15, 0x2307p-15, 0x390ep-15, 0x4d23p-15,
         0x5e98p-15, 0x6cd4p-15, 0x775bp-15, 0x7dd2p-15,
     };
@@ -274,7 +326,7 @@ static void unquantize_rc(const int *rc_q, int order, float rc[8])
     /* Quantization table, sin(delta * i), delta = Pi / 17,
      * rounded to fixed point Q15 value (LC3-Plus HR requirements). */
 
-    static float q_inv[] = {
+    static const float q_inv[] = {
         0x0000p-15, 0x1785p-15, 0x2e3dp-15, 0x4362p-15,
         0x563cp-15, 0x6625p-15, 0x7295p-15, 0x7b1dp-15, 0x7f74p-15,
     };

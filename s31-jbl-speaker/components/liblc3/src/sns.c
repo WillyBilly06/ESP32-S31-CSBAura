@@ -270,7 +270,7 @@ LC3_HOT static void compute_scale_factors(
 
 #endif /* LC3_PLUS_HR */
 
-    static const float *ge_table[LC3_NUM_SRATE] = {
+    static const float * const ge_table[LC3_NUM_SRATE] = {
         [LC3_SRATE_8K    ] = ge_14, [LC3_SRATE_16K   ] = ge_18,
         [LC3_SRATE_24K   ] = ge_22, [LC3_SRATE_32K   ] = ge_26,
         [LC3_SRATE_48K   ] = ge_30,
@@ -416,11 +416,53 @@ LC3_HOT static void resolve_codebooks(
  */
 LC3_HOT static void normalize(const int *c, float *cn)
 {
+    /* `c2_sum` is an integer, at most 10^2 + 1 (K = 10 pulses on the first
+     * 10 positions, plus 1 pulse).  The table holds the IEEE single
+     * precision values of `1.f / sqrtf(k)` (correctly rounded sqrt then
+     * divide, as computed at run-time), so the result is bit-exact, without
+     * the division and square root. */
+
+    static const float rsqrt_tab[128] = {
+                     0,        0x1p+0f, 0x1.6a09e6p-1f, 0x1.279a74p-1f,
+               0x1p-1f, 0x1.c9f25cp-2f, 0x1.a20bd6p-2f,  0x1.83092p-2f,
+        0x1.6a09e6p-2f, 0x1.555556p-2f, 0x1.43d136p-2f, 0x1.34bf64p-2f,
+        0x1.279a74p-2f, 0x1.1c01aap-2f, 0x1.11aceep-2f, 0x1.08654ap-2f,
+               0x1p-2f, 0x1.f0b686p-3f,  0x1.e2b7ep-3f, 0x1.d5d7eap-3f,
+        0x1.c9f25cp-3f, 0x1.bee904p-3f, 0x1.b4a294p-3f, 0x1.ab099ap-3f,
+        0x1.a20bd6p-3f, 0x1.99999ap-3f, 0x1.91a556p-3f, 0x1.8a2346p-3f,
+         0x1.83092p-3f, 0x1.7c4dd6p-3f, 0x1.75e974p-3f, 0x1.6fd4e8p-3f,
+        0x1.6a09e6p-3f, 0x1.6482d4p-3f, 0x1.5f3aa8p-3f, 0x1.5a2cd8p-3f,
+        0x1.555556p-3f, 0x1.50b06ap-3f, 0x1.4c3abep-3f, 0x1.47f146p-3f,
+        0x1.43d136p-3f, 0x1.3fd808p-3f, 0x1.3c0366p-3f, 0x1.38512cp-3f,
+        0x1.34bf64p-3f, 0x1.314c3ep-3f, 0x1.2df60cp-3f, 0x1.2abb44p-3f,
+        0x1.279a74p-3f, 0x1.24924ap-3f, 0x1.21a186p-3f, 0x1.1ec702p-3f,
+        0x1.1c01aap-3f, 0x1.19507ep-3f,  0x1.16b29p-3f, 0x1.1426fcp-3f,
+        0x1.11aceep-3f, 0x1.0f43a4p-3f, 0x1.0cea62p-3f, 0x1.0aa07cp-3f,
+        0x1.08654ap-3f, 0x1.063832p-3f, 0x1.0418a4p-3f, 0x1.020614p-3f,
+               0x1p-3f, 0x1.fc0bd8p-4f, 0x1.f82ec8p-4f, 0x1.f467f4p-4f,
+        0x1.f0b686p-4f, 0x1.ed19b8p-4f, 0x1.e990cep-4f, 0x1.e61b16p-4f,
+         0x1.e2b7ep-4f, 0x1.df668ap-4f, 0x1.dc267cp-4f, 0x1.d8f71ep-4f,
+        0x1.d5d7eap-4f, 0x1.d2c854p-4f, 0x1.cfc7dcp-4f, 0x1.ccd606p-4f,
+        0x1.c9f25cp-4f, 0x1.c71c72p-4f, 0x1.c453d8p-4f, 0x1.c1982cp-4f,
+        0x1.bee904p-4f, 0x1.bc460ap-4f, 0x1.b9aedcp-4f, 0x1.b72326p-4f,
+        0x1.b4a294p-4f, 0x1.b22cd6p-4f, 0x1.afc19ep-4f,  0x1.ad60ap-4f,
+        0x1.ab099ap-4f, 0x1.a8bc44p-4f, 0x1.a6785ap-4f,  0x1.a43dap-4f,
+        0x1.a20bd6p-4f, 0x1.9fe2c2p-4f, 0x1.9dc22cp-4f, 0x1.9ba9dcp-4f,
+        0x1.99999ap-4f, 0x1.979138p-4f,  0x1.95908p-4f, 0x1.939744p-4f,
+        0x1.91a556p-4f, 0x1.8fba8ap-4f, 0x1.8dd6b4p-4f, 0x1.8bf9acp-4f,
+        0x1.8a2346p-4f, 0x1.88535ep-4f, 0x1.8689ccp-4f, 0x1.84c66ep-4f,
+         0x1.83092p-4f, 0x1.8151bcp-4f, 0x1.7fa024p-4f, 0x1.7df438p-4f,
+        0x1.7c4dd6p-4f, 0x1.7aace2p-4f, 0x1.79113ep-4f, 0x1.777acep-4f,
+        0x1.75e974p-4f, 0x1.745d18p-4f, 0x1.72d59ep-4f, 0x1.7152eap-4f,
+        0x1.6fd4e8p-4f, 0x1.6e5b7ep-4f, 0x1.6ce694p-4f, 0x1.6b7614p-4f,
+    };
+
     int c2_sum = 0;
     for (int i = 0; i < 16; i++)
         c2_sum += c[i] * c[i];
 
-    float c_norm = 1.f / sqrtf(c2_sum);
+    float c_norm = c2_sum < 128 ?
+        rsqrt_tab[c2_sum] : 1.f / sqrtf(c2_sum);
 
     for (int i = 0; i < 16; i++)
         cn[i] = c[i] * c_norm;
