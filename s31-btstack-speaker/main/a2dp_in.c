@@ -860,7 +860,9 @@ static void avrcp_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet
             break;                                       /* same event via the CT/TG handlers */
         }
         s_avrcp_cid = avrcp_subevent_connection_established_get_avrcp_cid(packet);
-        /* absolute volume: the phone's slider drives our gain, and we tell it ours */
+        /* absolute volume: the phone's slider drives our gain, and we tell it ours -
+         * capped so a reconnect never jumps the phone (and the party) to full */
+        if (s_volume > 76) s_volume = 76;            /* ~60 % */
         avrcp_target_support_event(s_avrcp_cid, AVRCP_NOTIFICATION_EVENT_VOLUME_CHANGED);
         avrcp_target_volume_changed(s_avrcp_cid, s_volume);
         ESP_LOGW(TAG, "AVRCP connected (cid 0x%02x), absolute volume %u/127", s_avrcp_cid, s_volume);
