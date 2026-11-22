@@ -34,7 +34,7 @@ static const char *TAG = "A2DP";
 #define OUT_RATE        48000
 #define PKT_MAX         (AVDTP_L2CAP_MTU + 16)
 #define PKT_Q_LEN       24                    /* ~300 ms of 5-frame packets */
-#define RING_MS         400
+#define RING_MS         160                   /* max S31-added delay: beyond it the OLDEST audio is dropped */
 #define TARGET_MS       80                    /* PCM fill the clock recovery aims at */
 #define PRIME_MS        50                    /* start output once this much is buffered */
 #define MS_FRAMES(ms)   ((OUT_RATE / 1000) * (ms))
@@ -106,10 +106,10 @@ static void on_pcm(int16_t *data, int num_frames, int num_channels, int sample_r
         done += m;
         int o = rs_run(&s_rs, step, s_out_tmp, RS_OUT_MAX);
         if (o > 0) {
+            /* full: throw the OLDEST audio away, always keep the newest */
             uint32_t space = ring_space(&s_ring);
             if ((uint32_t)o > space) {
-                s_ring_drops += (uint32_t)o - space;
-                o = (int)space;
+                s_ring_drops += ring_drop_oldest(&s_ring, (uint32_t)o - space);
             }
             ring_write(&s_ring, s_out_tmp, (uint32_t)o);
         }
@@ -186,9 +186,7 @@ int a2dp_in_read(int16_t *pcm, int n)
         memset(pcm, 0, (size_t)n * 4);
         return 0;
     }
-    uint32_t have = ring_fill(&s_ring);
-    uint32_t take = have < (uint32_t)n ? have : (uint32_t)n;
-    ring_read(&s_ring, (uint32_t *)pcm, take);
+    uint32_t take = ring_read_upto(&s_ring, (uint32_t *)pcm, (uint32_t)n);
     if (take < (uint32_t)n) {
         memset(pcm + 2 * take, 0, (size_t)(n - take) * 4);
         s_underruns++;
@@ -204,7 +202,7 @@ void a2dp_in_log_stats(void)
     static uint32_t last_pkts;
     uint32_t pk = s_pkts;
     ESP_LOGW(TAG, "A2DP 2s: %s, media pkts %lu (+%lu), q drops %lu, seq gaps %lu | bitpool %lu (min %lu max %lu) | "
-             "PCM %lu ms, underruns %lu, ring drops %lu, clock corr %ld ppm",
+             "PCM %lu ms, underruns %lu, oldest dropped %lu, clock corr %ld ppm",
              s_streaming ? "STREAMING" : s_connected ? "connected" : "no phone",
              (unsigned long)pk, (unsigned long)(pk - last_pkts), (unsigned long)s_pkt_drops,
              (unsigned long)s_seq_gaps, (unsigned long)s_bitpool,

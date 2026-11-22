@@ -213,25 +213,62 @@ static inline void ring_write(spsc_ring_t *r, const uint32_t *src, uint32_t n)
     __atomic_store_n(&r->wr, w, __ATOMIC_RELEASE);
 }
 
+/* Overflow policy: drop the OLDEST audio, keep the newest. The read position
+ * is therefore moved by both sides, always with compare-and-swap:
+ *   producer  ring_drop_oldest()  advances rd past the oldest frames
+ *   consumer  ring_read_upto()    copies, then commits rd only if nobody moved
+ *                                 it meanwhile (else the copy may contain
+ *                                 frames the producer has just overwritten,
+ *                                 and it retries on the new position)
+ * The write position stays producer-only. */
+static inline uint32_t ring_fill_at(const spsc_ring_t *r, uint32_t d)
+{
+    uint32_t w = __atomic_load_n(&r->wr, __ATOMIC_ACQUIRE);
+    return w >= d ? w - d : w + r->slots - d;
+}
+
+/* Consumer: copy up to n frames; returns how many. */
+static inline uint32_t ring_read_upto(spsc_ring_t *r, uint32_t *dst, uint32_t n)
+{
+    for (;;) {
+        uint32_t d = __atomic_load_n(&r->rd, __ATOMIC_ACQUIRE);
+        uint32_t have = ring_fill_at(r, d);
+        uint32_t take = have < n ? have : n;
+        uint32_t first = r->slots - d;
+        if (first > take) first = take;
+        memcpy(dst, r->buf + d, first * 4);
+        memcpy(dst + first, r->buf, (take - first) * 4);
+        uint32_t nd = d + take;
+        if (nd >= r->slots) nd -= r->slots;
+        if (__atomic_compare_exchange_n(&r->rd, &d, nd, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            return take;
+        }
+    }
+}
+
 /* Consumer: n must be <= ring_fill(). */
 static inline void ring_read(spsc_ring_t *r, uint32_t *dst, uint32_t n)
 {
-    uint32_t d = r->rd;
-    uint32_t first = r->slots - d;
-    if (first > n) first = n;
-    memcpy(dst, r->buf + d, first * 4);
-    memcpy(dst + first, r->buf, (n - first) * 4);
-    d += n;
-    if (d >= r->slots) d -= r->slots;
-    __atomic_store_n(&r->rd, d, __ATOMIC_RELEASE);
+    (void)ring_read_upto(r, dst, n);
 }
 
-/* Consumer: drop the n oldest frames (n <= ring_fill()) without copying them.
- * Only moves rd, so it is as lock-free as ring_read; ring_skip(r, ring_fill(r))
- * flushes the ring from the consumer side. */
+/* Either side: drop up to n of the oldest frames; returns how many. */
+static inline uint32_t ring_drop_oldest(spsc_ring_t *r, uint32_t n)
+{
+    for (;;) {
+        uint32_t d = __atomic_load_n(&r->rd, __ATOMIC_ACQUIRE);
+        uint32_t have = ring_fill_at(r, d);
+        uint32_t k = have < n ? have : n;
+        uint32_t nd = d + k;
+        if (nd >= r->slots) nd -= r->slots;
+        if (__atomic_compare_exchange_n(&r->rd, &d, nd, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            return k;
+        }
+    }
+}
+
+/* Consumer: drop the n oldest frames (flush = ring_skip(r, ring_fill(r))). */
 static inline void ring_skip(spsc_ring_t *r, uint32_t n)
 {
-    uint32_t d = r->rd + n;
-    if (d >= r->slots) d -= r->slots;
-    __atomic_store_n(&r->rd, d, __ATOMIC_RELEASE);
+    (void)ring_drop_oldest(r, n);
 }
