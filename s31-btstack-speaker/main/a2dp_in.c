@@ -29,6 +29,7 @@
 
 #include "a2dp_dsp.h"
 #include "bt_sched_tune.h"
+#include "auracast.h"
 
 static const char *TAG = "A2DP";
 
@@ -562,11 +563,14 @@ static void volume_store(void)
     }
 }
 
+uint8_t a2dp_in_volume(void) { return s_volume; }
+
 static void volume_set(uint8_t v, const char *why)
 {
     if (v > 127) v = 127;
     if (v == s_volume) return;
     s_volume = v;
+    auracast_volume_changed();                /* party members follow (JBL block volume) */
     ESP_LOGW(TAG, "volume %u/127 (%d%%, %.1f dB) <- %s", v, v * 100 / 127,
              v ? 20.0 * log10((double)volume_gain(v)) : -999.0, why);
     volume_store();

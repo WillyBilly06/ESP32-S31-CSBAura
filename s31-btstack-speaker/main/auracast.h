@@ -88,6 +88,10 @@ void auracast_log_stats(void);
 #include <stddef.h>
 void *auracast_lc3_workspace_take(size_t *half);
 
+/* BT thread: the phone volume changed - refresh the JBL party block now so
+ * every joined speaker follows it (no-op while not broadcasting). */
+void auracast_volume_changed(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -24,6 +24,8 @@ void a2dp_in_button(a2dp_btn_t btn);
 
 /* Local speaker path: apply the phone (AVRCP) volume, ramped. One caller at a time. */
 void a2dp_in_apply_volume(int16_t *pcm, int n);
+/* Any thread: current phone (AVRCP absolute) volume, 0..127. */
+uint8_t a2dp_in_volume(void);
 
 /* Bench test: replace the phone audio with a 20 s cycle of
  *   0-9 s   up-sweep 50 Hz -> 18 kHz made at 48 kHz (straight to the encoder)

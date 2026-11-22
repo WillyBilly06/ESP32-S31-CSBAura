@@ -187,6 +187,8 @@ static const uint8_t jbl_pa_mfg_ad[] = {
 #ifndef AURA_JBL_PA_BLOCK
 #define AURA_JBL_PA_BLOCK      (!AURA_GENERIC)
 #endif
+#define JBL_PA_VOL_OFFSET      6          /* TLV 02 02 <vol>: master volume 0..100 (JBL AudioVolume scale; a partial sweep read 9..62) */
+#define JBL_PA_VOL_MAX         100
 #define JBL_PA_NN_OFFSET       10
 #define JBL_PA_YY_OFFSET       17
 #define JBL_PA_TG_OFFSET       20
@@ -436,13 +438,30 @@ static void pa_refresh(void)
 #endif
     uint32_t r = esp_random();
     s_pa[s_pa_jbl_pos + JBL_PA_NN_OFFSET] = s_pa_nn;
+    /* master volume: members join at it and follow it. Decoded from a sniffed
+ * sweep of a real Xtreme 5 master (read 9..62 over a partial sweep); the copied
+     * template carried 3, so every member joined at ~5 %. */
+    s_pa[s_pa_jbl_pos + JBL_PA_VOL_OFFSET] =
+        (uint8_t)(((unsigned)a2dp_in_volume() * JBL_PA_VOL_MAX + 63u) / 127u);
     /* YY is NOT random: the real master's YY is a clock - +~62 per second,
      * wrapping at 200 (1/64 s units mod 200), decoded from 385 sniffed updates.
      * Random values made party members see the master's time jump every update
      * (their volume dived to ~5 %). */
     s_pa[s_pa_jbl_pos + JBL_PA_YY_OFFSET] = (uint8_t)((uint64_t)esp_timer_get_time() * 64u / 1000000u % 200u);
-    s_pa[s_pa_jbl_pos + JBL_PA_TG_OFFSET] = ((r >> 8) % 10) < 6 ? 1 : 0;
+    (void)r;
+    /* TG: 1 = active. The real master's TG is not random (runs of 1 with 0/1
+     * flicker between); a random 0 here looked like a master not ready yet and
+     * a joining Xtreme 5 started very quiet. Constant 1 under test. */
+    s_pa[s_pa_jbl_pos + JBL_PA_TG_OFFSET] = 1;
     gap_periodic_advertising_set_data(s_adv_handle, s_pa_len, s_pa);
+}
+
+void auracast_volume_changed(void)
+{
+    if (s_phase == PH_ADV_ON_WAIT || s_phase == PH_BIG_WAIT || s_phase == PH_ON) {
+        s_pa_nn++;                                /* members act on a new update counter */
+        pa_refresh();
+    }
 }
 
 static int s_exp;                                 /* bench experiment phase (S31_TEST_SIGNAL) */
