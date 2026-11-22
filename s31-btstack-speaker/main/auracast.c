@@ -130,6 +130,11 @@ static const uint8_t jbl_pa_mfg_ad[] = {
     0x12, 0x11, 0x01, 0x01, 0x01, 0x00, 0x49, 0x00, 0x01, 0x01, 0x3c,
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x24, 0xb9, 0x01,
 };
+/* A/B test: 0 = periodic data carries the BASE only (no JBL party block whose
+ * NN/YY bytes we can only imitate; the real master's YY is not a timer). */
+#ifndef AURA_JBL_PA_BLOCK
+#define AURA_JBL_PA_BLOCK      0
+#endif
 #define JBL_PA_NN_OFFSET       10
 #define JBL_PA_YY_OFFSET       17
 
@@ -328,14 +333,21 @@ static void pa_build(void)
     le_audio_base_builder_add_bis(&b, 1, sizeof(cc_bis_fl), cc_bis_fl);
     le_audio_base_builder_add_bis(&b, 2, sizeof(cc_bis_fr), cc_bis_fr);
     s_pa_jbl_pos = le_audio_base_builder_get_ad_data_size(&b);
+#if AURA_JBL_PA_BLOCK
     memcpy(s_pa + s_pa_jbl_pos, jbl_pa_mfg_ad, sizeof(jbl_pa_mfg_ad));
     s_pa_len = s_pa_jbl_pos + sizeof(jbl_pa_mfg_ad);
+#else
+    s_pa_len = s_pa_jbl_pos;                      /* BASE only */
+#endif
 }
 
 /* BT thread: tick the JBL party block and hand it to the controller. BTstack
  * uploads from s_pa on its next run (single fragment, < 252 B). */
 static void pa_refresh(void)
 {
+#if !AURA_JBL_PA_BLOCK
+    return;
+#endif
     s_pa[s_pa_jbl_pos + JBL_PA_NN_OFFSET] = s_pa_nn;
     s_pa[s_pa_jbl_pos + JBL_PA_YY_OFFSET] = (uint8_t)(btstack_run_loop_get_time_ms() / 10);
     gap_periodic_advertising_set_data(s_adv_handle, s_pa_len, s_pa);

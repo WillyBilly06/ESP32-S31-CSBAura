@@ -178,8 +178,12 @@ static bool feat_value(uint16_t id, uint8_t *v, uint16_t *n)
     case 0x2005: v[0] = 0x00; *n = 1; return true;
     case 0x2006: v[0] = st.playtime_boost; *n = 1; return true;
     case 0x2009: v[0] = st.bass_boost; *n = 1; return true;
-    case 0x2C00: v[0] = 0x80; *n = 1; return true;                            /* Auracast party */
-    case 0x2C01: v[0] = 0x01; *n = 1; return true;                            /* group: party */
+    /* Report "no party" to the app: with PartyStatus b7 (auracastParty) and
+     * group = party, JBL One greys the EQ out ("not available in Auracast
+     * mode"). The broadcast and the native join do not depend on these GATT
+     * values (beacon + ext adv do that), so EQ stays usable while hosting. */
+    case 0x2C00: v[0] = 0x00; *n = 1; return true;                            /* not in a party (EQ enabled) */
+    case 0x2C01: v[0] = 0x00; *n = 1; return true;                            /* group: normal */
     case 0x2C02: v[0] = 0x02; *n = 1; return true;                            /* connected */
     case 0x2C03: v[0] = 0x02; *n = 1; return true;                            /* role: primary */
     case 0x2C04: v[0] = 0x00; *n = 1; return true;
@@ -450,7 +454,11 @@ void jbl_v5_on_write(hci_con_handle_t con, const uint8_t *d, uint16_t len)
         for (uint16_t k = 0; k < len && k < 24; k++) {
             hl += snprintf(h + hl, sizeof(h) - (size_t)hl, "%02x ", d[k]);
         }
-        ESP_LOGW(TAG, "app cmd 0x%04x (%u B): %s", cmd, have, h);
+        ESP_LOGW(TAG, "app cmd 0x%04x (%u B): %s -> replied 00 00", cmd, have, h);
+        /* Every command needs a reply with the same cmd id: the app's V5
+         * queue waits 6 s per unanswered command (that delayed the EQ). */
+        static const uint8_t ok[2] = { 0x00, 0x00 };
+        send_frame(con, cmd, ok, sizeof(ok));
         break;
     }
     }
