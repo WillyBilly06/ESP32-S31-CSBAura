@@ -254,36 +254,122 @@ function onStatus(st, initial = false) {
 }
 
 /* ================= metric tiles ================= */
+/* Fed by StatsParser in server.py from the s31-btstack-speaker 2 s status lines
+ * (A2DP / AURA / PARTY / JBL_* / V5_EQ / S31 HEAP) plus event lines.  "<key>_d" =
+ * increase of a firmware total since the previous 2 s line. */
 const L = (k) => latest[k];
+const has = (k) => latest[k] !== undefined && latest[k] !== null;
+const n0 = (k) => (has(k) ? fmtN(latest[k]) : '—');
+const dlt = (k) => (has(k + '_d') && latest[k + '_d'] > 0 ? ` (+${fmtN(latest[k + '_d'])})` : '');
+const at = (k) => (has(k) ? clock(latest[k]) : '');
+const join = (...p) => p.filter((x) => x !== '' && x != null && x !== false).join(' · ');
+const lvl3 = (v, warn, err) => (v == null ? '' : v >= err ? 'err' : v >= warn ? 'warn' : 'ok');
+const worst = (...c) => (c.includes('err') ? 'err' : c.includes('warn') ? 'warn' : c.includes('ok') ? 'ok' : c.includes('info') ? 'info' : '');
+const streaming = () => L('a2dp_state') === 'streaming';
+const ROLE_CLS = { HOST: 'ok', LISTEN: 'info', HOST_STOPPING: 'warn', LISTEN_STOPPING: 'warn' };
+
 const TILES = [
-  { id: 'not_sent', label: 'Auracast NOT SENT', val: () => L('not_sent'), unit: () => `/${L('expect') || 200}`,
-    cls: (v) => (v === 0 ? 'ok' : v < 5 ? 'warn' : 'err'), sub: () => (L('on_air') != null ? `on-air ${L('on_air')} · in flight ${L('in_flight') ?? '—'}/${L('in_flight_max') ?? '—'}` : ''), stale: 'not_sent' },
-  { id: 'underruns', label: 'A2DP underruns', val: () => L('underruns'), unit: () => '/2 s',
-    cls: (v) => (v === 0 ? 'ok' : v <= 2 ? 'warn' : 'err'), sub: () => (L('drops') != null ? `drops ${L('drops')} · glitches ${L('pcm_glitches') ?? 0}` : ''), stale: 'underruns' },
-  { id: 'buf_ms', label: 'A2DP buffer', val: () => L('buf_ms'), unit: () => 'ms',
-    cls: (v) => (v < 50 ? 'err' : v < 90 ? 'warn' : 'ok'), sub: () => (L('a2dp_pkts') != null ? `a2dp pkts ${fmtN(L('a2dp_pkts'))}` : ''), stale: 'buf_ms' },
+  // ---- phone -> S31 (A2DP) ----
+  { g: 'Phone · A2DP', id: 'a2dp', label: 'A2DP', val: () => L('a2dp_state'), unit: () => '',
+    cls: (v) => ({ streaming: 'ok', connected: 'info', paused: 'warn' }[v] || ''),
+    sub: () => (L('a2dp_state') === 'no phone'
+      ? join(L('a2dp_disc_reason'), L('a2dp_event') ? `${L('a2dp_event')} ${at('a2dp_event_t')}` : '')
+      : join(L('a2dp_peer'), L('bredr_role'), has('a2dp_since') ? 'since ' + clock(L('a2dp_since')) : '')), stale: 'a2dp_link' },
+  { id: 'volume', label: 'Volume / AVRCP', val: () => L('volume'), unit: () => '/127',
+    cls: () => (L('avrcp') === false ? 'warn' : 'info'),
+    sub: () => {
+      const v = L('volume'); const pct = has('volume_pct') ? L('volume_pct') : (v != null ? Math.round((v * 100) / 127) : null);
+      if (L('avrcp') === false) return join('no AVRCP — phone volume not synced', L('avrcp_event') && L('avrcp_event') !== 'AVRCP disconnected' ? L('avrcp_event') : '');
+      return join(has('avrcp') ? 'AVRCP ✓' : '', pct != null ? pct + '%' : '', has('volume_db') ? `${L('volume_db').toFixed(1)} dB` : '',
+        has('volume_src') ? `← ${L('volume_src')} ${at('volume_t')}` : '');
+    } },
+  { id: 'latency', label: 'Latency (PCM buffer)', val: () => L('pcm_ms'), unit: () => 'ms',
+    cls: (v) => (!streaming() ? '' : worst(v < 60 ? 'err' : v < 150 ? 'warn' : 'ok', L('catchups_d') > 0 ? 'warn' : '')),
+    sub: () => join(has('catchups') ? `catch-ups ${n0('catchups')}${dlt('catchups')}` : '',
+      has('catchup_ms') ? `${n0('catchup_ms')} ms skipped` : '', has('catchup_expired') ? `${n0('catchup_expired')} expired` : '',
+      has('clock_ppm') ? `corr ${L('clock_ppm')} ppm` : '',
+      has('delay_report_ms') ? `delay report ${L('delay_report_ms')} ms${L('delay_report_status') && L('delay_report_status') !== '0x00' ? ' → ' + L('delay_report_status') : ''}` : ''),
+    stale: 'pcm_ms' },
+  { id: 'underruns', label: 'A2DP underruns', val: () => L('a2dp_underruns_d'), unit: () => '/2 s',
+    cls: (v) => worst(lvl3(v, 1, 3), (L('seq_gaps_d') || 0) > 0 ? 'warn' : '', (L('q_drops_d') || 0) > 0 ? 'warn' : ''),
+    sub: () => join(`total ${n0('a2dp_underruns')}`, `seq gaps ${n0('seq_gaps')}${dlt('seq_gaps')}`,
+      `q drops ${n0('q_drops')}${dlt('q_drops')}`, `oldest dropped ${n0('oldest_dropped')}${dlt('oldest_dropped')}`), stale: 'a2dp_underruns' },
   { id: 'bitpool', label: 'SBC bitpool', val: () => L('bitpool'), unit: () => '',
-    cls: (v) => (v >= 51 ? 'ok' : v >= 35 ? 'warn' : 'err'), sub: () => (L('bitpool_min') != null ? `min ${L('bitpool_min')} · max ${L('bitpool_max')} · lost ${L('lost_pkts') ?? 0}` : ''), stale: 'bitpool' },
+    cls: (v) => (!streaming() ? '' : v >= 51 ? 'ok' : v >= 35 ? 'warn' : 'err'),
+    sub: () => join(has('bitpool_min') ? `min ${L('bitpool_min')} max ${L('bitpool_max')}` : '',
+      has('media_pkts_2s') ? `+${L('media_pkts_2s')} pkts` : '', has('sbc_fpp') ? `${L('sbc_fpp')} fr/pkt` : '',
+      has('pkt_max_b') ? `max ${L('pkt_max_b')} B` : '', L('sbc_config')), stale: 'bitpool' },
+  { id: 'role', label: 'BR/EDR link', val: () => L('bredr_role') ?? (has('link_last') ? 'role ?' : null), unit: () => '',
+    cls: (v) => (v === 'MASTER' ? 'ok' : v === 'SLAVE' ? 'err' : 'info'),
+    sub: () => join(L('bredr_role') === 'SLAVE' ? 'phone schedules the S31 — bad' : '',
+      has('link_poll_slots') ? `QoS poll ${L('link_poll_slots')} slots` : '', has('link_qos_latency_us') ? `latency ${fmtN(L('link_qos_latency_us'))} µs` : '',
+      has('link_max_slots') ? `max slots ${L('link_max_slots')}` : '', has('link_phone_edr') ? `phone EDR ${L('link_phone_edr')}` : '') || (L('link_last') || '') },
+  // ---- S31 -> speakers (Auracast) ----
+  { g: 'Auracast broadcast', id: 'aura', label: 'Auracast', val: () => L('aura_state'), unit: () => '',
+    cls: (v) => (v === 'ON' ? 'ok' : v === 'off' ? '' : 'warn'),
+    sub: () => join(has('sdu_sent_l') ? `sent L/R ${L('sdu_sent_l')}/${L('sdu_sent_r')}` : '', has('sdu_done_l') ? `done ${L('sdu_done_l')}/${L('sdu_done_r')}` : '',
+      has('aura_iso_us') ? `ISO ${L('aura_iso_us') / 1000} ms` : '', has('aura_since') ? 'since ' + clock(L('aura_since')) : ''), stale: 'aura_state' },
+  { id: 'not_sent', label: 'Not sent / late', val: () => L('not_sent'), unit: () => '/2 s',
+    cls: (v) => worst(lvl3(v, 1, 5), lvl3(L('late_silence'), 1, 5), (L('trimmed') || 0) > 0 ? 'warn' : ''),
+    sub: () => join(`host ${n0('not_sent_host')} ctrl ${n0('not_sent_ctrl')}`, `late ${n0('late_silence')}`, `trimmed ${n0('trimmed')}`,
+      has('rq_ready') ? `ready ${L('rq_ready')}/${L('rq_depth')}` : '', `in flight ${n0('in_flight')}`, `ctrl free ${n0('ctrl_free')}`), stale: 'not_sent' },
   { id: 'enc', label: 'LC3 encode avg', val: () => L('enc_avg'), unit: () => 'µs',
-    cls: (v) => { const m = L('enc_max') || 0; return v < 3000 && m < 6000 ? 'ok' : v < 6000 && m < 9000 ? 'warn' : 'err'; },
-    sub: () => (L('enc_max') != null ? `max ${fmtN(L('enc_max'))} µs · ~${L('enc_core_pct') ?? '—'}% core` : ''), stale: 'enc_avg' },
-  { id: 'sdu', label: 'SDU wait in controller', val: () => L('sdu_avg'), unit: () => 'µs avg',
-    cls: (v) => { const m = L('sdu_max') || 0; return v < 5000 && m < 10000 ? 'ok' : v < 10000 ? 'warn' : 'err'; },
-    sub: () => (L('sdu_max') != null ? `max ${fmtN(L('sdu_max'))} µs` : ''), stale: 'sdu_avg' },
-  { id: 'role', label: 'BR/EDR role', val: () => L('bredr_role'), unit: () => '',
-    cls: (v) => (v === 'MASTER' ? 'ok' : v === 'SLAVE' ? 'err' : 'info'), sub: () => (L('bredr_role') === 'SLAVE' ? 'phone schedules the S31 — bad' : L('bredr_role') ? 'S31 schedules the phone' : '') },
-  { id: 'a2dp', label: 'A2DP', val: () => L('a2dp_state'), unit: () => '',
-    cls: (v) => ({ streaming: 'ok', connected: 'info', paused: 'warn', disconnected: 'err' }[v] || ''),
-    sub: () => { const s = L('a2dp_state'); if (s === 'disconnected') return L('a2dp_disc_reason') || L('last_hci_reason') || ''; return L('a2dp_peer') ? `${L('a2dp_peer')}${L('a2dp_since') ? ' · since ' + clock(L('a2dp_since')) : ''}` : ''; } },
-  { id: 'heap', label: 'Free internal RAM', val: () => L('free_internal_kb'), unit: () => 'KB',
-    cls: (v) => (v > 100 ? 'ok' : v > 40 ? 'warn' : 'err'), sub: () => (L('free_psram_kb') != null ? `PSRAM free ${fmtN(L('free_psram_kb'))} KB` : '') },
+    cls: (v) => { const m = L('enc_max') || 0; return worst(v < 3000 && m < 6000 ? 'ok' : v < 6000 && m < 9000 ? 'warn' : 'err', (L('aura_underruns') || 0) + (L('aura_wdog') || 0) > 0 ? 'warn' : ''); },
+    sub: () => join(`max ${n0('enc_max')} µs`, `${n0('enc_frames')} fr`, `PCM underruns ${n0('aura_underruns')}`, `wdog ${n0('aura_wdog')}`,
+      `rq full ${n0('rq_full')}${dlt('rq_full')}`, has('enc_stack_free') ? `stack ${L('enc_stack_free')} B` : ''), stale: 'enc_avg' },
+  { id: 'big', label: 'BIG timing (BIS0)', val: () => (has('big_gap_avg_ms') ? Number(L('big_gap_avg_ms')).toFixed(3) : null), unit: () => 'ms gap',
+    cls: () => worst((L('big_long') || 0) > 0 ? 'warn' : 'ok', (L('partly_unsent_d') || 0) > 0 ? 'warn' : '', (L('big_ctl_late_d') || 0) > 0 ? 'warn' : ''),
+    sub: () => join(`min ${n0('big_gap_min_us')} max ${n0('big_gap_max_us')} µs`, `>1.5 itvl ${n0('big_long')}`,
+      has('big_sdus_per_ev') ? `${L('big_sdus_per_ev').toFixed(2)} SDU/ev` : '', `drift ${n0('ts_drift_us')} µs`,
+      `re-anchors ${n0('reanchors')}`, `partly unsent ${n0('partly_unsent')}${dlt('partly_unsent')}`), stale: 'big_gap_avg_ms' },
+  { id: 'lr', label: 'L/R align', val: () => L('lr_tx_offset_us'), unit: () => 'µs tx offset',
+    cls: (v) => worst(Math.abs(v) === 0 ? 'ok' : Math.abs(v) < 1000 ? 'warn' : 'err', has('lr_seq0') && L('lr_seq0') !== L('lr_seq1') ? 'err' : ''),
+    sub: () => join(`ref offset ${n0('lr_ref_offset_us')} µs`, has('lr_pkt_cnt') ? `pkt_cnt ${L('lr_pkt_cnt')}` : '',
+      has('lr_seq0') ? (L('lr_seq0') === L('lr_seq1') ? 'seq L = R' : `seq L ${L('lr_seq0')} R ${L('lr_seq1')}`) : ''), stale: 'lr_tx_offset_us' },
+  // ---- party mode / JBL ----
+  { g: 'Party · JBL', id: 'party', label: 'Party role', wide: true, val: () => L('party_role'), unit: () => (has('party_listen') ? `listen ${L('party_listen')}` : ''),
+    cls: (v) => ROLE_CLS[v] || 'info',
+    sub: () => join(has('party_since') ? 'since ' + clock(L('party_since')) : '',
+      has('party_to_listen') ? `switches →listen ${L('party_to_listen')}, →host ${L('party_to_host')}` : '', has('party_syncs') ? `syncs ${L('party_syncs')}` : '',
+      L('party_event') ? `last: ${L('party_event')} ${at('party_event_t')}` : '') || 'no PARTY line yet', stale: 'party_role' },
+  { id: 'listen', label: 'Party listen RX', val: () => L('listen_lost'), unit: () => 'lost /2 s',
+    cls: (v) => worst(lvl3(v, 1, 5), (L('listen_errors_d') || 0) > 0 ? 'err' : '', (L('listen_i2s_late_d') || 0) > 0 ? 'warn' : ''),
+    sub: () => (!has('listen_rx1') ? 'not listening' : join(L('listen_name') ? `'${L('listen_name')}'` : '',
+      `BIS1 rx ${n0('listen_rx1')} lost ${n0('listen_lost1')}`, `BIS2 rx ${n0('listen_rx2')} lost ${n0('listen_lost2')}`,
+      `PLC ${n0('listen_plc')}`, `errors ${n0('listen_errors')}`, `gaps ${n0('listen_gaps')}`, `q drops ${n0('listen_qdrops')}`, `I2S late ${n0('listen_i2s_late')}`)),
+    stale: 'listen_rx1' },
+  { id: 'assist', label: 'JBL speakers (assistant)', val: () => L('assist_state'), unit: () => '',
+    cls: (v) => (v == null ? '' : /scanning|connect|probing|searching|joining/.test(v) ? 'warn' : 'info'),
+    sub: () => join(`speakers ${n0('assist_speakers')}`, `joins ${n0('assist_joins_ok')}/${n0('assist_joins_sent')} ok`, `native ${n0('assist_native')}`,
+      L('assist_speaker') ? `${L('assist_speaker')} ${at('assist_speaker_t')}` : '', L('assist_event') ? `last: ${L('assist_event')}` : ''), stale: 'assist_state' },
+  { id: 'beacon', label: 'JBL beacon partyInfo', val: () => L('party_info'), unit: () => '',
+    cls: () => { const s = L('beacon_state'); return s == null ? '' : s === 'on' ? 'ok' : s === 'OFF' ? 'err' : 'warn'; },
+    sub: () => join(L('party_info_str'), L('beacon_state') !== 'on' ? L('beacon_state') : '', has('beacon_ms') ? `${L('beacon_ms')} ms` : '',
+      has('beacon_scanners') ? `scanners ${L('beacon_scanners')}` : '', L('beacon_name_crc') ? '+phone name' : '',
+      L('beacon_event') ? `last: ${L('beacon_event')}` : ''), stale: 'party_info' },
+  { id: 'app', label: 'JBL app (GATT / V5)', val: () => L('v5_link'), unit: () => '',
+    cls: (v) => (v === 'up' ? 'ok' : worst((L('gatt_dropped_d') || 0) > 0 ? 'warn' : '', (L('v5_tx_dropped_d') || 0) > 0 ? 'warn' : '')),
+    sub: () => join(`GATT links ${n0('gatt_links')}`, `notify ${n0('gatt_notify')}`, `dropped ${n0('gatt_dropped')}`, `V5 rx ${n0('v5_rx')} tx ${n0('v5_tx')}`,
+      has('eq_state') ? `EQ ${L('eq_state')} (${L('eq_bands')} bands)` : '', L('v5_event') || ''), stale: 'v5_link' },
+  // ---- system ----
+  { g: 'System', id: 'heap', label: 'Free internal RAM', val: () => L('free_internal_kb'), unit: () => 'KB',
+    cls: (v) => worst(v > 60 ? 'ok' : v > 30 ? 'warn' : 'err', has('lowest_kb') && L('lowest_kb') < 12 ? 'warn' : ''),
+    sub: () => join(has('largest_kb') ? `largest ${L('largest_kb')} KB` : '', has('lowest_kb') ? `lowest ${L('lowest_kb')} KB` : '',
+      has('free_psram_kb') ? `PSRAM ${fmtN(L('free_psram_kb'))} KB` : ''), stale: 'free_internal_kb' },
+  { id: 'radio', label: 'VHCI / ISO tx errors', val: () => (has('vhci_rx_drops') ? L('vhci_rx_drops') + (L('iso_tx_errors') || 0) : null), unit: () => 'total',
+    cls: (v) => ((L('vhci_rx_drops_d') || 0) + (L('iso_tx_errors_d') || 0) > 0 ? 'err' : v > 0 ? 'warn' : 'ok'),
+    sub: () => join(`VHCI rx drops ${n0('vhci_rx_drops')}${dlt('vhci_rx_drops')}`, `ISO tx errors ${n0('iso_tx_errors')}${dlt('iso_tx_errors')}`,
+      has('iso_tx_last') && L('iso_tx_last') ? `last ${L('iso_tx_last')}` : ''), stale: 'vhci_rx_drops' },
   { id: 'crash', label: 'Crashes / unexpected reboots', val: () => (ST ? ST.crash_count : null), unit: () => '',
     cls: (v) => (v === 0 ? 'ok' : 'err'), sub: () => (ST && ST.last_crash ? `last ${clock(ST.last_crash.t)} · click to filter` : 'none this server run'), click: () => setFilter('/Guru Meditation|assert failed|task_wdt|Rebooting|rst:0x|Backtrace/') },
-  { id: 'party', label: 'Party role', val: () => L('party_role'), unit: () => '', cls: (v) => (v ? 'info' : ''), sub: () => (L('party_role') ? '' : 'not seen yet') },
-  { id: 'source', label: 'Audio source', val: () => L('source'), unit: () => '', cls: (v) => (v === 'PHONE MUSIC' ? 'ok' : v ? 'warn' : ''), sub: () => (L('frames') != null ? `${L('frames')}/${L('expect')} frames · send_err ${L('send_err') ?? 0}` : ''), stale: 'source' },
 ];
 function buildTiles() {
-  $('#tiles').innerHTML = TILES.map((t) => `<div class="tile${t.click ? ' clickable' : ''}" id="tile-${t.id}"><div class="t-label">${t.label}</div><div class="t-val"><span class="v">—</span><span class="u"></span></div><div class="t-sub"></div></div>`).join('');
+  let html = '', open = false;
+  for (const t of TILES) {
+    if (t.g) { if (open) html += '</div>'; html += `<div class="section-title sub">${t.g}</div><div class="tiles">`; open = true; }
+    html += `<div class="tile${t.click ? ' clickable' : ''}${t.wide ? ' wide' : ''}" id="tile-${t.id}"><div class="t-label">${t.label}</div><div class="t-val"><span class="v">—</span><span class="u"></span></div><div class="t-sub"></div></div>`;
+  }
+  $('#tiles').innerHTML = html + (open ? '</div>' : '');
   for (const t of TILES) if (t.click) $(`#tile-${t.id}`).onclick = t.click;
 }
 function renderTiles() {
@@ -291,23 +377,32 @@ function renderTiles() {
   for (const t of TILES) {
     const el = $(`#tile-${t.id}`); if (!el) continue;
     const v = t.val();
-    const has = v !== undefined && v !== null;
-    el.className = `tile${t.click ? ' clickable' : ''}${has && t.cls(v) ? ' s-' + t.cls(v) : ''}${t.stale && updated[t.stale] && now - updated[t.stale] > 10 ? ' stale' : ''}${el.classList.contains('flash') ? ' flash' : ''}`;
-    el.querySelector('.v').textContent = has ? (typeof v === 'number' ? fmtN(v) : String(v)) : '—';
-    el.querySelector('.u').textContent = has ? t.unit() : '';
-    el.querySelector('.t-sub').textContent = t.sub() || '';
+    const hv = v !== undefined && v !== null;
+    let c = '';
+    try { c = hv ? t.cls(v) : ''; } catch { c = ''; }
+    const stale = t.stale && (!updated[t.stale] || now - updated[t.stale] > 10) && hv;
+    el.className = `tile${t.click ? ' clickable' : ''}${t.wide ? ' wide' : ''}${c ? ' s-' + c : ''}${stale ? ' stale' : ''}${el.classList.contains('flash') ? ' flash' : ''}`;
+    el.querySelector('.v').textContent = hv ? (typeof v === 'number' ? fmtN(v) : String(v)) : '—';
+    el.querySelector('.u').textContent = hv ? t.unit() : '';
+    let s = '';
+    try { s = t.sub() || ''; } catch { s = ''; }
+    const se = el.querySelector('.t-sub');
+    if (se.textContent !== s) { se.textContent = s; el.title = s; }
   }
-  const tl = updated.not_sent || updated.underruns;
-  $('#statsAge').textContent = tl ? `updated ${Math.max(0, Math.round(now - tl))} s ago` : 'waiting for stats lines';
+  const tl = Math.max(updated.a2dp_link || 0, updated.aura_state || 0);
+  $('#statsAge').textContent = tl ? `updated ${Math.max(0, Math.round(now - tl))} s ago` : 'waiting for 2 s status lines';
 }
 
 /* ================= charts (self-drawn canvas) ================= */
 const CHARTS = [
-  { id: 'c1', title: 'NOT SENT / 2 s', keys: ['not_sent'], thr: 5 },
-  { id: 'c2', title: 'Underruns / 2 s', keys: ['underruns'], thr: 1 },
-  { id: 'c3', title: 'A2DP buffer ms', keys: ['buf_ms'], thr: 50 },
+  { id: 'c1', title: 'Auracast not sent / late (2 s)', keys: ['not_sent', 'late_silence'], thr: 5 },
+  { id: 'c2', title: 'A2DP underruns / seq gaps (2 s)', keys: ['a2dp_underruns_d', 'seq_gaps_d'], thr: 1 },
+  { id: 'c3', title: 'A2DP PCM buffer ms', keys: ['pcm_ms'], thr: 60 },
   { id: 'c4', title: 'LC3 encode µs (avg / max)', keys: ['enc_avg', 'enc_max'] },
+  { id: 'c5', title: 'BIG gap max µs', keys: ['big_gap_max_us'] },
+  { id: 'c6', title: 'Free internal RAM KB', keys: ['free_internal_kb'] },
 ];
+const CHART_KEYS = new Set(CHARTS.flatMap((c) => c.keys));
 let COL = {};
 function readColors() {
   const cs = getComputedStyle(document.documentElement);
@@ -356,7 +451,7 @@ function queueCharts() { if (!chartQueued) { chartQueued = true; requestAnimatio
 function onStats(d) {
   for (const [k, v] of Object.entries(d.v)) {
     latest[k] = v; updated[k] = d.t;
-    if (k in series || ['not_sent', 'underruns', 'buf_ms', 'enc_avg', 'enc_max', 'sdu_avg', 'sdu_max', 'bitpool'].includes(k)) {
+    if ((k in series || CHART_KEYS.has(k)) && typeof v === 'number') {
       (series[k] = series[k] || []).push([d.t, v]);
       const cut = d.t - SERIES_KEEP_S; while (series[k].length && series[k][0][0] < cut) series[k].shift();
     }
@@ -374,10 +469,16 @@ const fLevels = Object.assign({ E: true, W: true, I: true, O: true, T: true }, s
 
 function hiLine(text) {
   let h = esc(text);
-  h = h.replace(/NOT SENT (\d+)/, (m, n) => (+n >= 5 ? `<span class="hot">${m}</span>` : +n > 0 ? `<span class="warm">${m}</span>` : m));
-  h = h.replace(/underruns (\d+)/, (m, n) => (+n > 0 ? `<span class="hot">${m}</span>` : m));
-  h = h.replace(/lost pkts (\d+)/, (m, n) => (+n > 0 ? `<span class="warm">${m}</span>` : m));
-  h = h.replace(/\(ABNORMAL[^)]*\)|role on this link: SLAVE/, (m) => `<span class="hot">${m}</span>`);
+  const hot = (m) => `<span class="hot">${m}</span>`, warm = (m) => `<span class="warm">${m}</span>`;
+  // AURA 2s (per-2 s counts)
+  h = h.replace(/not sent: host (\d+) ctrl (\d+)/, (m, a, b) => (+a + +b >= 5 ? hot(m) : +a + +b > 0 ? warm(m) : m));
+  h = h.replace(/late \(silence\) (\d+)/, (m, n) => (+n > 0 ? hot(m) : m));
+  h = h.replace(/PCM underruns (\d+)/, (m, n) => (+n > 0 ? hot(m) : m));
+  h = h.replace(/&gt;1\.5 itvl (\d+)/, (m, n) => (+n > 0 ? warm(m) : m));
+  // PARTY LISTEN 2s
+  h = h.replace(/ lost (\d+)/g, (m, n) => (+n > 0 ? warm(m) : m));
+  h = h.replace(/\(no AVRCP\)|role SLAVE|now SLAVE|ESP_FAIL/, (m) => warm(m));
+  h = h.replace(/A2DP disconnected|ACL disconnected, reason 0x[0-9a-f]+/, (m) => hot(m));
   return h;
 }
 function lineEl(e) {

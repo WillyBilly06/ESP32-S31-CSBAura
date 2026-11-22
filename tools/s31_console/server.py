@@ -97,18 +97,48 @@ class Hub:
 # =============================================================================
 # Stats parser
 # =============================================================================
+# Firmware: s31-btstack-speaker (BTstack build). Every 2 s it prints one line
+# per module (A2DP, AURA x3, PARTY, JBL_GATT, JBL_V5, V5_EQ, JBL_BEACON,
+# JBL_ASSIST, S31 HEAP); event lines (A2DP audio STARTED, volume, PARTY role
+# changes, LINK ...) come in between.  Formats: main/a2dp_in.c, auracast.c,
+# party.c, jbl_*.c, v5_eq.c, link_tune.c, main.c.
+LINE_RE = re.compile(r"^([EWIDV]) \((\d+)\) ([A-Za-z0-9_]+): (.*)$")
+NUM_RE = re.compile(r"-?\d+(?:\.\d+)?")
+MAC_RE = re.compile(r"\b(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}\b")
+
+
 def _i(m, g=1):
     return int(m.group(g)) if m else None
+
+
+def _num(s):
+    return float(s) if "." in s else int(s)
+
+
+def party_info_str(pi: int) -> str:
+    """Decode the JBL beacon partyInfo word (same bits as jbl_assist.c pi_str)."""
+    if not (pi >> 15) & 1:
+        return "Auracast OFF"
+    role = ("normal", "SECONDARY", "PRIMARY", "sub")[(pi >> 9) & 3]
+    conn = ("idle", "connecting", "connected", "?")[(pi >> 11) & 3]
+    return f"Auracast ON, {role}, {conn}"
 
 
 class StatsParser:
     """Tolerant parser for the firmware's periodic stats / event lines."""
 
-    SERIES = ("not_sent", "underruns", "buf_ms", "enc_avg", "enc_max", "sdu_avg",
-              "sdu_max", "bitpool", "drops", "lost_pkts", "on_air")
+    SERIES = ("not_sent", "late_silence", "a2dp_underruns_d", "seq_gaps_d", "pcm_ms", "enc_avg",
+              "enc_max", "bitpool", "big_gap_max_us", "lr_tx_offset_us", "free_internal_kb",
+              "listen_lost")
+    # firmware totals: the parser adds "<key>_d" = increase since the previous line
+    CUMULATIVE = ("a2dp_underruns", "q_drops", "seq_gaps", "oldest_dropped", "catchups", "catchup_ms",
+                  "catchup_expired", "rq_full", "big_ctl_late", "partly_unsent", "reanchors",
+                  "vhci_rx_drops", "iso_tx_errors", "listen_gaps", "listen_errors", "listen_i2s_late",
+                  "party_syncs", "gatt_dropped", "v5_tx_dropped")
     HIST = 1500  # ~50 min at one sample / 2 s
     GROUP_RE = re.compile(r"^[EWIDV] \(\d+\) ([^:]+): (.+?) 2s: (.*)$")
     PAIR_RE = re.compile(r"^([A-Za-z][A-Za-z_\-/+ ]*?)\s+(-?\d+(?:\.\d+)?)(?:\s*/\s*(\d+))?")
+    A2DP_STATE = {"STREAMING": "streaming", "connected": "connected", "no phone": "no phone"}
 
     def __init__(self) -> None:
         self.latest: dict = {}
@@ -116,6 +146,10 @@ class StatsParser:
         self.groups: dict = {}
         self.history = {k: deque(maxlen=self.HIST) for k in self.SERIES}
         self.events = deque(maxlen=200)  # notable BT events (connect, role, ...)
+        self.handlers = {"A2DP": self._a2dp, "AURA": self._aura, "PARTY": self._party,
+                         "JBL_ASSIST": self._assist, "JBL_BEACON": self._beacon, "JBL_GATT": self._gatt,
+                         "JBL_V5": self._v5, "V5_EQ": self._eq, "S31": self._s31, "LINK": self._link,
+                         "JBL": self._jbl, "bt_sched": self._bt_sched}
 
     def reset(self) -> None:
         self.__init__()
@@ -139,103 +173,322 @@ class StatsParser:
         if pairs:
             self.groups.setdefault(group, {}).update(pairs)
 
+    @staticmethod
+    def _grab(ch: dict, text: str, pat: str, *keys):
+        """re.search(pat); store group i under keys[i] (numbers converted). None key = skip."""
+        m = re.search(pat, text)
+        if m:
+            for k, g in zip(keys, m.groups()):
+                if k and g is not None:
+                    ch[k] = _num(g) if NUM_RE.fullmatch(g) else g
+        return m
+
+    def _event(self, now: float, ch: dict, key: str, text: str) -> None:
+        ch[key] = text
+        ch[key + "_t"] = now
+        self.events.append((now, text))
+
+    # -- A2DP (a2dp_in.c) ----------------------------------------------------
+    def _a2dp(self, msg: str, ch: dict, now: float) -> None:
+        g = self._grab
+        if msg.startswith("A2DP 2s: "):
+            m = re.match(r"A2DP 2s: (STREAMING|connected|no phone)", msg)
+            if m:
+                link = m.group(1)
+                ch["a2dp_link"] = link
+                st = self.A2DP_STATE[link]
+                if st == "connected" and self.latest.get("a2dp_state") == "paused":
+                    st = "paused"   # 2 s line says "connected" for both; keep the suspend event's word
+                ch["a2dp_state"] = st
+            g(ch, msg, r"media pkts (\d+) \(\+(\d+), ([\d.]+) SBC frames/pkt, max (\d+) B\)",
+              "media_pkts", "media_pkts_2s", "sbc_fpp", "pkt_max_b")
+            g(ch, msg, r"q drops (\d+), seq gaps (\d+)", "q_drops", "seq_gaps")
+            g(ch, msg, r"bitpool (\d+) \(min (\d+) max (\d+)\)", "bitpool", "bitpool_min", "bitpool_max")
+            g(ch, msg, r"PCM (\d+) ms, underruns (\d+), oldest dropped (\d+), clock corr (-?\d+) ppm",
+              "pcm_ms", "a2dp_underruns", "oldest_dropped", "clock_ppm")
+            # newer firmware tail (optional)
+            g(ch, msg, r"catch-ups (\d+) \((\d+) ms skipped, (\d+) expired\)",
+              "catchups", "catchup_ms", "catchup_expired")
+            m = re.search(r"\| volume (\d+)/127( \(no AVRCP\))?", msg)
+            if m:
+                ch["volume"] = int(m.group(1))
+                ch["avrcp"] = m.group(2) is None
+            return
+        m = re.match(r"A2DP audio (STARTED|started|suspended|stopped)", msg)
+        if m:
+            ch["a2dp_state"] = "streaming" if m.group(1).lower() == "started" else "paused"
+            self._event(now, ch, "a2dp_event", "audio " + m.group(1))
+            return
+        m = re.match(r"volume (\d+)/127 \((\d+)%, (-?[\d.]+) dB\) <- (.*)$", msg)
+        if m:
+            ch["volume"] = int(m.group(1))
+            ch["volume_pct"] = int(m.group(2))
+            ch["volume_db"] = float(m.group(3))
+            ch["volume_src"] = m.group(4).strip()
+            ch["volume_t"] = now
+            return
+        m = re.match(r"AVRCP connected \(cid (0x[0-9a-fA-F]+)\)(?:, absolute volume (\d+)/127)?", msg)
+        if m:
+            ch["avrcp"] = True
+            if m.group(2):
+                ch["volume"] = int(m.group(2))
+            self._event(now, ch, "avrcp_event", f"AVRCP connected (cid {m.group(1)})")
+            return
+        if msg.startswith("AVRCP disconnected"):
+            ch["avrcp"] = False
+            self._event(now, ch, "avrcp_event", "AVRCP disconnected")
+            return
+        if msg.startswith("AVRCP"):   # connect failed / phone did not connect - connecting ourselves
+            self._event(now, ch, "avrcp_event", msg[:120])
+            return
+        m = re.match(r"delay report ([\d.]+) ms(?: \(try (\d+)\))? -> (0x[0-9a-fA-F]+)", msg)
+        if m:
+            ch["delay_report_ms"] = int(float(m.group(1)))
+            ch["delay_report_try"] = int(m.group(2)) if m.group(2) else 1
+            ch["delay_report_status"] = m.group(3)
+            ch["delay_report_t"] = now
+            return
+        if msg.startswith("phone supports delay reporting"):
+            ch["phone_dr"] = True
+            return
+        m = re.match(r"A2DP connected (\S+), role (MASTER|SLAVE)", msg)
+        if m:
+            ch["a2dp_state"] = "connected"
+            ch["a2dp_peer"] = m.group(1)
+            ch["bredr_role"] = m.group(2)
+            ch["a2dp_disc_reason"] = ""
+            self._event(now, ch, "a2dp_event", "A2DP connected")
+            return
+        if msg.startswith("A2DP disconnected"):
+            ch["a2dp_state"] = "no phone"
+            self._event(now, ch, "a2dp_event", "A2DP disconnected")
+            return
+        m = re.match(r"ACL disconnected, reason (0x[0-9a-fA-F]+)", msg)
+        if m:
+            ch["a2dp_disc_reason"] = "ACL reason " + m.group(1)
+            self._event(now, ch, "a2dp_event", "ACL disconnected " + m.group(1))
+            return
+        m = re.match(r"role change: now (MASTER|SLAVE)", msg)
+        if m:
+            ch["bredr_role"] = m.group(1)
+            self._event(now, ch, "a2dp_event", "role change -> " + m.group(1))
+            return
+        m = re.match(r"A2DP connect to \S+ failed, status (0x[0-9a-fA-F]+)", msg)
+        if m:
+            self._event(now, ch, "a2dp_event", "connect failed " + m.group(1))
+            return
+        m = re.match(r"SBC configured: (\d+) Hz, (\d+) ch.*bitpool (\d+)-(\d+)", msg)
+        if m:
+            ch["sbc_config"] = f"{int(m.group(1)) / 1000:g} kHz {m.group(2)} ch, bitpool {m.group(3)}-{m.group(4)}"
+
+    # -- AURA (auracast.c) ---------------------------------------------------
+    def _aura(self, msg: str, ch: dict, now: float) -> None:
+        g = self._grab
+        if msg.startswith("AURA 2s: "):
+            g(ch, msg, r"^AURA 2s: (\w+)", "aura_state")
+            g(ch, msg, r"SDUs sent L (\d+) R (\d+), done L (\d+) R (\d+)(?: \((\w+)\))?",
+              "sdu_sent_l", "sdu_sent_r", "sdu_done_l", "sdu_done_r", "aura_comp")
+            m = g(ch, msg, r"not sent: host (\d+) ctrl (\d+)", "not_sent_host", "not_sent_ctrl")
+            if m:
+                ch["not_sent"] = int(m.group(1)) + int(m.group(2))
+            g(ch, msg, r"late \(silence\) (\d+), trimmed (\d+)", "late_silence", "trimmed")
+            g(ch, msg, r"ready (\d+)/(\d+), in flight (\d+), ctrl free (\d+)",
+              "rq_ready", "rq_depth", "in_flight", "ctrl_free")
+            g(ch, msg, r"LC3 L\+R avg (\d+) us max (\d+) us \((\d+) fr\)", "enc_avg", "enc_max", "enc_frames")
+            g(ch, msg, r"PCM underruns (\d+), wdog (\d+), rq full (\d+)", "aura_underruns", "aura_wdog", "rq_full")
+            g(ch, msg, r"stack free (\d+) B", "enc_stack_free")
+            return
+        if msg.startswith("BIG timing"):
+            g(ch, msg, r"(\d+) events, gap avg ([\d.]+) ms min (\d+) us max (\d+) us",
+              "big_events", "big_gap_avg_ms", "big_gap_min_us", "big_gap_max_us")
+            g(ch, msg, r">1\.5 itvl (\d+), same-event cbs (\d+)", "big_long", "big_multi_cb")
+            g(ch, msg, r"SDUs (\d+) \(([\d.]+) per event\)", "big_sdus", "big_sdus_per_ev")
+            g(ch, msg, r"SDU ts (\w+), sync reads (\d+), drift (-?\d+) us, re-anchors (\d+)",
+              "sdu_ts", "ts_reads", "ts_drift_us", "reanchors")
+            g(ch, msg, r"ctl (\w+): late (\d+), partly unsent (\d+)", "ctl_ver", "big_ctl_late", "partly_unsent")
+            return
+        if msg.startswith("L/R align"):
+            g(ch, msg, r"BIS0 seq (\d+).*?\| BIS1 seq (\d+)", "lr_seq0", "lr_seq1")
+            g(ch, msg, r"tx offset (-?\d+) us, ref offset (-?\d+) us", "lr_tx_offset_us", "lr_ref_offset_us")
+            m = re.search(r"pkt_cnt (\d+)/(\d+)", msg)
+            if m:
+                ch["lr_pkt_cnt"] = f"{m.group(1)}/{m.group(2)}"
+            return
+        m = re.match(r"broadcast ON: '(.*)' Broadcast_ID (0x[0-9a-fA-F]+).*?ISO interval (\d+) us", msg)
+        if m:
+            ch["aura_name"] = m.group(1)
+            ch["aura_bcast_id"] = m.group(2)
+            ch["aura_iso_us"] = int(m.group(3))
+            self._event(now, ch, "aura_event", "broadcast ON")
+            return
+        if msg.startswith("broadcast off"):
+            self._event(now, ch, "aura_event", "broadcast off")
+
+    # -- PARTY (party.c) -----------------------------------------------------
+    def _party(self, msg: str, ch: dict, now: float) -> None:
+        m = re.match(r"role (\w+), listen (.+?) \| switches to listen (\d+), to host (\d+), syncs (\d+)", msg)
+        if m:
+            ch["party_role"] = m.group(1)
+            ch["party_listen"] = m.group(2)
+            ch["party_to_listen"] = int(m.group(3))
+            ch["party_to_host"] = int(m.group(4))
+            ch["party_syncs"] = int(m.group(5))
+            return
+        m = re.match(r"LISTEN '(.*)' 2s: (.*)$", msg)
+        if m:
+            ch["party_role"] = "LISTEN"   # this line replaces the role line while streaming
+            ch["party_listen"] = "STREAMING"
+            ch["listen_name"] = m.group(1)
+            body = m.group(2)
+            g = self._grab
+            g(ch, body, r"BIS1 rx (\d+) lost (\d+) gaps (\d+)", "listen_rx1", "listen_lost1", "listen_gaps1")
+            g(ch, body, r"BIS2 rx (\d+) lost (\d+) gaps (\d+)", "listen_rx2", "listen_lost2", "listen_gaps2")
+            g(ch, body, r"decoded (\d+) PLC (\d+) errors (\d+)", "listen_decoded", "listen_plc", "listen_errors")
+            g(ch, body, r"q drops (\d+), I2S late (\d+)", "listen_qdrops", "listen_i2s_late")
+            ch["listen_lost"] = ch.get("listen_lost1", 0) + ch.get("listen_lost2", 0)
+            ch["listen_gaps"] = ch.get("listen_gaps1", 0) + ch.get("listen_gaps2", 0)
+            return
+        m = re.match(r"role (\w+) -> (\w+) \((.*)\)", msg)
+        if m:
+            ch["party_role"] = m.group(2)
+            self._event(now, ch, "party_event", f"role {m.group(1)} -> {m.group(2)} ({m.group(3)})")
+            return
+        m = re.match(r"listen: (.+?) -> (.+?) \((.*)\)", msg)
+        if m:
+            ch["party_listen"] = m.group(2)
+            self._event(now, ch, "party_event", f"listen {m.group(1)} -> {m.group(2)} ({m.group(3)})")
+            return
+        m = re.match(r"listening to '(.*)': (\d+) BIS, ISO interval (\d+) us", msg)
+        if m:
+            ch["listen_name"] = m.group(1)
+            ch["listen_bis"] = int(m.group(2))
+            ch["listen_iso_us"] = int(m.group(3))
+
+    # -- JBL modules ---------------------------------------------------------
+    def _assist(self, msg: str, ch: dict, now: float) -> None:
+        m = re.match(r"assistant (.+?) \| speakers (\d+) \| beacon reports (\d+) \| connects (\d+) \| "
+                     r"joins sent (\d+), ok (\d+) \| native joins seen (\d+)", msg)
+        if m:
+            ch["assist_state"] = m.group(1)
+            for k, gi in (("assist_speakers", 2), ("assist_reports", 3), ("assist_connects", 4),
+                          ("assist_joins_sent", 5), ("assist_joins_ok", 6), ("assist_native", 7)):
+                ch[k] = int(m.group(gi))
+            return
+        m = re.match(r"JBL (\w+) \(macCrc (0x[0-9a-fA-F]+)\) is now: (.+?) \[(0x[0-9a-fA-F]+)\](.*)$", msg)
+        if m:
+            extra = " (receiving a master)" if "receiving" in m.group(5) else ""
+            self._event(now, ch, "assist_speaker", f"JBL {m.group(1)} {m.group(2)}: {m.group(3)}{extra}")
+            return
+        if msg.startswith((">>>", "<- JOIN", "<- speaker", "party ", "phone music", "New JBL speaker",
+                           "Hosting", "speaker 0x")):
+            self._event(now, ch, "assist_event", msg.lstrip("> ")[:140])
+
+    def _beacon(self, msg: str, ch: dict, now: float) -> None:
+        m = re.match(r"beacon (.+?) handle (\d+), (\d+) ms, partyInfo (0x[0-9a-fA-F]+)( \+srcName1Crc)? \| "
+                     r"data updates (\d+), interval changes (\d+), peer connects (\d+), re-arms (\d+), scanners (\d+)",
+                     msg)
+        if m:
+            pi = int(m.group(4), 16)
+            ch["beacon_state"] = m.group(1)
+            ch["beacon_ms"] = int(m.group(3))
+            ch["party_info"] = m.group(4)
+            ch["party_info_str"] = party_info_str(pi)
+            ch["beacon_name_crc"] = m.group(5) is not None
+            ch["beacon_updates"] = int(m.group(6))
+            ch["beacon_peer_cons"] = int(m.group(8))
+            ch["beacon_rearms"] = int(m.group(9))
+            ch["beacon_scanners"] = int(m.group(10))
+            return
+        if msg.startswith(">>>") or msg.startswith("beacon set terminated") or msg.startswith("beacon paused"):
+            self._event(now, ch, "beacon_event", msg.lstrip("> ")[:140])
+
+    def _gatt(self, msg: str, ch: dict, now: float) -> None:
+        m = re.match(r"GATT links (\d+) \| rx writes (\d+) \(V5 (\d+), long (\d+)\) \| notify sent (\d+), "
+                     r"queued (\d+), dropped (\d+), stale (\d+), waits (\d+), queue peak (\d+) B( \(waiting\))?", msg)
+        if m:
+            for k, gi in (("gatt_links", 1), ("gatt_rx_writes", 2), ("gatt_rx_v5", 3), ("gatt_notify", 5),
+                          ("gatt_queued", 6), ("gatt_dropped", 7), ("gatt_stale", 8), ("gatt_waits", 9),
+                          ("gatt_peak_b", 10)):
+                ch[k] = int(m.group(gi))
+            ch["gatt_waiting"] = m.group(11) is not None
+            return
+        if msg.startswith(">>>"):
+            self._event(now, ch, "gatt_event", msg.lstrip("> ")[:140])
+
+    def _v5(self, msg: str, ch: dict, now: float) -> None:
+        m = re.match(r"V5 link (up|down) \(con (0x[0-9a-fA-F]+)\) \| rx (\d+) frames \(Get (\d+), Set (\d+), "
+                     r"split (\d+), bad (\d+)\) \| tx (\d+) frames / (\d+) pkts, dropped (\d+) \| "
+                     r"heartbeat (\d+) sent, (\d+) skipped \| EQ sets (\d+)", msg)
+        if m:
+            ch["v5_link"] = m.group(1)
+            for k, gi in (("v5_rx", 3), ("v5_rx_get", 4), ("v5_rx_set", 5), ("v5_rx_bad", 7), ("v5_tx", 8),
+                          ("v5_tx_dropped", 10), ("v5_hb", 11), ("v5_eq_sets", 13)):
+                ch[k] = int(m.group(gi))
+            return
+        if msg.startswith("JBL One control link") or msg.startswith("EQ set") or msg.startswith("EQ restored"):
+            self._event(now, ch, "v5_event", msg[:140])
+
+    def _eq(self, msg: str, ch: dict, now: float) -> None:
+        m = re.match(r"EQ (\S+) \((\d+) bands\) \| updates (\d+) published, (\d+) applied, (\d+) deferred \| "
+                     r"calls (\d+) \| last (\d+) us, max (\d+) us", msg)
+        if m:
+            ch["eq_state"] = m.group(1)
+            for k, gi in (("eq_bands", 2), ("eq_published", 3), ("eq_applied", 4), ("eq_deferred", 5),
+                          ("eq_last_us", 7), ("eq_max_us", 8)):
+                ch[k] = int(m.group(gi))
+
+    def _jbl(self, msg: str, ch: dict, now: float) -> None:
+        m = re.match(r"phone name '(.*)' -> srcName1Crc", msg)
+        if m:
+            ch["phone_name"] = m.group(1)
+
+    # -- system --------------------------------------------------------------
+    def _s31(self, msg: str, ch: dict, now: float) -> None:
+        if msg.startswith("HEAP: "):
+            g = self._grab
+            g(ch, msg, r"internal free (\d+) KB \(largest (\d+) KB, lowest (\d+) KB\)",
+              "free_internal_kb", "largest_kb", "lowest_kb")
+            g(ch, msg, r"PSRAM free (\d+) KB", "free_psram_kb")
+            g(ch, msg, r"VHCI rx drops (\d+)", "vhci_rx_drops")
+            g(ch, msg, r"ISO tx errors (\d+) \(last (-?\d+)\)", "iso_tx_errors", "iso_tx_last")
+            return
+        if msg.startswith("BTstack up"):
+            self._event(now, ch, "sys_event", "BTstack up")
+
+    def _link(self, msg: str, ch: dict, now: float) -> None:
+        ch["link_last"] = MAC_RE.sub("..", msg)[:140]
+        ch["link_last_t"] = now
+        g = self._grab
+        g(ch, msg, r"QoS poll (\d+) slots", "link_poll_slots")
+        g(ch, msg, r"QoS setup status (0x[0-9a-fA-F]+): service \d+, token (\d+) B/s, latency (\d+) us",
+          "link_qos_status", "link_qos_token", "link_qos_latency_us")
+        g(ch, msg, r"max slots now (\d+)", "link_max_slots")
+        m = re.match(r"phone features .*\| EDR 2M (\w+), 3M (\w+)", msg)
+        if m:
+            ch["link_phone_edr"] = f"2M {m.group(1)}, 3M {m.group(2)}"
+        if msg.startswith("ACL gone"):
+            ch["link_poll_slots"] = None
+
+    def _bt_sched(self, msg: str, ch: dict, now: float) -> None:
+        if not msg.startswith("BR/EDR pti table"):
+            ch["bt_sched"] = msg.strip()[:140]
+
+    # -- entry point -----------------------------------------------------------
     def feed(self, text: str, now: float):
         """Returns (changed_fields: dict, alerts: list[(kind, text)])."""
         ch: dict = {}
         alerts: list = []
-        s = re.search
-
-        def put(k, v):
-            if v is not None:
-                ch[k] = v
-
-        if " 2s:" in text:
-            self._generic(text)
-            if "TX 2s:" in text:
-                put("frames", _i(s(r"(\d+) frames", text)))
-                put("expect", _i(s(r"expect (\d+)", text)))
-                put("send_err", _i(s(r"send_err (\d+)", text)))
-                m = s(r"\|\s*([A-Z][A-Z0-9 _]+?)\s*,", text)
-                put("source", m.group(1) if m else None)
-                put("a2dp_pkts", _i(s(r"a2dp pkts (\d+)", text)))
-                put("buf_ms", _i(s(r"buf (\d+) ms", text)))
-                put("underruns", _i(s(r"underruns (\d+)", text)))
-                put("drops", _i(s(r"(?<!backlog )\bdrops (\d+)", text)))
-                put("latency_skips", _i(s(r"latency skips (\d+)", text)))
-                put("pcm_glitches", _i(s(r"PCM glitches (\d+)", text)))
-                put("clipped", _i(s(r"clipped (\d+)", text)))
-            elif "ISO timing 2s:" in text:
-                m = s(r"SDU wait[^|]*?avg (\d+)\s*us[^|]*?max (\d+)", text)
-                if m:
-                    put("sdu_avg", int(m.group(1)))
-                    put("sdu_max", int(m.group(2)))
-                m = s(r"tx-ref avg (\d+)\s*us[^|]*?max (\d+)", text)
-                if m:
-                    put("txref_avg", int(m.group(1)))
-                    put("txref_max", int(m.group(2)))
-            elif "ISO 2s:" in text:
-                put("on_air", _i(s(r"on-air (\d+)", text)))
-                put("not_sent", _i(s(r"NOT SENT (\d+)", text)))
-                put("drift", _i(s(r"drift (-?\d+)", text)))
-                put("ticks_late", _i(s(r"ticks late (\d+)", text)))
-                put("worst_gap_us", _i(s(r"worst gap (\d+)", text)))
-                m = s(r"in flight (\d+)/(\d+)", text)
-                if m:
-                    put("in_flight", int(m.group(1)))
-                    put("in_flight_max", int(m.group(2)))
-                put("backlog_drops", _i(s(r"backlog drops (\d+)", text)))
-                put("backoff", _i(s(r"backoff (\d+)", text)))
-                put("ticks_skipped", _i(s(r"ticks skipped (\d+)", text)))
-            elif "SBC 2s:" in text:
-                put("bitpool", _i(s(r"bitpool now (\d+)", text)))
-                put("bitpool_min", _i(s(r"\(min (\d+)", text)))
-                put("bitpool_max", _i(s(r"max (\d+)\)", text)))
-                put("media_pkts", _i(s(r"media pkts (\d+)", text)))
-                put("lost_pkts", _i(s(r"lost pkts (\d+)", text)))
-            elif "LC3 2s:" in text:
-                put("enc_avg", _i(s(r"avg (\d+)\s*us", text)))
-                put("enc_max", _i(s(r"max (\d+)\s*us", text)))
-                put("enc_core_pct", _i(s(r"~(\d+)%", text)))
-        else:
-            m = s(r"role on this link: (\w+)", text)
-            if m:
-                put("bredr_role", m.group(1).upper())
-                self.events.append((now, "role " + m.group(1).upper()))
-            m = s(r"A2DP Connected \[([0-9a-fA-F:]+)\]", text)
-            if m:
-                put("a2dp_state", "connected")
-                put("a2dp_peer", m.group(1))
-                put("a2dp_since", now)
-                self.events.append((now, "A2DP connected"))
-            elif "A2DP Disconnected" in text:
-                put("a2dp_state", "disconnected")
-                put("a2dp_since", now)
-                m = s(r"Disconnected \[[^\]]*\]\s*\(([^)]*)\)", text)
-                put("a2dp_disc_reason", m.group(1) if m else "")
-                self.events.append((now, "A2DP disconnected"))
-            elif "A2DP audio STARTED" in text or "A2DP audio started" in text:
-                put("a2dp_state", "streaming")
-                put("a2dp_since", now)
-            elif s(r"A2DP audio (suspended|stopped|paused)", text):
-                put("a2dp_state", "paused")
-                put("a2dp_since", now)
-            m = s(r"HCI reason (0x[0-9a-fA-F]+)(?:\s*\(([^)]*)\))?", text)
-            if m and "disconnect" in text.lower():
-                put("last_hci_reason", m.group(1) + (f" ({m.group(2)})" if m.group(2) else ""))
-            m = s(r"bt_sched: (.*)$", text)
-            if m:
-                put("bt_sched", m.group(1).strip())
-            m = s(r"free internal (\d+) ?KB", text)
-            if m:
-                put("free_internal_kb", int(m.group(1)))
-                m2 = s(r"PSRAM (\d+) ?KB", text)
-                put("free_psram_kb", int(m2.group(1)) if m2 else None)
-            m = s(r"PARTY:\s*([A-Za-z_]+)\s*->\s*([A-Za-z_]+)", text) or \
-                s(r"[Pp]arty role[:=]?\s+([A-Za-z_]+)\s*()", text)
-            if m:
-                role = m.group(2) or m.group(1)
-                put("party_role", role.upper())
-                self.events.append((now, "party " + role.upper()))
+        m = LINE_RE.match(text)
+        if m:
+            if " 2s: " in text:
+                self._generic(text)
+            h = self.handlers.get(m.group(3))
+            if h:
+                try:
+                    h(m.group(4), ch, now)
+                except Exception:   # never let one odd line kill the reader
+                    traceback.print_exc()
+        ch = {k: v for k, v in ch.items() if v is not None or k in self.latest}
 
         if CRASH_RE.search(text):
             alerts.append(("crash", text))
@@ -243,7 +496,7 @@ class StatsParser:
             m = REBOOT_RE.search(text)
             if m:
                 if m.group(2) is not None:
-                    put("last_reset_reason", m.group(2))
+                    ch["last_reset_reason"] = m.group(2)
                     if "POWERON" in m.group(2).upper():
                         alerts.append(("boot", text))
                     else:
@@ -251,10 +504,18 @@ class StatsParser:
                 else:
                     alerts.append(("reboot", text))
 
+        for k in self.CUMULATIVE:   # per-line increase of firmware totals (reboot: counter restarts)
+            if k in ch and isinstance(ch[k], int):
+                prev = self.latest.get(k)
+                ch[k + "_d"] = 0 if prev is None else (ch[k] - prev if ch[k] >= prev else ch[k])
+        for k, since in (("a2dp_state", "a2dp_since"), ("party_role", "party_since"), ("aura_state", "aura_since")):
+            if k in ch and ch[k] != self.latest.get(k):
+                ch[since] = now
+
         for k, v in ch.items():
             self.latest[k] = v
             self.updated[k] = now
-            if k in self.SERIES:
+            if k in self.SERIES and v is not None:
                 self.history[k].append((round(now, 2), v))
         return ch, alerts
 
@@ -265,6 +526,85 @@ class StatsParser:
         if history:
             out["history"] = {k: [list(p) for p in v] for k, v in self.history.items()}
         return out
+
+
+# -- offline self-test: python server.py --selftest [LOGFILE] [--selftest-lines N] ----------
+# card -> keys it needs (mirrors the tiles in static/app.js); "?" prefix = only present on
+# newer firmware / in some modes (listening), reported but not a failure.
+SELFTEST_CARDS = {
+    "A2DP": ["a2dp_state", "a2dp_link"],
+    "Volume / AVRCP": ["?volume", "?avrcp"],
+    "Latency (PCM buffer)": ["pcm_ms", "clock_ppm", "?catchups", "?catchup_ms", "?delay_report_ms"],
+    "A2DP underruns": ["a2dp_underruns", "a2dp_underruns_d", "q_drops", "seq_gaps", "oldest_dropped"],
+    "SBC": ["bitpool", "bitpool_min", "bitpool_max", "media_pkts_2s", "sbc_fpp", "pkt_max_b"],
+    "Auracast": ["aura_state", "sdu_sent_l", "sdu_sent_r", "sdu_done_l", "sdu_done_r"],
+    "Auracast not sent": ["not_sent", "not_sent_host", "not_sent_ctrl", "late_silence", "trimmed",
+                          "rq_ready", "in_flight", "ctrl_free"],
+    "LC3 encode": ["enc_avg", "enc_max", "enc_frames", "aura_underruns", "aura_wdog", "rq_full"],
+    "BIG timing": ["big_gap_avg_ms", "big_gap_min_us", "big_gap_max_us", "big_long", "big_sdus_per_ev",
+                   "ts_drift_us", "reanchors", "partly_unsent"],
+    "L/R align": ["lr_tx_offset_us", "lr_ref_offset_us", "lr_pkt_cnt"],
+    "Party role": ["party_role", "party_listen", "party_to_listen", "party_to_host", "party_syncs"],
+    "Party listen RX": ["?listen_rx1", "?listen_lost", "?listen_plc", "?listen_errors", "?listen_i2s_late"],
+    "JBL speakers": ["assist_state", "assist_speakers", "assist_joins_sent", "assist_joins_ok", "assist_native"],
+    "JBL beacon": ["beacon_state", "party_info", "party_info_str", "beacon_ms", "beacon_scanners"],
+    "JBL app (GATT / V5)": ["gatt_links", "gatt_notify", "gatt_dropped", "v5_link", "v5_rx", "v5_tx",
+                            "eq_state", "eq_bands"],
+    "Free internal RAM": ["free_internal_kb", "largest_kb", "lowest_kb", "free_psram_kb"],
+    "Radio errors": ["vhci_rx_drops", "iso_tx_errors", "iso_tx_last"],
+    "BR/EDR link": ["?bredr_role", "?link_last"],
+}
+SESSION_PREFIX_RE = re.compile(r"^\[\s*-?[\d.]+\]\s?")
+
+
+def selftest(path: str, nlines: int) -> int:
+    with open(path, encoding="utf-8", errors="replace") as f:
+        tail = deque(f, maxlen=nlines) if nlines > 0 else list(f)
+    p = StatsParser()
+    fed = hits = 0
+    for i, raw in enumerate(tail):
+        line = SESSION_PREFIX_RE.sub("", raw.rstrip("\r\n"))
+        line = CTRL_RE.sub("", ANSI_RE.sub("", line))
+        if not line or line.startswith(("[idf]", "[console]", "──")):
+            continue
+        fed += 1
+        ch, _ = p.feed(line, 1000.0 + i * 0.01)
+        hits += bool(ch)
+    print(f"self-test: {os.path.basename(path)}  (last {len(tail)} lines, {fed} device lines, "
+          f"{hits} produced stats)")
+    fails = 0
+    for card, keys in SELFTEST_CARDS.items():
+        have, missing, opt_missing = [], [], []
+        for k in keys:
+            opt = k.startswith("?")
+            k = k.lstrip("?")
+            if k in p.latest and p.latest[k] is not None:
+                v = p.latest[k]
+                v = MAC_RE.sub("00:11:22:33:44:55", v) if isinstance(v, str) else v
+                have.append(f"{k}={v}")
+            else:
+                (opt_missing if opt else missing).append(k)
+        ok = not missing and bool(have)
+        if not have and not missing:
+            status = "n/a "      # only optional keys and none in this log
+        else:
+            status = "OK  " if ok else "FAIL"
+            fails += not ok
+        print(f"  [{status}] {card:22s} {', '.join(have)[:150]}")
+        if missing:
+            print(f"         missing: {', '.join(missing)}")
+        if opt_missing:
+            print(f"         not in this log (newer firmware / listen mode only): {', '.join(opt_missing)}")
+    print("self-test " + ("PASSED" if not fails else f"FAILED ({fails} card(s) without values)"))
+    return 1 if fails else 0
+
+
+def newest_session_log(d: str):
+    try:
+        logs = [os.path.join(d, n) for n in os.listdir(d) if n.startswith("session-") and n.endswith(".log")]
+    except OSError:
+        return None
+    return max(logs, key=os.path.getmtime) if logs else None
 
 
 # =============================================================================
@@ -355,9 +695,9 @@ MOCK_LAYOUT = [(0x2000, 24112, "bootloader/bootloader.bin"),
 
 
 class MockDevice:
-    """Generates realistic firmware output; keeps running while the port is closed."""
+    """Generates s31-btstack-speaker style output; keeps running while the port is closed."""
 
-    PEER = "74:f4:41:e0:a5:aa"
+    PEER = "00:11:22:33:44:55"   # anonymized
 
     def __init__(self) -> None:
         self.lock = threading.RLock()  # re-entrant: scheduled reboot runs inside pull()
@@ -365,10 +705,17 @@ class MockDevice:
         self.boot_mono = time.monotonic() - self.rng.uniform(300, 900)
         self.sched: list = []
         self.next_tick = time.monotonic() + 0.4
-        self.a2dp = "streaming"
+        self.a2dp = "streaming"          # "no phone" | "connected" | "paused" | "streaming"
         self.pkts = self.rng.randint(1000, 5000)
-        self.party = "HOST"
-        self.last_heap = 0.0
+        self.party = "HOST"              # HOST | LISTEN
+        self.underruns = 0
+        self.seq_gaps = 0
+        self.catchups = 0
+        self.catch_ms = 0
+        self.volume = 85
+        self.avrcp = True
+        self.l_rx = 0
+        self.seq = 30000
 
     def ms(self) -> int:
         return int((time.monotonic() - self.boot_mono) * 1000)
@@ -385,87 +732,144 @@ class MockDevice:
         with self.lock:
             self.sched.clear()
             self.boot_mono = time.monotonic()
-            self.a2dp = "disconnected"
-            self.pkts = 0
+            self.a2dp = "no phone"
+            self.pkts = self.underruns = self.seq_gaps = self.catchups = self.catch_ms = 0
+            self.avrcp = False
+            self.party = "HOST"
             garbage = bytes(self.rng.randrange(0x80, 0x100) for _ in range(48)) + b"\x00\r\n" + \
                 bytes(self.rng.randrange(0x80, 0x100) for _ in range(30)) + b"\r\n"
             self.at(0.05, lambda: garbage)
             self.at(0.35, lambda: self.ln("I", "boot", "ESP-IDF v6.1-dev 2nd stage bootloader"))
             self.at(0.40, lambda: self.ln("I", "cpu_start", "Multicore app"))
-            self.at(0.55, lambda: self.ln("I", "app_init", "Project name:     s31-jbl-speaker"))
+            self.at(0.55, lambda: self.ln("I", "app_init", "Project name:     s31-btstack-speaker"))
+            self.at(0.80, lambda: self.ln("I", "vhci", "controller up (BR/EDR + LE), VHCI ring 18588 B"))
             self.at(0.90, lambda: self.ln("W", "bt_sched", "init [MASTER]: ACL 2->2 | BIS first 9->15 rep 7->12 pto 8->11 ctrl 12->15"))
-            self.at(1.10, lambda: self.ln("W", "JBL_BREDR", "audio buffer 75 KB in PSRAM; free internal 152 KB, PSRAM 14562 KB"))
-            self.at(1.20, lambda: f"PARTY: BOOT -> {self.party}\r\n".encode())
+            self.at(1.00, lambda: self.ln("W", "S31", f"BTstack up: 'S31 JBL Xtreme 5' at {self.PEER} (BR/EDR A2DP sink, LE)"))
+            self.at(1.20, lambda: self.ln("W", "AURA", "broadcast ON: 'S31 Auracast' Broadcast_ID 0x112233, "
+                                                       "BIS 0x0202/0x0203, ISO interval 30000 us"))
             self.at(3.0, self._connect)
             self.next_tick = time.monotonic() + 2.0
 
     def _connect(self) -> bytes:
         self.a2dp = "connected"
-        role_slave = self.rng.random() < 0.12
-        out = self.ln("W", "JBL_BREDR", f"A2DP Connected [{self.PEER}]")
-        out += self.ln("W", "JBL_BREDR", "BR/EDR role on this link: SLAVE (phone schedules the S31 - bad)" if role_slave
-                       else "BR/EDR role on this link: MASTER (S31 schedules the phone - good)")
-        self.at(self.rng.uniform(1.5, 3.0), self._start)
+        role = "SLAVE" if self.rng.random() < 0.12 else "MASTER (S31 schedules the phone)"
+        out = self.ln("W", "A2DP", f"A2DP connected {self.PEER}, role {role}")
+        out += self.ln("W", "LINK", "ACL 0x0802: packet types 0xcc18 (DM1 DH1 DM3 DH3 DM5 DH5 2-DHx 3-DHx 2-DH5 3-DH5), "
+                                    "QoS poll 32 slots, inquiry scan off")
+        out += self.ln("W", "A2DP", "SBC configured: 44100 Hz, 2 ch, block 16, subbands 8, bitpool 2-53")
+        out += self.ln("W", "A2DP", "delay report 410 ms (try 1) -> 0x00 | ep state 4, phone configured DR yes, signaling 2/0")
+        self.at(2.0, self._avrcp)
+        self.at(self.rng.uniform(2.5, 4.0), self._start)
         return out
 
+    def _avrcp(self) -> bytes:
+        self.avrcp = True
+        return self.ln("W", "A2DP", f"AVRCP connected (cid 0x41), absolute volume {self.volume}/127")
+
     def _start(self) -> bytes:
+        if self.a2dp == "no phone":
+            return b""
         self.a2dp = "streaming"
-        return self.ln("W", "JBL_BREDR", "A2DP audio STARTED -> re-broadcasting on Auracast")
+        return self.ln("W", "A2DP", "A2DP audio STARTED")
+
+    def _party_switch(self, new: str) -> bytes:
+        if new == "LISTEN":
+            out = self.ln("W", "PARTY", "role HOST -> HOST_STOPPING (no audio for 1.5 s)")
+            out += self.ln("W", "AURA", "broadcast off")
+            out += self.ln("W", "PARTY", "role HOST_STOPPING -> LISTEN (broadcast stopped)")
+            out += self.ln("W", "PARTY", "listen: off -> scanning (start listening)")
+            out += self.ln("W", "PARTY", "listen: scanning -> PA syncing (found 'JBL Party')")
+            out += self.ln("W", "PARTY", "listening to 'JBL Party': 2 BIS, ISO interval 30000 us")
+            out += self.ln("W", "PARTY", "listen: BIG syncing -> STREAMING (BIG synced)")
+        else:
+            out = self.ln("W", "PARTY", "role LISTEN -> LISTEN_STOPPING (audio playing - host has priority)")
+            out += self.ln("W", "PARTY", "listen: STREAMING -> off (stop listening)")
+            out += self.ln("W", "PARTY", "role LISTEN_STOPPING -> HOST (listen torn down)")
+            out += self.ln("W", "AURA", "broadcast ON: 'S31 Auracast' Broadcast_ID 0x112233, "
+                                        "BIS 0x0202/0x0203, ISO interval 30000 us")
+        self.party = new
+        return out
 
     def _tick(self) -> bytes:
         r = self.rng
         out = b""
         streaming = self.a2dp == "streaming"
-        if self.a2dp in ("streaming", "connected", "paused"):
-            self.pkts += r.randint(95, 105) if streaming else 0
-            underruns = (r.randint(1, 3) if r.random() < 0.06 else 0) if streaming else 0
-            buf = r.randint(105, 150) if streaming else 0
-            if underruns:
-                buf = r.randint(20, 60)
-            out += self.ln("W", "BAP_BSRC",
-                           f"TX 2s: 200 frames (expect 200), send_err 0 | {'PHONE MUSIC' if streaming else 'SILENCE'}, "
-                           f"a2dp pkts {self.pkts}, buf {buf} ms, underruns {underruns}, drops 0, latency skips 0, "
-                           f"PCM glitches 0, clipped 0")
-            x = r.random()
-            not_sent = 0 if x < 0.72 else (r.randint(1, 4) if x < 0.9 else r.randint(40, 60))
-            out += self.ln("W", "BAP_BSRC",
-                           f"ISO 2s: on-air 200, NOT SENT {not_sent}, drift 0 | encode ticks late 0, "
-                           f"worst gap {r.randint(10000, 10450)} us | in flight {r.randint(3, 4)}/8, totals: "
-                           f"backlog drops 0, backoff 0, ticks skipped 0")
-            bp = 53 if r.random() < 0.9 else r.choice([45, 49, 51])
-            out += self.ln("W", "BAP_BSRC",
-                           f"SBC 2s: bitpool now {bp} (min {bp}, max 53), media pkts {r.randint(94, 100) if streaming else 0}, "
-                           f"lost pkts {1 if r.random() < 0.03 else 0}")
-            avg = r.randint(1700, 1900)
-            mx = avg + r.randint(250, 800)
-            out += self.ln("W", "BAP_BSRC", f"LC3 2s: encode L+R avg {avg} us, max {mx} us per 10 ms frame (~{avg // 100}% of one core)")
-            sa = r.randint(900, 1600)
-            out += self.ln("W", "BAP_BSRC",
-                           f"ISO timing 2s: SDU wait in controller avg {sa} us max {sa + r.randint(2000, 5000)} us | "
-                           f"tx-ref avg {r.randint(80, 140)} us max {r.randint(180, 320)} us (n 199) raw tx 1 rec 2 ref 3 hdl 4")
+        host = self.party == "HOST"
+        # ---- A2DP 2s ----
+        dp = r.randint(98, 102) if streaming else 0
+        self.pkts += dp
+        if streaming and r.random() < 0.04:
+            self.underruns += r.randint(1, 3)
+        if streaming and r.random() < 0.02:
+            self.seq_gaps += 1
+        if streaming and r.random() < 0.05:
+            self.catchups += 1
+            self.catch_ms += r.randint(5, 40)
+        word = {"streaming": "STREAMING", "no phone": "no phone"}.get(self.a2dp, "connected")
+        bp = 53 if streaming else 0
+        pcm = r.randint(230, 275) if streaming else (0 if self.a2dp == "no phone" else 240)
+        out += self.ln("W", "A2DP",
+                       f"A2DP 2s: {word}, media pkts {self.pkts} (+{dp}, {'6.8' if dp else '0.0'} SBC frames/pkt, "
+                       f"max {965 if dp else 0} B), q drops 0, seq gaps {self.seq_gaps} | bitpool {bp} (min {bp} max {bp}) | "
+                       f"PCM {pcm} ms, underruns {self.underruns}, oldest dropped 0, clock corr {r.randint(100, 140)} ppm | "
+                       f"catch-ups {self.catchups} ({self.catch_ms} ms skipped, 0 expired) | volume {self.volume}/127"
+                       f"{'' if self.avrcp else ' (no AVRCP)'}")
+        # ---- AURA 2s / BIG timing / L/R align ----
+        x = r.random()
+        ns = 0 if x < 0.8 else (r.randint(1, 4) if x < 0.95 else r.randint(20, 60))
+        n = 200 if host else 0
+        avg = r.randint(1330, 1420) if host else 0
+        out += self.ln("W", "AURA",
+                       f"AURA 2s: {'ON' if host else 'off'} | SDUs sent L {n - ns} R {n - ns}, done L {n - ns} R {n - ns} (NSFC), "
+                       f"not sent: host {ns} ctrl 0 | late (silence) {1 if ns > 10 else 0}, trimmed 0 | ready 0/8, "
+                       f"in flight {5 if host else 0}, ctrl free {2 if host else 0} | LC3 L+R avg {avg} us max "
+                       f"{avg + r.randint(60, 300) if host else 0} us ({n} fr) | PCM underruns 0, wdog 0, rq full 0, stack free 7336 B")
+        if host:
+            gmax = 30000 + r.randint(2, 25) if r.random() < 0.95 else 60010
+            out += self.ln("W", "AURA",
+                           f"BIG timing (BIS0 completions): 67 events, gap avg 30.000 ms min {30000 - r.randint(2, 25)} us "
+                           f"max {gmax} us, >1.5 itvl {1 if gmax > 45000 else 0}, same-event cbs 0, SDUs 201 (3.00 per event) | "
+                           f"SDU ts ON, sync reads 341, drift {r.choice([0, 0, -10000])} us, re-anchors 1 | ctl v1: late 0, partly unsent 0")
+            self.seq += 200
+            out += self.ln("W", "AURA", f"L/R align: BIS0 seq {self.seq} tx 360049238 ref 360049238 | BIS1 seq {self.seq} "
+                                        f"tx 360049238 ref 360049238 | tx offset 0 us, ref offset 0 us (pkt_cnt 3/3)")
+            out += self.ln("I", "PARTY", f"role HOST, listen off | switches to listen 1, to host 1, syncs 0")
+        else:
+            lost = 0 if r.random() < 0.85 else r.randint(1, 5)
+            out += self.ln("W", "PARTY", f"LISTEN 'JBL Party' 2s: BIS1 rx {67 - lost} lost {lost} gaps 0 | BIS2 rx 67 lost 0 "
+                                         f"gaps 0 | decoded 200 PLC {lost * 3} errors 0 | q drops 0, I2S late 0")
+        # ---- JBL / system ----
+        out += self.ln("I", "JBL_GATT", "GATT links 0 | rx writes 0 (V5 0, long 0) | notify sent 0, queued 0, dropped 0, "
+                                        "stale 0, waits 0, queue peak 0 B")
+        out += self.ln("I", "JBL_V5", "V5 link down (con 0xffff) | rx 0 frames (Get 0, Set 0, split 0, bad 0) | tx 0 frames / "
+                                      "0 pkts, dropped 0 | heartbeat 0 sent, 0 skipped | EQ sets 0")
+        out += self.ln("I", "V5_EQ", "EQ flat (0 bands) | updates 0 published, 0 applied, 0 deferred | calls 33256 | last 0 us, max 0 us")
+        pi = "0xb440" if host else "0xb240"
+        out += self.ln("I", "JBL_BEACON", f"beacon on handle 1, 100 ms, partyInfo {pi} +srcName1Crc | data updates 3, "
+                                          f"interval changes 1, peer connects 0, re-arms 0, scanners 9")
+        st = "scan paused (phone streaming)" if streaming else ("party off (party LISTEN)" if not host else "scanning")
+        out += self.ln("I", "JBL_ASSIST", f"assistant {st} | speakers 1 | beacon reports 16 | connects 0 | "
+                                          f"joins sent 0, ok 0 | native joins seen 0")
+        out += self.ln("W", "S31", f"HEAP: internal free {r.randint(80, 84)} KB (largest 52 KB, lowest 26 KB) | "
+                                   f"PSRAM free 15000 KB | VHCI rx drops 0 | ISO tx errors 0 (last 0)")
         # ---- random events ----
-        now = time.monotonic()
-        if now - self.last_heap > 30:
-            self.last_heap = now
-            out += self.ln("W", "JBL_BREDR", f"audio buffer 75 KB in PSRAM; free internal {r.randint(138, 156)} KB, PSRAM 14562 KB")
-        if r.random() < 0.15:
-            out += self.ln("I", "JBL_AVRC", f"absolute volume {r.randint(40, 110)}")
+        if self.avrcp and r.random() < 0.08:
+            self.volume = max(0, min(127, self.volume + r.choice([-8, -4, 4, 8])))
+            out += self.ln("W", "A2DP", f"volume {self.volume}/127 ({self.volume * 100 // 127}%, -12.0 dB) <- phone")
         if streaming and r.random() < 0.025:
             self.a2dp = "paused"
-            out += self.ln("W", "JBL_BREDR", "A2DP audio suspended -> broadcasting silence")
+            out += self.ln("W", "A2DP", "A2DP audio suspended")
         elif self.a2dp == "paused" and r.random() < 0.3:
             out += self._start()
-        elif self.a2dp in ("streaming", "paused") and r.random() < 0.02:
-            self.a2dp = "disconnected"
-            out += self.ln("W", "JBL_BREDR", f"A2DP Disconnected [{self.PEER}] (ABNORMAL - link lost)")
-            out += self.ln("W", "JBL_BREDR", "ACL disconnected, HCI reason 0x08 (supervision timeout)")
+        elif self.a2dp in ("streaming", "paused") and r.random() < 0.015:
+            self.a2dp = "no phone"
+            self.avrcp = False
+            out += self.ln("W", "A2DP", "AVRCP disconnected")
+            out += self.ln("W", "A2DP", "A2DP disconnected")
+            out += self.ln("W", "A2DP", "ACL disconnected, reason 0x08")
             self.at(r.uniform(5, 9), self._connect)
-        if r.random() < 0.03:
-            out += self.ln("E", "BAP_BSRC", f"bt_le_iso_chan_send failed ({r.choice([-12, -105, -11])})")
-        if r.random() < 0.015:
-            new = r.choice(["HOST", "LISTEN", "JOIN"])
-            out += f"PARTY: {self.party} -> {new}\r\n".encode()
-            self.party = new
+        if r.random() < 0.012:
+            out += self._party_switch("LISTEN" if host else "HOST")
         if r.random() < 0.004:
             out += self.ln("E", "task_wdt", "Task watchdog got triggered. The following tasks/users did not reset the watchdog in time:")
             out += self.ln("E", "task_wdt", " - IDLE1 (CPU 1)")
@@ -1624,6 +2028,10 @@ def main(argv=None) -> int:
     ap.add_argument("--no-auto-log", action="store_true", help="do not start logging automatically after a flash")
     ap.add_argument("--log-on-start", action="store_true", help="open the port and start logging at server start")
     ap.add_argument("--verbose", action="store_true", help="print HTTP access log")
+    ap.add_argument("--selftest", nargs="?", const="", metavar="LOGFILE",
+                    help="offline: run the stats parser over the tail of LOGFILE (default: newest session log "
+                         "in --logs-dir) and report which status cards get values; never opens the port")
+    ap.add_argument("--selftest-lines", type=int, default=3000, help="lines from the end of the log (0 = all)")
     ap.add_argument("--mock-tool", help=argparse.SUPPRESS)
     ap.add_argument("--mock-fail", default="", help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
@@ -1633,6 +2041,12 @@ def main(argv=None) -> int:
 
     if args.logs_dir is None:
         args.logs_dir = os.path.join(HERE, "mock_logs") if args.mock else os.path.join(args.project, "logs")
+    if args.selftest is not None:
+        path = args.selftest or newest_session_log(args.logs_dir)
+        if not path or not os.path.isfile(path):
+            print(f"self-test: no log file (looked in {args.logs_dir})", file=sys.stderr)
+            return 2
+        return selftest(path, args.selftest_lines)
     if not args.mock:
         try:
             import serial  # noqa: F401

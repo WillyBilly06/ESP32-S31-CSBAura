@@ -25,6 +25,25 @@ The server does **not** open the port at start-up unless `--log-on-start` is giv
 - Sessions: `s31-jbl-speaker\logs\session-YYYYmmdd-HHMMSS.log`, lines `[  12.34] <line>`; build/flash output is written as `[idf] …`, markers as `── … ──`. (Mock mode writes to `tools\s31_console\mock_logs\`.)
 - Crash detection (Guru Meditation, assert failed, task_wdt, abort, `Rebooting...`, non-POWERON `rst:`) → red toast + sound + counter; reboots that we caused (flash/reset) are ignored.
 
+## Live metrics (left panel)
+Parsed by `StatsParser` in `server.py` from the **s31-btstack-speaker** status lines (one each every 2 s) and event lines:
+
+| Card group | Source lines (`TAG: …`) |
+|---|---|
+| Phone · A2DP: A2DP state, Volume / AVRCP, Latency (PCM ms, catch-ups, clock corr, delay report), A2DP underruns, SBC bitpool, BR/EDR link | `A2DP: A2DP 2s: …` (the `\| catch-ups … \| volume N/127[ (no AVRCP)]` tail is optional), `A2DP: A2DP audio STARTED/suspended/stopped`, `A2DP: volume N/127 (…) <- …`, `A2DP: AVRCP connected/disconnected`, `A2DP: delay report …`, `A2DP: A2DP connected …, role …`, `LINK: …` |
+| Auracast: state, not sent / late, LC3 encode, BIG timing, L/R align | `AURA: AURA 2s: …`, `AURA: BIG timing (BIS0 completions): …`, `AURA: L/R align: …`, `AURA: broadcast ON/off` |
+| Party · JBL: Party role, Party listen RX, JBL speakers, JBL beacon partyInfo (decoded), JBL app (GATT / V5 / EQ) | `PARTY: role …, listen … \| …`, `PARTY: LISTEN '<name>' 2s: …`, `PARTY: role X -> Y (why)`, `PARTY: listen: a -> b (why)`, `JBL_ASSIST`, `JBL_BEACON`, `JBL_GATT`, `JBL_V5`, `V5_EQ` |
+| System: free internal RAM, VHCI / ISO tx errors, crashes | `S31: HEAP: …`, crash/reboot detection |
+
+Firmware totals (underruns, seq gaps, catch-ups, VHCI drops, …) also get a `<key>_d` field = increase since the previous line; tiles colour on that. A tile fades when its line has not been seen for 10 s.
+
+Offline self-test (never opens the port): runs the parser over the tail of a session log and lists which card got values.
+```powershell
+& $py server.py --selftest --project E:\ESP32-S31-CSBAura\s31-btstack-speaker   # newest logs\session-*.log, last 3000 lines
+& $py server.py --selftest mock_logs\sample-btstack-status.log                   # anonymized synthetic sample (incl. listen mode)
+```
+Exit code 0 = every card has values (cards only printed by newer firmware / listen mode are reported as `n/a`).
+
 ## API (http://127.0.0.1:8765)
 | Method | Path | Notes |
 |---|---|---|
