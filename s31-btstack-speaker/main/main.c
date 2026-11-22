@@ -18,6 +18,7 @@
 #include "hci_dump.h"
 #include "hci_dump_embedded_stdout.h"
 
+#include "esp_bt.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_mac.h"
@@ -94,6 +95,26 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
         if (S31_SNIFFER) {
             sniffer_start();
             return;
+        }
+        {   /* LE TX power: probe the controller ROM setter (value units unknown: enum
+             * index or dBm) from high to low and keep the highest it accepts */
+            extern int r_ble_txpwr_set(int type, uint16_t handle, int level);
+            extern int r_ble_txpwr_get(int type, uint16_t handle);
+            int before = r_ble_txpwr_get(0, 0);
+            static const int tries[] = { 20, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9 };
+            char res[160];
+            int n = 0, chosen = -1;
+            for (unsigned i = 0; i < sizeof(tries) / sizeof(tries[0]); i++) {
+                int rc = r_ble_txpwr_set(0, 0, tries[i]);
+                n += snprintf(res + n, sizeof(res) - n, "%d:%d ", tries[i], rc);
+                if (rc == 0) {
+                    chosen = tries[i];
+                    break;
+                }
+            }
+            int rc_adv = chosen >= 0 ? r_ble_txpwr_set(1, 2, chosen) : -99;   /* adv set 2 (Auracast) */
+            ESP_LOGW(TAG, "LE TX power: default was %d; tried %s-> using %d (adv set 2: %d), now default %d",
+                     before, res, chosen, rc_adv, r_ble_txpwr_get(0, 0));
         }
         a2dp_in_on_hci_working();
         auracast_on_hci_working();

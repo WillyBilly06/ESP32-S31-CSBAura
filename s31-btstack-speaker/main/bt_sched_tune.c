@@ -24,8 +24,11 @@ static const char *TAG = "bt_sched";
 /* ---- controller symbols (libbredr_app.a / libble_app.a) ------------------ */
 extern uint8_t r_olc_sched_pti_dft_get(uint8_t idx);   /* tbl[2*idx]   */
 extern uint8_t r_olc_sched_pti_inc_get(uint8_t idx);   /* tbl[2*idx+1] */
-extern uint8_t *r_sym_ble_kBC0rRwtjATsFkriXVDL(void);  /* returns r_sym_ble_u66q9VTswFBa3W6uzpwY */
-extern uint8_t *r_sym_ble_u66q9VTswFBa3W6uzpwY;        /* 64-byte ISO config block (heap) */
+/* Obfuscated names of the July-2026 controller libs; the Nov-2026 libs renamed
+ * them. Weak: on newer libs the LE (BIS priority) half is skipped, the BR/EDR
+ * half still works. */
+extern uint8_t *r_sym_ble_kBC0rRwtjATsFkriXVDL(void) __attribute__((weak));  /* returns r_sym_ble_u66q9VTswFBa3W6uzpwY */
+extern uint8_t *r_sym_ble_u66q9VTswFBa3W6uzpwY __attribute__((weak));        /* 64-byte ISO config block (heap) */
 extern uint8_t _data_start[], _data_end[];
 
 /* ---- profiles ------------------------------------------------------------ */
@@ -129,6 +132,10 @@ static uint8_t *pti_find(void)
 /* Returns the verified ISO config block or NULL. */
 static uint8_t *iso_cfg_find(void)
 {
+    if (r_sym_ble_kBC0rRwtjATsFkriXVDL == NULL || &r_sym_ble_u66q9VTswFBa3W6uzpwY == NULL) {
+        ESP_LOGW(TAG, "ISO priority block not known in this controller lib - BIS priorities left at stock");
+        return NULL;
+    }
     uint8_t *p = r_sym_ble_kBC0rRwtjATsFkriXVDL();
     if (p == NULL || p != r_sym_ble_u66q9VTswFBa3W6uzpwY || !esp_ptr_byte_accessible(p) ||
         !esp_ptr_byte_accessible(p + 63)) {

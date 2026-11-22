@@ -29,6 +29,7 @@
 #include "btstack.h"
 #include "le-audio/le_audio_base_builder.h"
 
+#include "esp_bt.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -67,13 +68,47 @@ typedef struct {
         uint32_t sdu_rec_time;
     } pkt[2];
 } ctl_iso_tx_info_t;
+
+/* Controller libs from Nov 2026 (IDF release/v6.1 c43d665a96+): versioned,
+ * one entry per SDU with PDUs sent / late. iso.h BT_ISO_TX_CB_INFO_VERSION 1. */
+typedef struct {
+    uint8_t version;
+    uint8_t framing;
+    uint8_t sdu_cnt;
+    uint8_t sdu_dropped;
+    struct {
+        uint16_t seq_num;
+        uint32_t tx_time_stamp;
+        uint32_t sdu_ref_time;
+        uint32_t sdu_hdl_time;
+        uint32_t sdu_rec_time;
+        union {
+            struct {
+                uint8_t pdu_cnt;
+                uint8_t txd_cnt;
+                uint8_t late : 1;
+                uint8_t more : 1;
+                uint32_t sdu_end_time;
+            } unf;
+            struct {
+                uint32_t time_offset : 24;
+            } fra;
+        };
+    } sdu[4];
+} ctl_iso_tx_info_v1_t;
 extern void r_ble_ll_isoal_tx_comp_cb_set(void *cb);
 extern uint16_t r_ble_ll_iso_free_buf_num_get(uint16_t conn_handle);
 
 /* ---- broadcast identity (keep exactly: the Xtreme 5 joins on these) -------- */
-#define AURA_BROADCAST_ID      0x112233u
-#define AURA_BROADCAST_NAME    "ESP32-S31's JBL Xtreme 5"
-#define AURA_NAME_LEN          (sizeof(AURA_BROADCAST_NAME) - 1)
+/* 1 = plain Auracast source like a phone (no JBL master marker, no JBL PA
+ * block, phone BIG layout, stock encoder): the Xtreme 5 then joins as an
+ * ordinary Auracast receiver (its Auracast button), not as a JBL party member. */
+#ifndef AURA_GENERIC
+#define AURA_GENERIC           0
+#endif
+#define AURA_BROADCAST_ID      (AURA_GENERIC ? 0x5a31c3u : 0x112233u)
+#define AURA_BROADCAST_NAME    (AURA_GENERIC ? "S31 Auracast" : "ESP32-S31's JBL Xtreme 5")
+#define AURA_NAME_LEN          (AURA_GENERIC ? sizeof("S31 Auracast") - 1 : sizeof("ESP32-S31's JBL Xtreme 5") - 1)
 #define AURA_APPEARANCE        0x0885u
 #define AURA_PBA_UUID          0x1856u
 #define AURA_PBA_FEATURES      0x04u      /* High Quality, not encrypted */
@@ -94,7 +129,7 @@ extern uint16_t r_ble_ll_iso_free_buf_num_get(uint16_t conn_handle);
  * NSE 8, IRC 4, PTO 0, 100 B), 0 = the S26 Ultra's layout (30 ms, BN 3, 120 B,
  * here with IRC 3 / PTO 0). Pair 1 with liblc3 LC3_ENCODER_JBL_COMPAT/JBL_NF. */
 #ifndef AURA_JBL_PROFILE
-#define AURA_JBL_PROFILE       1
+#define AURA_JBL_PROFILE       (!AURA_GENERIC)
 #endif
 #define AURA_SDU               (AURA_JBL_PROFILE ? 100 : 120)   /* octets per LC3 frame = SDU */
 #define AURA_PD_US             80000
@@ -148,14 +183,15 @@ static const uint8_t jbl_pa_mfg_ad[] = {
 /* A/B test: 0 = periodic data carries the BASE only (no JBL party block whose
  * NN/YY bytes we can only imitate; the real master's YY is not a timer). */
 #ifndef AURA_JBL_PA_BLOCK
-#define AURA_JBL_PA_BLOCK      1
+#define AURA_JBL_PA_BLOCK      (!AURA_GENERIC)
 #endif
 #define JBL_PA_NN_OFFSET       10
 #define JBL_PA_YY_OFFSET       17
 #define JBL_PA_TG_OFFSET       20
 
 /* ---- advertising / BIG storage (BT thread) --------------------------------- */
-static uint8_t s_ext_adv[7 + 6 + 4 + 2 * (2 + AURA_NAME_LEN) + sizeof(jbl_master_mfg_ad)];
+static uint8_t s_ext_adv[7 + 6 + 4 + 2 * (2 + 24) + sizeof(jbl_master_mfg_ad)];
+static uint16_t s_ext_adv_len;
 static uint8_t s_pa[64 + sizeof(jbl_pa_mfg_ad)];
 static uint16_t s_pa_len, s_pa_jbl_pos;
 static uint8_t s_pa_nn = 0x02;
@@ -205,10 +241,10 @@ static le_audio_big_params_t s_big_params = {
  * phone's A2DP link starved). The old Xtreme 5 layout was 16/8/100/2/4/0. */
 static const le_audio_big_test_params_t s_big_test = {
     .iso_interval_1250us = AURA_JBL_PROFILE ? 16 : 24,
-    .nse = AURA_JBL_PROFILE ? 8 : 9,
+    .nse = AURA_JBL_PROFILE ? 6 : 9,       /* JBL master: NSE 8 / IRC 4; IRC 3 frees ~25 % BIG airtime for the phone's A2DP (time-stamped SDUs fill every slot) */
     .max_pdu = AURA_SDU,
     .bn = AURA_BN,
-    .irc = AURA_JBL_PROFILE ? 4 : 3,       /* no pre-transmission: with PTO 1 (phone: IRC 2 + PTO 1) the controller */
+    .irc = AURA_JBL_PROFILE ? 3 : 3,       /* no pre-transmission: with PTO 1 (phone: IRC 2 + PTO 1) the controller */
     .pto = 0,       /* skipped 2 BIG events every 10-20 s (4-11 / 90 s), PTO 0: none in 150 s */
 };
 
@@ -325,10 +361,12 @@ static void ext_adv_build(void)
     memcpy(d + i, AURA_BROADCAST_NAME, AURA_NAME_LEN);
     i += AURA_NAME_LEN;
 
-    memcpy(d + i, jbl_master_mfg_ad, sizeof(jbl_master_mfg_ad));   /* the JBL master marker */
-    i += sizeof(jbl_master_mfg_ad);
-
-    btstack_assert(i == sizeof(s_ext_adv));
+    if (!AURA_GENERIC) {
+        memcpy(d + i, jbl_master_mfg_ad, sizeof(jbl_master_mfg_ad));   /* the JBL master marker */
+        i += sizeof(jbl_master_mfg_ad);
+    }
+    btstack_assert(i <= sizeof(s_ext_adv));
+    s_ext_adv_len = (uint16_t)i;
 }
 
 static void pa_build(void)
@@ -662,16 +700,87 @@ static void kick_cb(void *context)
     tx_kick();
 }
 
+/* SDU time grid, as Espressif's own S31 broadcast source (esp-gmf esp_bt_audio
+ * bt_audio_le_tx_group.c): anchor (seq, controller timestamp) from LE Read ISO
+ * TX Sync, every SDU stamped anchor_ts + (seq - anchor_seq) * SDU interval, so
+ * the controller puts each SDU in exactly its own payload slot instead of
+ * "the next free one". Re-read every second, re-anchored if > 4 SDUs off. */
+#ifndef AURA_SDU_TIMESTAMPS
+#define AURA_SDU_TIMESTAMPS    1
+#endif
+static bool s_ts_valid;
+static uint32_t s_ts_anchor;
+static uint16_t s_seq_anchor;
+static btstack_timer_source_t s_sync_timer;
+static uint32_t st_ts_reanchor, st_ts_reads;
+static int32_t st_ts_drift;
+
+static void sync_timer_handler(btstack_timer_source_t *ts)
+{
+    if (s_phase != PH_ON) {
+        return;
+    }
+    if (hci_can_send_command_packet_now()) {
+        hci_send_cmd(&hci_le_read_iso_tx_sync, s_bis[0]);
+        btstack_run_loop_set_timer(ts, 1000);
+    } else {
+        btstack_run_loop_set_timer(ts, 50);
+    }
+    btstack_run_loop_add_timer(ts);
+}
+
+static void on_tx_sync(const uint8_t *rp)
+{
+    if (rp[0] != 0) {
+        ESP_LOGW(TAG, "LE Read ISO TX Sync: status 0x%02x (no SDU sent yet?)", rp[0]);
+        return;
+    }
+    uint16_t seq = little_endian_read_16(rp, 3);
+    uint32_t ts = little_endian_read_32(rp, 5);
+    uint32_t off = little_endian_read_24(rp, 9);
+    st_ts_reads++;
+    if (s_ts_valid) {
+        uint32_t expect = s_ts_anchor + (uint32_t)(int32_t)(int16_t)(uint16_t)(seq - s_seq_anchor) * AURA_FRAME_US;
+        int32_t d = (int32_t)(ts - expect);
+        st_ts_drift = d;
+        if (d > 4 * AURA_FRAME_US || d < -4 * AURA_FRAME_US) {
+            ESP_LOGW(TAG, "TX sync: seq %u ts %lu is %ld us off the grid -> re-anchor", seq, (unsigned long)ts, (long)d);
+            st_ts_reanchor++;
+            s_ts_anchor = ts;
+            s_seq_anchor = seq;
+        }
+        return;
+    }
+    s_ts_anchor = ts;
+    s_seq_anchor = seq;
+    s_ts_valid = AURA_SDU_TIMESTAMPS;
+    ESP_LOGW(TAG, "TX sync anchor: seq %u at %lu us (time offset %lu us) -> SDUs now %s", seq, (unsigned long)ts,
+             (unsigned long)off, s_ts_valid ? "time-stamped" : "unstamped (AURA_SDU_TIMESTAMPS 0)");
+}
+
 static void send_sdu(int bis)
 {
     hci_reserve_packet_buffer();
     uint8_t *b = hci_get_outgoing_packet_buffer();
-    little_endian_store_16(b, 0, (uint16_t)s_bis[bis] | (2u << 12));   /* complete SDU, no time stamp */
-    little_endian_store_16(b, 2, 4 + AURA_SDU);
-    little_endian_store_16(b, 4, s_seq[bis]);
-    little_endian_store_16(b, 6, AURA_SDU);
-    memcpy(b + 8, s_tx[bis], AURA_SDU);
-    uint8_t st = hci_send_iso_packet_buffer(8 + AURA_SDU);
+    uint16_t n;
+    if (s_ts_valid) {
+        uint32_t ts = s_ts_anchor + (uint32_t)(int32_t)(int16_t)(uint16_t)(s_seq[bis] - s_seq_anchor) * AURA_FRAME_US;
+        little_endian_store_16(b, 0, (uint16_t)s_bis[bis] | (2u << 12) | (1u << 14));   /* complete SDU, time stamp */
+        little_endian_store_16(b, 2, 8 + AURA_SDU);
+        little_endian_store_32(b, 4, ts);
+        little_endian_store_16(b, 8, s_seq[bis]);
+        little_endian_store_16(b, 10, AURA_SDU);
+        memcpy(b + 12, s_tx[bis], AURA_SDU);
+        n = 12 + AURA_SDU;
+    } else {
+        little_endian_store_16(b, 0, (uint16_t)s_bis[bis] | (2u << 12));   /* complete SDU, no time stamp */
+        little_endian_store_16(b, 2, 4 + AURA_SDU);
+        little_endian_store_16(b, 4, s_seq[bis]);
+        little_endian_store_16(b, 6, AURA_SDU);
+        memcpy(b + 8, s_tx[bis], AURA_SDU);
+        n = 8 + AURA_SDU;
+    }
+    uint8_t st = hci_send_iso_packet_buffer(n);
     s_seq[bis]++;                                 /* the slot is used either way */
     if (st == ERROR_CODE_SUCCESS) {
         s_sent[bis]++;
@@ -768,6 +877,8 @@ static void on_hci_completed(const uint8_t *packet, uint16_t size)
 
 /* completion timing on BIS 0 (controller task writes, stats reads) */
 static volatile uint32_t ct_long_total;
+static volatile uint32_t st_late_ctl, st_partial;
+static volatile bool s_ctl_v1;
 static volatile uint32_t sk_gap, sk_comp, sk_ntx, sk_cnt, sk_seq, sk_ts, sk_free, sk_infl;
 static volatile bool sk_new;
 static volatile uint32_t ct_n, ct_pkts, ct_gap_min = UINT32_MAX, ct_gap_max, ct_long, ct_cb_multi;
@@ -782,16 +893,48 @@ static void ctl_tx_comp_cb(uint16_t conn_handle, void *info, size_t size)
     if (info == NULL || size < 4) {
         return;
     }
-    const ctl_iso_tx_info_t *ti = (const ctl_iso_tx_info_t *)info;
+    /* normalise old (Jul 2026) and versioned (Nov 2026) controller layouts */
+    uint32_t comp, ntx = 0, late = 0, cnt;
+    uint16_t seq0 = 0;
+    uint32_t ts0 = 0, ref0 = 0;
+    if (size == sizeof(ctl_iso_tx_info_v1_t) && ((const ctl_iso_tx_info_v1_t *)info)->version >= 1) {
+        const ctl_iso_tx_info_v1_t *v = (const ctl_iso_tx_info_v1_t *)info;
+        cnt = v->sdu_cnt > 4 ? 4 : v->sdu_cnt;
+        comp = cnt + v->sdu_dropped;
+        for (uint32_t k = 0; k < cnt; k++) {
+            if (v->framing == 0) {
+                if (v->sdu[k].unf.txd_cnt == 0) ntx++;
+                if (v->sdu[k].unf.late) late++;
+                if (v->sdu[k].unf.txd_cnt < v->sdu[k].unf.pdu_cnt) st_partial++;
+            }
+        }
+        if (cnt) {
+            seq0 = v->sdu[0].seq_num;
+            ts0 = v->sdu[0].tx_time_stamp;
+            ref0 = v->sdu[0].sdu_ref_time;
+        }
+        s_ctl_v1 = true;
+    } else {
+        const ctl_iso_tx_info_t *o = (const ctl_iso_tx_info_t *)info;
+        comp = (uint32_t)o->completed_pkts + o->not_txd_pkts;
+        ntx = o->not_txd_pkts;
+        cnt = o->pkt_cnt;
+        if (cnt) {
+            seq0 = o->pkt[0].seq_num;
+            ts0 = o->pkt[0].tx_time_stamp;
+            ref0 = o->pkt[0].sdu_ref_time;
+        }
+    }
     for (int i = 0; i < AURA_NUM_BIS; i++) {
         if (conn_handle == s_bis_ctl[i]) {
-            if (ti->pkt_cnt > 0) {
-                al_seq[i] = ti->pkt[0].seq_num;
-                al_ts[i] = ti->pkt[0].tx_time_stamp;
-                al_ref[i] = ti->pkt[0].sdu_ref_time;
-                al_pk[i] = ti->pkt_cnt;
+            if (cnt > 0) {
+                al_seq[i] = seq0;
+                al_ts[i] = ts0;
+                al_ref[i] = ref0;
+                al_pk[i] = cnt;
                 al_cnt[i]++;
             }
+            st_late_ctl += late;
             if (i == 0) {
                 int64_t now = esp_timer_get_time();
                 if (ct_last != 0) {
@@ -804,8 +947,8 @@ static void ctl_tx_comp_cb(uint16_t conn_handle, void *info, size_t size)
                         if (g > AURA_ISO_INTERVAL_MS * 1500) {
                             ct_long++;
                             ct_long_total++;
-                            sk_gap = g; sk_comp = ti->completed_pkts; sk_ntx = ti->not_txd_pkts;
-                            sk_cnt = ti->pkt_cnt; sk_seq = ti->pkt[0].seq_num; sk_ts = ti->pkt[0].tx_time_stamp;
+                            sk_gap = g; sk_comp = comp; sk_ntx = ntx;
+                            sk_cnt = cnt; sk_seq = seq0; sk_ts = ts0;
                             sk_free = r_ble_ll_iso_free_buf_num_get(s_bis_ctl[0]);
                             sk_infl = s_sent[0] - s_done[0];
                             sk_new = true;
@@ -815,11 +958,10 @@ static void ctl_tx_comp_cb(uint16_t conn_handle, void *info, size_t size)
                     }
                 }
                 ct_last = now;
-                ct_pkts += ti->completed_pkts + ti->not_txd_pkts;
+                ct_pkts += comp;
             }
-            __atomic_fetch_add(&s_comp_pending[i], (uint32_t)ti->completed_pkts + ti->not_txd_pkts,
-                               __ATOMIC_RELEASE);
-            st_not_txd += ti->not_txd_pkts;
+            __atomic_fetch_add(&s_comp_pending[i], comp, __ATOMIC_RELEASE);
+            st_not_txd += ntx;
             s_vendor_comp = true;
             btstack_run_loop_execute_on_main_thread(&s_comp_reg);
             return;
@@ -866,6 +1008,7 @@ static void pipeline_reset(bool run)
     s_tx_valid = false;
     s_csn_requested = false;
     s_silence_due = 0;
+    s_ts_valid = false;                           /* new BIG / stop: re-anchor the SDU time grid */
     btstack_run_loop_remove_timer(&s_deadline_timer);
     s_streaming = run;
     grant_publish();
@@ -983,7 +1126,7 @@ static int begin_start(void)
         if (gap_extended_advertising_setup(&s_adv_set, &s_ext_params, &s_adv_handle) != ERROR_CODE_SUCCESS) {
             return -EIO;
         }
-        gap_extended_advertising_set_adv_data(s_adv_handle, sizeof(s_ext_adv), s_ext_adv);
+        gap_extended_advertising_set_adv_data(s_adv_handle, s_ext_adv_len, s_ext_adv);
         gap_periodic_advertising_set_params(s_adv_handle, &s_pa_params);
         s_adv_created = true;
         ESP_LOGI(TAG, "advertising set handle %u (SID %u)", s_adv_handle, AURA_ADV_SID);
@@ -1057,6 +1200,16 @@ static void on_big_created(const uint8_t *packet)
     }
     set_phase(PH_ON);
     pipeline_reset(true);
+    s_ts_valid = false;
+    btstack_run_loop_remove_timer(&s_sync_timer);
+    btstack_run_loop_set_timer_handler(&s_sync_timer, sync_timer_handler);
+    btstack_run_loop_set_timer(&s_sync_timer, 300);        /* after the first SDUs went out */
+    btstack_run_loop_add_timer(&s_sync_timer);
+    for (int i = 0; i < AURA_NUM_BIS; i++) {          /* per-handle TX power for the BIS, if the controller takes it */
+        esp_err_t e = esp_ble_tx_power_set_enhanced(ESP_BLE_ENHANCED_PWR_TYPE_CONN, s_bis[i], ESP_PWR_LVL_P20);
+        ESP_LOGW(TAG, "BIS 0x%04x TX power +20 dBm: %s (reads back level %d)", s_bis[i], esp_err_to_name(e),
+                 esp_ble_tx_power_get_enhanced(ESP_BLE_ENHANCED_PWR_TYPE_CONN, s_bis[i]));
+    }
     ESP_LOGW(TAG, "broadcast ON: '%s' Broadcast_ID 0x%06x, BIS 0x%04x/0x%04x, ISO interval %u us",
              AURA_BROADCAST_NAME, (unsigned)AURA_BROADCAST_ID, s_bis[0], s_bis[1],
              gap_subevent_big_created_get_iso_interval_1250us(packet) * 1250u);
@@ -1147,6 +1300,9 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
             size >= 6) {
             on_pa_enable_complete(hci_event_command_complete_get_return_parameters(packet)[0]);
         }
+        if (hci_event_command_complete_get_command_opcode(packet) == HCI_OPCODE_HCI_LE_READ_ISO_TX_SYNC && size >= 5 + 12) {
+            on_tx_sync(hci_event_command_complete_get_return_parameters(packet));
+        }
         break;
     case HCI_EVENT_META_GAP:
         switch (hci_event_gap_meta_get_subevent_code(packet)) {
@@ -1185,7 +1341,7 @@ void auracast_setup(void)
 {
     ext_adv_build();
     pa_build();
-    log_hex("EXT ADV", s_ext_adv, sizeof(s_ext_adv));
+    log_hex("EXT ADV", s_ext_adv, s_ext_adv_len);
     log_hex("PA (BASE + JBL)", s_pa, s_pa_len);
 
     /* hot encoder state: internal RAM explicitly */
@@ -1353,10 +1509,12 @@ void auracast_log_stats(void)
         uint32_t n = ct_n, mn = ct_gap_min, mx2 = ct_gap_max, lg = ct_long, mc = ct_cb_multi, pk = ct_pkts;
         uint64_t sum = ct_gap_sum;
         ct_n = 0; ct_gap_sum = 0; ct_gap_min = UINT32_MAX; ct_gap_max = 0; ct_long = 0; ct_cb_multi = 0; ct_pkts = 0;
-        ESP_LOGW(TAG, "BIG timing (BIS0 completions): %lu events, gap avg %lu.%03lu ms min %lu us max %lu us, >1.5 itvl %lu, same-event cbs %lu, SDUs %lu (%lu.%02lu per event)",
+        ESP_LOGW(TAG, "BIG timing (BIS0 completions): %lu events, gap avg %lu.%03lu ms min %lu us max %lu us, >1.5 itvl %lu, same-event cbs %lu, SDUs %lu (%lu.%02lu per event) | SDU ts %s, sync reads %lu, drift %ld us, re-anchors %lu | ctl %s: late %lu, partly unsent %lu",
                  (unsigned long)n, (unsigned long)(n ? sum / n / 1000 : 0), (unsigned long)(n ? (sum / n) % 1000 : 0),
                  (unsigned long)(n ? mn : 0), (unsigned long)mx2, (unsigned long)lg, (unsigned long)mc, (unsigned long)pk,
-                 (unsigned long)(n ? pk / n : 0), (unsigned long)(n ? (pk * 100 / n) % 100 : 0));
+                 (unsigned long)(n ? pk / n : 0), (unsigned long)(n ? (pk * 100 / n) % 100 : 0),
+                 s_ts_valid ? "ON" : "off", (unsigned long)st_ts_reads, (long)st_ts_drift, (unsigned long)st_ts_reanchor,
+                 s_ctl_v1 ? "v1" : "old", (unsigned long)st_late_ctl, (unsigned long)st_partial);
     }
     if (sk_new) {
         sk_new = false;

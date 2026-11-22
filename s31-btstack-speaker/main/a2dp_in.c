@@ -36,7 +36,7 @@ static const char *TAG = "A2DP";
 #define PKT_Q_LEN       24                    /* ~550 ms of 8-frame packets */
 #define RING_MS         160                   /* max S31-added delay: beyond it the OLDEST audio is dropped */
 #define TARGET_MS       80                    /* PCM fill the clock recovery aims at */
-#define PRIME_MS        50                    /* start output once this much is buffered */
+#define PRIME_MS        TARGET_MS             /* start output at the target fill: no start-up underruns / integrator wind-up */
 #define MS_FRAMES(ms)   ((OUT_RATE / 1000) * (ms))
 
 /* ---- AVDTP endpoint / SDP --------------------------------------------------- */
@@ -89,7 +89,7 @@ static void on_pcm(int16_t *data, int num_frames, int num_channels, int sample_r
     float fill = (float)ring_fill(&s_ring);
     s_fill_avg += (fill - s_fill_avg) * 0.002f;
     float err = (s_fill_avg - (float)MS_FRAMES(TARGET_MS)) * (1.0f / (float)MS_FRAMES(TARGET_MS));
-    s_integ += err * 0.0005f;
+    s_integ += err * 0.0002f;
     /* +-1500 ppm: at +-500 the loop sat on the limit with the S26 Ultra (its
      * A2DP clock vs our BIG clock), so the fill was not regulated and wandered
      * 40-104 ms -> occasional underrun clicks */
@@ -377,16 +377,19 @@ static void a2dp_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet,
     case A2DP_SUBEVENT_STREAM_STARTED:
         s_reset_dsp = true;
         s_streaming = true;
+        gap_connectable_control(0);               /* no page scan while streaming: airtime for the BIS */
         ESP_LOGW(TAG, "A2DP audio STARTED");
         break;
     case A2DP_SUBEVENT_STREAM_SUSPENDED:
     case A2DP_SUBEVENT_STREAM_STOPPED:
         s_streaming = false;
+        gap_connectable_control(!S31_QUIET_RADIO_TEST);
         ESP_LOGW(TAG, "A2DP audio %s", packet[2] == A2DP_SUBEVENT_STREAM_SUSPENDED ? "suspended" : "stopped");
         break;
     case A2DP_SUBEVENT_SIGNALING_CONNECTION_RELEASED:
         s_streaming = false;
         s_connected = false;
+        gap_connectable_control(!S31_QUIET_RADIO_TEST);
         ESP_LOGW(TAG, "A2DP disconnected");
         break;
     default:

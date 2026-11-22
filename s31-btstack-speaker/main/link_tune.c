@@ -18,7 +18,7 @@
  *
  *  LE (JBL One / peer GATT link, S31 peripheral):
  *   - 6 s after the connection (service discovery and the V5 handshake are
- *     done by then) the S31 asks for a 30-50 ms interval instead of the
+ *     done by then) the S31 asks for a 60-75 ms interval instead of the
  *     7.5-15 ms phones use while discovering.
  */
 #include "link_tune.h"
@@ -34,8 +34,8 @@ static const char *TAG = "LINK";
 
 #define POLL_SLOTS          10                    /* Tpoll, 0.625 ms slots */
 #define LE_UPDATE_DELAY_MS  6000
-#define LE_ITVL_MIN         24                    /* 30 ms in 1.25 ms */
-#define LE_ITVL_MAX         40                    /* 50 ms */
+#define LE_ITVL_MIN         48                    /* 60 ms in 1.25 ms */
+#define LE_ITVL_MAX         60                    /* 75 ms */
 #define LE_LATENCY          0
 #define LE_TIMEOUT          500                   /* 5 s in 10 ms */
 

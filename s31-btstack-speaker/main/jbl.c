@@ -199,6 +199,13 @@ void jbl_on_hci_working(void)
     s_working = true;
     jbl_beacon_state_t st;
     beacon_state(&st);
+#ifndef AURA_GENERIC_JBL_OFF
+#define AURA_GENERIC_JBL_OFF 0     /* plain-Auracast test: no JBL host beacon / assistant */
+#endif
+    if (AURA_GENERIC_JBL_OFF) {
+        ESP_LOGW(TAG, "generic Auracast test: JBL beacon and assistant OFF (GATT/V5 still up)");
+        return;
+    }
     jbl_beacon_start(crc, &st);
     jbl_assist_set_streaming(st.streaming);
     jbl_assist_start(crc, a);
