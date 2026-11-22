@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>S31 Console</title>
+<link rel="icon" id="favicon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect rx='7' width='32' height='32' fill='%236b7686'/%3E%3Cpath d='M18 4 8 18h7l-2 10 11-15h-7z' fill='white'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <symbol id="i-bolt" viewBox="0 0 24 24"><path d="M13 2 4 14h7l-1 8 9-12h-7l1-8z"/></symbol>
+    <symbol id="i-box" viewBox="0 0 24 24"><path d="M21 16V8a2 2 0 0 0-1-1.7l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.7l7 4a2 2 0 0 0 2 0l7-4a2 2 0 0 0 1-1.7z"/><path d="M3.3 7 12 12l8.7-5M12 22V12"/></symbol>
+    <symbol id="i-rec" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3.5" class="fillc"/></symbol>
+    <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2" class="fillc"/></symbol>
+    <symbol id="i-reset" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></symbol>
+    <symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></symbol>
+    <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></symbol>
+    <symbol id="i-moon" viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></symbol>
+    <symbol id="i-bell" viewBox="0 0 24 24"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.9 1.9 0 0 0 3.4 0"/></symbol>
+    <symbol id="i-vol" viewBox="0 0 24 24"><path d="M11 5 6 9H2v6h4l5 4V5z"/><path d="M15.5 8.5a5 5 0 0 1 0 7M19 5a10 10 0 0 1 0 14"/></symbol>
+    <symbol id="i-mute" viewBox="0 0 24 24"><path d="M11 5 6 9H2v6h4l5 4V5z"/><path d="m22 9-6 6M16 9l6 6"/></symbol>
+    <symbol id="i-trash" viewBox="0 0 24 24"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/></symbol>
+    <symbol id="i-down" viewBox="0 0 24 24"><path d="M12 5v14M5 12l7 7 7-7"/></symbol>
+    <symbol id="i-flag" viewBox="0 0 24 24"><path d="M4 22V4M4 4h13l-2 4 2 4H4"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></symbol>
+    <symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/></symbol>
+    <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 16v-4M12 8h.01"/></symbol>
+  </defs>
+</svg>
+
+<header class="topbar">
+  <div class="brand">
+    <div class="logo"><svg><use href="#i-bolt"/></svg></div>
+    <div>
+      <div class="brand-name">S31 Console</div>
+      <div class="brand-sub" id="devSub">ESP32-S31</div>
+    </div>
+    <span class="badge-mock" id="mockBadge" hidden title="Simulated board — no hardware is touched">SIMULATOR</span>
+  </div>
+  <div class="top-right">
+    <span class="conn" id="conn" title="Live connection to the console server"><i></i><span id="connText">connecting…</span></span>
+    <button class="icon-btn" id="btnSound" title="Sounds on/off"><svg><use href="#i-vol"/></svg></button>
+    <button class="icon-btn" id="btnNotif" title="Desktop notifications"><svg><use href="#i-bell"/></svg></button>
+    <button class="icon-btn" id="btnTheme" title="Light / dark theme"><svg><use href="#i-sun"/></svg></button>
+  </div>
+</header>
+
+<section class="hero" id="hero" data-state="IDLE">
+  <div class="hero-row">
+    <button class="pill" id="pill" title="Current state"><span class="pill-dot"></span><span id="pillText">IDLE</span></button>
+    <div class="hero-mid">
+      <div class="phase-row">
+        <span class="phase" id="phase">Ready</span>
+        <span class="steps" id="steps"></span>
+      </div>
+      <div class="progress" id="progress">
+        <div class="progress-fill" id="progFill"></div>
+        <span class="progress-label" id="progLabel"></span>
+      </div>
+    </div>
+    <div class="timer">
+      <div class="timer-label" id="timerLabel">Elapsed</div>
+      <div class="timer-val" id="timerVal">—</div>
+    </div>
+  </div>
+  <div class="hero-sub">
+    <div class="logind" id="logInd"><span class="rec-dot"></span><span id="logText">Not logging</span></div>
+    <div class="last" id="lastResult"><span class="muted">No build/flash in this session yet</span></div>
+  </div>
+</section>
+
+<section class="controls">
+  <div class="btn-group">
+    <button id="btnBuildFlash" class="btn primary" title="idf.py build, then flash COM5, then auto-log"><svg><use href="#i-bolt"/></svg>Build + Flash</button>
+    <button id="btnFlash" class="btn" title="Flash the current build"><svg><use href="#i-bolt"/></svg>Flash</button>
+    <button id="btnBuild" class="btn" title="idf.py build"><svg><use href="#i-box"/></svg>Build</button>
+    <button id="btnCancel" class="btn danger" hidden title="Kill the running build/flash"><svg><use href="#i-x"/></svg>Cancel</button>
+  </div>
+  <div class="btn-group">
+    <button id="btnLog" class="btn logbtn" title="Open the serial port and log to a session file"><svg class="ic-rec"><use href="#i-rec"/></svg><span id="btnLogText">Start logging</span></button>
+    <button id="btnReset" class="btn" title="Pulse RTS (DTR low) to reset the board"><svg><use href="#i-reset"/></svg>Reset board</button>
+  </div>
+  <label class="switch" title="After a successful flash, reopen the port and log automatically">
+    <input type="checkbox" id="tgAutoLog" checked><span class="track"></span><span>Auto-log after flash</span>
+  </label>
+</section>
+
+<main class="layout">
+  <aside class="side">
+    <div class="section-title">Live metrics <span class="muted" id="statsAge"></span></div>
+    <div class="tiles" id="tiles"></div>
+    <div class="section-title">Last 5 minutes</div>
+    <div class="charts" id="charts"></div>
+  </aside>
+
+  <section class="logcard">
+    <div class="log-toolbar">
+      <div class="filter-wrap">
+        <input id="filter" type="search" placeholder="Filter — text, or /regex/" spellcheck="false" autocomplete="off">
+      </div>
+      <div class="chips" id="chips">
+        <button class="chip on" data-f="E">E</button>
+        <button class="chip on" data-f="W">W</button>
+        <button class="chip on" data-f="I">I</button>
+        <button class="chip on" data-f="O" title="D/V and unformatted lines">other</button>
+        <button class="chip on" data-f="T" title="build / flash tool output">tool</button>
+      </div>
+      <span class="log-count" id="logCount"></span>
+      <span class="spacer"></span>
+      <label class="switch small" title="Follow new lines (pauses automatically when you scroll up)">
+        <input type="checkbox" id="tgScroll" checked><span class="track"></span><span>Auto-scroll</span>
+      </label>
+      <button class="btn ghost small" id="btnClear" title="Clear the view (the session file is not touched)"><svg><use href="#i-trash"/></svg>Clear view</button>
+    </div>
+    <div class="log-wrap">
+      <div class="log" id="log" tabindex="0"></div>
+      <button class="jump" id="jump" hidden><svg><use href="#i-down"/></svg>Jump to latest <span id="jumpN"></span></button>
+    </div>
+    <form class="markbar" id="markForm" autocomplete="off">
+      <svg class="markic"><use href="#i-flag"/></svg>
+      <input id="markText" placeholder="Insert a marker line into the log / session file…" maxlength="300">
+      <button class="btn small" type="submit">Mark</button>
+    </form>
+  </section>
+</main>
+
+<div class="toasts" id="toasts" aria-live="polite"></div>
+<script src="app.js"></script>
+</body>
+</html>

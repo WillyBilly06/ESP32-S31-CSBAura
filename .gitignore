@@ -24,3 +24,8 @@ __pycache__/
 
 # Claude Code agent worktrees
 .claude/
+
+# console runtime
+tools/s31_console/__pycache__/
+tools/s31_console/mock_logs/
+s31-jbl-speaker/logs/

@@ -27,4 +27,7 @@ void a2dp_bridge_on_phone_name(void (*cb)(const char *name));
 
 /* Totals since boot, plus the current buffer fill. drops: packets the writer
  * threw away (ring full); skips: times the reader cut latency back to target. */
+/* current phone-vs-S31 audio clock correction (ppm) */
+int32_t a2dp_bridge_clock_ppm(void);
+
 void a2dp_bridge_stats(uint32_t *underruns, uint32_t *drops, uint32_t *skips, uint32_t *fill_ms);

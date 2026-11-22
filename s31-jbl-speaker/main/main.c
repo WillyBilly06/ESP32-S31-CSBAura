@@ -1128,7 +1128,8 @@ static void stats_task(void *arg)
                  (unsigned long)g_iso_backlog_drops, (unsigned long)g_send_backoffs,
                  (unsigned long)g_tick_skips);
         if (a2dp_bridge_streaming()) {
-            ESP_LOGW(TAG, "SBC 2s: bitpool now %u (min %u, max %u), media pkts %lu, lost pkts %lu",
+            ESP_LOGW(TAG, "SBC 2s: clock corr %ld ppm | bitpool now %u (min %u, max %u), media pkts %lu, lost pkts %lu",
+                     (long)a2dp_bridge_clock_ppm(),
                      btc_a2dp_sink_bitpool_last,
                      btc_a2dp_sink_bitpool_min == 0xFF ? 0 : btc_a2dp_sink_bitpool_min,
                      btc_a2dp_sink_bitpool_max, (unsigned long)btc_a2dp_sink_media_pkts,

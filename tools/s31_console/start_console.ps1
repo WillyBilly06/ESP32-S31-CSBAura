@@ -1,0 +1,29 @@
+<#
+.SYNOPSIS
+  Start the S31 Console (flash + serial monitor web UI) on http://127.0.0.1:8765
+.EXAMPLE
+  .\start_console.ps1            # real board on COM5 @ 921600
+  .\start_console.ps1 -Mock      # simulator, no hardware touched
+  .\start_console.ps1 -Port COM7 -Baud 115200 -LogOnStart
+#>
+param(
+  [switch]$Mock,
+  [string]$Port = "COM5",
+  [int]$Baud = 921600,
+  [int]$HttpPort = 8765,
+  [switch]$LogOnStart,
+  [switch]$NoAutoLog,
+  [switch]$NoBrowser
+)
+$py = Join-Path $env:USERPROFILE ".espressif\python_env\idf6.1_py3.12_env\Scripts\python.exe"
+if (-not (Test-Path $py)) { Write-Warning "IDF python env not found at $py - falling back to 'python'"; $py = "python" }
+$server = Join-Path $PSScriptRoot "server.py"
+$argList = @($server, "--port", $Port, "--baud", $Baud, "--http-port", $HttpPort)
+if ($Mock)       { $argList += "--mock" }
+if ($LogOnStart) { $argList += "--log-on-start" }
+if ($NoAutoLog)  { $argList += "--no-auto-log" }
+if (-not $NoBrowser) {
+  # open the UI shortly after the server comes up
+  Start-Job -ScriptBlock { param($u) Start-Sleep -Seconds 1.5; Start-Process $u } -ArgumentList "http://127.0.0.1:$HttpPort/" | Out-Null
+}
+& $py @argList

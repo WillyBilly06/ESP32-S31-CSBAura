@@ -47,7 +47,9 @@
 
 static volatile uint32_t s_underruns;           /* encoder found too little phone audio */
 static volatile uint32_t s_drops;               /* phone audio dropped (buffer full) */
-static volatile uint32_t s_skips;               /* latency cap hit: oldest audio dropped back to TARGET */
+static volatile uint32_t s_skips;
+static volatile bool s_rs_fresh = true;         /* clock recovery restarts after a reset/flush */
+static volatile int32_t s_corr_ppm;             /* current clock correction, for the stats */               /* latency cap hit: oldest audio dropped back to TARGET */
 /* Set by the A2DP callbacks (BTC task) on start / suspend / codec change /
  * disconnect; the encoder task (the ring's consumer, the only side allowed to
  * move rd) empties the ring on its next read, so audio from before a pause or
@@ -131,15 +133,40 @@ static void a2d_data_cb(const uint8_t *data, uint32_t len)
     if (s_rs_reset) {
         s_rs_reset = false;
         rs_reset(&s_rs);
+        s_rs_fresh = true;
     }
 
-    /* Drift control, once per packet: nudge the resampling ratio (max
-     * +-0.2 %) so the buffer hovers around TARGET; the phone's clock and
-     * ours differ. */
+    /* Clock recovery, once per packet. The phone's audio clock and ours
+     * differ by a few tens of ppm; the ring fill tells us which way. The raw
+     * fill jumps by tens of ms with every packet, so feeding it straight into
+     * the ratio frequency-modulated the audio at packet rate (audible as
+     * garble on sine sweeps). Instead: ~4 s low-pass on the fill, PI control
+     * of the ratio, +-500 ppm range, and at most 2 ppm change per packet. */
     const uint32_t src_rate = s_src_rate;
     uint32_t space = ring_space(&s_ring);
     uint32_t fill = RB_FRAMES - space;
-    const float e = ((float)fill - (float)TARGET_FRAMES) * (1.0f / (float)TARGET_FRAMES);
+    float corr;                                    /* fractional ratio correction */
+    {
+        static float fill_avg = -1.0f, integ = 0.0f, corr_prev = 0.0f;
+        if (fill_avg < 0.0f || s_rs_fresh) {      /* after (re)start: no history */
+            fill_avg = (float)TARGET_FRAMES;
+            integ = 0.0f;
+            corr_prev = 0.0f;
+            s_rs_fresh = false;
+        }
+        fill_avg += ((float)fill - fill_avg) * (1.0f / 256.0f);           /* ~256 packets ~ 4 s */
+        const float err = (fill_avg - (float)TARGET_FRAMES) * (1.0f / (float)TARGET_FRAMES);
+        integ += err * (1.0f / 64.0f);
+        if (integ > 4.0f) integ = 4.0f; else if (integ < -4.0f) integ = -4.0f;
+        float c = 300e-6f * err + 100e-6f * integ;                         /* P + I */
+        if (c > 500e-6f) c = 500e-6f; else if (c < -500e-6f) c = -500e-6f;
+        if (c > corr_prev + 2e-6f) c = corr_prev + 2e-6f;                  /* slew limit */
+        else if (c < corr_prev - 2e-6f) c = corr_prev - 2e-6f;
+        corr_prev = c;
+        corr = c;
+        s_corr_ppm = (int32_t)(c * 1e6f);
+    }
+    const float e = corr * 500.0f;                 /* rs_step_q32 applies 0.002*e */
     const uint64_t step = rs_step_q32(src_rate, OUT_RATE, e);
 
     /* Drop the whole packet if the encoder has fallen behind (keeps latency
@@ -234,6 +261,11 @@ bool a2dp_bridge_connected(void)
 uint32_t a2dp_bridge_packets(void)
 {
     return s_in_pkts;
+}
+
+int32_t a2dp_bridge_clock_ppm(void)
+{
+    return s_corr_ppm;
 }
 
 void a2dp_bridge_stats(uint32_t *underruns, uint32_t *drops, uint32_t *skips, uint32_t *fill_ms)
