@@ -72,6 +72,19 @@ extern uint8_t *BTM_ReadLocalFeatures(void);    /* Bluedroid: LMP features page 
  * and re/controller_sched.md. */
 #include "bt_sched_tune.h"
 
+/* Bluedroid internals: desired link role for new connections, current role. */
+extern uint8_t L2CA_SetDesireRole(uint8_t new_role);
+extern uint8_t BTM_GetRole(uint8_t *remote_bd_addr, uint8_t *p_role);
+#define S31_HCI_ROLE_MASTER        0x00
+#define S31_L2CAP_ROLE_NO_SWITCH   0x40     /* disallow role switch at create-connection */
+
+/* A/B test: while music streams, rotate radio profiles every 20 s and log
+ * which one is active, so one listening session compares them all. */
+#ifndef SCHED_AB_TEST
+#define SCHED_AB_TEST 0
+#endif
+#define ACL_PKT_DH3_ONLY (ESP_BT_ACL_PKT_TYPES_MASK_DM1 | ESP_BT_ACL_PKT_TYPES_MASK_DH1 |                           ESP_BT_ACL_PKT_TYPES_MASK_DM3 | ESP_BT_ACL_PKT_TYPES_MASK_DH3 |                           ESP_BT_ACL_PKT_TYPES_MASK_NO_2_DH5 | ESP_BT_ACL_PKT_TYPES_MASK_NO_3_DH5)
+
 /* All ACL packet types, EDR (2/3 Mbps) DH1/DH3/DH5 allowed (no "NO_x_DHy" bits). */
 #define ACL_PKT_ALL_EDR (ESP_BT_ACL_PKT_TYPES_MASK_DM1 | ESP_BT_ACL_PKT_TYPES_MASK_DH1 |                          ESP_BT_ACL_PKT_TYPES_MASK_DM3 | ESP_BT_ACL_PKT_TYPES_MASK_DH3 |                          ESP_BT_ACL_PKT_TYPES_MASK_DM5 | ESP_BT_ACL_PKT_TYPES_MASK_DH5)
 static void (*s_name_cb)(const char *name);
@@ -265,6 +278,13 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *p)
             remember_phone(a);
             esp_bt_gap_read_remote_name(a);   /* phone name -> CRC in the JBL beacon */
             esp_bt_gap_set_acl_pkt_types(a, ACL_PKT_ALL_EDR);   /* let the phone use 2/3-DH5 */
+            {
+                uint8_t role = 0xFF;
+                BTM_GetRole(a, &role);
+                ESP_LOGW(TAG, "BR/EDR role on this link: %s", role == 0 ? "MASTER (S31 schedules the phone - good)"
+                                                          : role == 1 ? "SLAVE (phone schedules blind - expect overlap)"
+                                                                      : "unknown");
+            }
             /* stop inquiry/page scanning while a phone is attached: frees radio time */
             esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
         } else if (p->conn_stat.state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
@@ -292,7 +312,13 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *p)
         s_flush_req = true;
         __atomic_thread_fence(__ATOMIC_RELEASE);
         s_streaming = (p->audio_stat.state == ESP_A2D_AUDIO_STATE_STARTED);
-        bt_sched_tune_streaming(s_streaming);    /* A2DP highest only while music flows */
+        bt_sched_tune_streaming(s_streaming);
+        if (s_have_peer) {
+            uint8_t role = 0xFF;
+            BTM_GetRole(s_peer, &role);
+            ESP_LOGW(TAG, "BR/EDR role at audio %s: %s", s_streaming ? "start" : "stop",
+                     role == 0 ? "MASTER" : role == 1 ? "SLAVE" : "unknown");
+        }
         ESP_LOGW(TAG, "A2DP audio %s", s_streaming ? "STARTED -> re-broadcasting on Auracast"
                                                    : "suspended -> broadcasting silence");
         break;
@@ -420,6 +446,33 @@ static void call_back_last_phone(const char *why, int tries)
     }
 }
 
+#if SCHED_AB_TEST
+static void sched_ab_task(void *arg)
+{
+    /* Round 2: BIS first copies 15, repetitions 7, DH3 only; sweep the ACL
+     * base. The controller adds +1 per missed 25 ms poll (and per 4 queued
+     * packets), so a base just under 7 lets repetitions win normally and the
+     * phone link overtake them only while it is falling behind. */
+    static const struct { uint8_t acl, first, rep, pto; bool dh3; const char *name; } prof[] = {
+        { 3, 15, 7, 7, true, "Q1 ACL3 (reps7), DH3" },
+        { 4, 15, 7, 7, true, "Q2 ACL4 (reps7), DH3" },
+        { 5, 15, 7, 7, true, "Q3 ACL5 (reps7), DH3" },
+        { 6, 15, 7, 7, true, "Q4 ACL6 (reps7), DH3" },
+    };
+    int i = 0;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(20000));
+        if (!s_streaming || !s_have_peer) {
+            continue;
+        }
+        i = (i + 1) & 3;
+        ESP_LOGW(TAG, "===== A/B PROFILE %s =====", prof[i].name);
+        bt_sched_tune_apply_custom(prof[i].acl, prof[i].first, prof[i].rep, prof[i].pto, prof[i].name);
+        esp_bt_gap_set_acl_pkt_types(s_peer, prof[i].dh3 ? ACL_PKT_DH3_ONLY : ACL_PKT_ALL_EDR);
+    }
+}
+#endif
+
 static void reconnect_task(void *arg)
 {
     vTaskDelay(pdMS_TO_TICKS(1500));
@@ -471,6 +524,12 @@ esp_err_t bt_dual_mode_init(void)
     esp_ble_gap_set_security_param(ESP_BLE_SM_MAX_KEY_SIZE, &key_size, sizeof(key_size));
     esp_ble_gap_set_security_param(ESP_BLE_SM_SET_INIT_KEY, &init_key, sizeof(init_key));
     esp_ble_gap_set_security_param(ESP_BLE_SM_SET_RSP_KEY, &rsp_key, sizeof(rsp_key));
+    /* Be the BR/EDR master: accept incoming connections as master (role switch
+     * at setup) and never offer a switch on our own outgoing pages. Together
+     * with the link-policy patch (no role switch later) our controller decides
+     * when the phone may transmit - around the Auracast BIG. */
+    L2CA_SetDesireRole(S31_HCI_ROLE_MASTER);
+    L2CA_SetDesireRole(S31_L2CAP_ROLE_NO_SWITCH);
     bt_sched_tune_init();
     return ESP_OK;
 }
@@ -544,5 +603,8 @@ esp_err_t a2dp_bridge_start(const char *bredr_name)
     ESP_LOGW(TAG, "BR/EDR speaker '%s' discoverable at %02x:%02x:%02x:%02x:%02x:%02x (A2DP sink)",
              bredr_name, a[0], a[1], a[2], a[3], a[4], a[5]);
     xTaskCreatePinnedToCore(reconnect_task, "a2dp_reconn", 3072, NULL, 4, NULL, 1);   /* core 1: keep core 0 for the BT controller */
+#if SCHED_AB_TEST
+    xTaskCreatePinnedToCore(sched_ab_task, "sched_ab", 3072, NULL, 3, NULL, 1);
+#endif
     return ESP_OK;
 }

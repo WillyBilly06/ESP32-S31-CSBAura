@@ -39,6 +39,10 @@ typedef enum {
      * SDU gets on air at least once; ACL base 8 beats repetitions 7 so A2DP
      * keeps its throughput (repetition diversity is what is sacrificed). */
     BT_SCHED_MODE_AURACAST_FIRST = 1,
+    /* S31 is BR/EDR master (role switch refused): stock ACL priority 2 and
+     * every BIS copy above it - the S31 just polls the phone in the gaps
+     * between BIG events, so nothing has to be dropped and nothing moves. */
+    BT_SCHED_MODE_MASTER = 2,
 } bt_sched_mode_t;
 
 #ifndef BT_SCHED_MODE
@@ -55,6 +59,9 @@ void bt_sched_tune_streaming(bool on);
 
 /* Change the mode at run time (A/B testing); re-applies the current profile. */
 void bt_sched_tune_set_mode(bt_sched_mode_t mode);
+
+/* A/B testing: explicit ACL base / BIS first / repetition / pre-tx priorities. */
+void bt_sched_tune_apply_custom(uint8_t acl, uint8_t first, uint8_t rep, uint8_t pto, const char *why);
 
 #ifdef __cplusplus
 }

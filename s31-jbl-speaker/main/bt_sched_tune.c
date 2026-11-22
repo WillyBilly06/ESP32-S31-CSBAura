@@ -58,12 +58,14 @@ static const prio_profile_t s_idle = {
 };
 
 /* Streaming profiles, indexed by bt_sched_mode_t. */
-static const prio_profile_t s_stream[2] = {
+static const prio_profile_t s_stream[3] = {
     /* A2DP_FIRST: ACL 14 (= its cap, so the escalation terms change nothing and
      * the controller's "new pti" log stays quiet) > BIS 13 > 12 > 11 > PA 10 > adv > scan */
     [BT_SCHED_MODE_A2DP_FIRST]     = { 14, 13, 12, 11, 13 },
     /* AURACAST_FIRST: BIS first copy 15 > ACL 8..14 > repetitions 7 */
     [BT_SCHED_MODE_AURACAST_FIRST] = { 8, 15, 7, 7, 15 },
+    /* MASTER: same as idle - stock ACL 2, all BIS copies above it */
+    [BT_SCHED_MODE_MASTER]         = { BT_SCHED_IDLE_ACL, BT_SCHED_IDLE_FIRST, BT_SCHED_IDLE_REP, BT_SCHED_IDLE_PTO, BT_SCHED_IDLE_FIRST },
 };
 
 /* ---- table location / verification ---------------------------------------- */
@@ -186,7 +188,7 @@ static void apply(const prio_profile_t *pr, const char *why)
     bool changed = (acl_ok && old_acl != pr->acl) || (iso_ok && memcmp(old_iso, iso + 33, 4) != 0);
     if (changed || !acl_ok || !iso_ok) {
         ESP_LOGW(TAG, "%s [%s]: ACL %u->%s%u | BIS first %u->%u rep %u->%u pto %u->%u ctrl %u->%u%s", why,
-                 s_mode == BT_SCHED_MODE_A2DP_FIRST ? "A2DP_FIRST" : "AURACAST_FIRST", old_acl,
+                 s_mode == BT_SCHED_MODE_A2DP_FIRST ? "A2DP_FIRST" : s_mode == BT_SCHED_MODE_MASTER ? "MASTER" : "AURACAST_FIRST", old_acl,
                  acl_ok ? "" : "FAILED ", pr->acl, old_iso[0], pr->first, old_iso[1], pr->rep, old_iso[2],
                  pr->pto, old_iso[3], pr->ctrl, iso_ok ? "" : " (ISO FAILED)");
     }
@@ -207,9 +209,16 @@ void bt_sched_tune_streaming(bool on)
 
 void bt_sched_tune_set_mode(bt_sched_mode_t mode)
 {
-    if (mode != BT_SCHED_MODE_A2DP_FIRST && mode != BT_SCHED_MODE_AURACAST_FIRST) {
+    if (mode != BT_SCHED_MODE_A2DP_FIRST && mode != BT_SCHED_MODE_AURACAST_FIRST && mode != BT_SCHED_MODE_MASTER) {
         return;
     }
     s_mode = mode;
     bt_sched_tune_streaming(s_streaming);
+}
+
+/* A/B testing: apply an explicit profile (same verification as the modes). */
+void bt_sched_tune_apply_custom(uint8_t acl, uint8_t first, uint8_t rep, uint8_t pto, const char *why)
+{
+    const prio_profile_t pr = { acl, first, rep, pto, first };
+    apply(&pr, why);
 }

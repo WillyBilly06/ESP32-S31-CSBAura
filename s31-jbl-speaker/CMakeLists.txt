@@ -25,4 +25,7 @@ idf_build_set_property(COMPILE_DEFINITIONS "A2D_SBC_DECODE_BATCH=1" APPEND)
 # constants is already strength-reduced to multiply/shift at -O2; prebuilt
 # blobs (controller, PHY, coex, libc/libm) are not affected.
 idf_build_set_property(COMPILE_OPTIONS "-freciprocal-math" APPEND)
+# Stay BR/EDR master: refuse role switches (idf-patches/0007) so the S31's
+# controller schedules the phone's A2DP traffic around the Auracast BIG.
+idf_build_set_property(COMPILE_DEFINITIONS "BTM_NO_ROLE_SWITCH=1" APPEND)
 project(s31_jbl_speaker)
