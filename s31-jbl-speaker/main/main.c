@@ -1067,8 +1067,13 @@ void app_main(void)
         ESP_LOGE(TAG, "Failed to create encode semaphore");
         return;
     }
+    /* Core 0 with the Bluedroid host + iso_task (CONFIG_BT_BLUEDROID_PINNED_TO_CORE_0):
+     * core 1 is left to A2DP_DECODER (SBC + resampler, hard-pinned to core 1 in
+     * btc_a2dp_sink.c). Prio 21 = below btdm (23), esp_timer/hciT (22), above
+     * BTU/iso_task (20), so the controller is never delayed and the iso_task
+     * k_work tick that gives g_encode_sem is followed at once by the encode. */
     xTaskCreatePinnedToCore(encode_task, "lc3_enc", 12288, NULL,
-                            configMAX_PRIORITIES - 4, NULL, 1);
+                            configMAX_PRIORITIES - 4, NULL, 0);
     xTaskCreatePinnedToCore(stats_task, "tx_stats", 4096, NULL, 2, NULL, 1);
 
     err = broadcast_start();
