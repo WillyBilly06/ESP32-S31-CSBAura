@@ -44,6 +44,8 @@
  * Name (AD 0x30) is "<owner>'s JBL Xtreme 5". Either one is enough to match. */
 #define TARGET_BROADCAST_ID     0x112233
 #define TARGET_NAME_SUBSTR      "JBL"
+/* 1 = record the PHONE's broadcast (reference encoder) instead of the JBL */
+#define CAPTURE_PHONE_BROADCAST 1
 
 #define PA_SYNC_HANDLE_INIT     UINT16_MAX
 
@@ -687,9 +689,24 @@ static void ext_scan_recv(esp_ble_audio_gap_app_event_t *event)
     if (!sr.broadcast_id_found) {
         return;
     }
+#if CAPTURE_PHONE_BROADCAST
+    /* Capture run: lock onto the phone's own Auracast broadcast (Android LE
+     * Audio, stock liblc3) - anything that is not a JBL / S31 broadcast. */
+    if (sr.broadcast_id == TARGET_BROADCAST_ID || sr.name_jbl || strstr(sr.name, "S31") != NULL) {
+        return;
+    }
+    {
+        static uint32_t logged_id = 0xffffffff;
+        if (logged_id != sr.broadcast_id) {
+            logged_id = sr.broadcast_id;
+            ESP_LOGW(TAG, "CAPTURE target: broadcast '%s' Broadcast_ID 0x%06lx", sr.name, (unsigned long)sr.broadcast_id);
+        }
+    }
+#else
     if (sr.broadcast_id != TARGET_BROADCAST_ID && !sr.name_jbl) {
         return;
     }
+#endif
 
     /* Time the target's extended adverts before syncing (40 reports). */
     {

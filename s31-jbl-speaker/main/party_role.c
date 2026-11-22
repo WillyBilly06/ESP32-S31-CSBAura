@@ -717,7 +717,7 @@ static void i2s_out(const int16_t *l, const int16_t *r, int fs)
  * analysis of a real JBL encoder (tools/lc3_dump_analyze.py). One line per
  * SDU: "LC3F <n> <len> <base64>" (len 0 = lost). ~16 KB/s of text at 921600. */
 #ifndef PARTY_LC3_DUMP
-#define PARTY_LC3_DUMP 0   /* debug only: ~16 KB/s of UART text busy-waits CPU 1 */
+#define PARTY_LC3_DUMP 1   /* capture run: dump the master's LC3 frames */
 #endif
 #if PARTY_LC3_DUMP
 static void dump_frame(const sdu_t *it)

@@ -1124,7 +1124,7 @@ class Console:
                 '$env:IDF_TARGET="esp32s31"; $env:PYTHONUNBUFFERED="1"; $env:PYTHONIOENCODING="utf-8"; '
                 '. "$env:IDF_PATH\\export.ps1" | Out-Null; '
                 f'Set-Location "{a.project}"; '
-                f"idf.py {idf_args}; "
+                f"idf.py --ccache {idf_args}; "
                 "if ($null -eq $LASTEXITCODE) { exit 97 } else { exit $LASTEXITCODE }")
 
     def _run_tool(self, kind: str, idf_args: str, on_line) -> int:
@@ -1136,7 +1136,7 @@ class Console:
         else:
             cmd = ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
                    "-Command", self._ps_script(idf_args)]
-            shown = f"idf.py {idf_args}"
+            shown = f"idf.py --ccache {idf_args}"
         self.emit("t", f"> {shown}", "cmd")
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"

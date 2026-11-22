@@ -89,7 +89,7 @@ extern uint16_t r_ble_ll_iso_free_buf_num_get(uint16_t conn_handle);
 #define AURA_SR_HZ             48000
 #define AURA_FRAME_US          10000
 #define AURA_FRAME_SAMPLES     480
-#define AURA_SDU               100        /* octets per LC3 frame = SDU */
+#define AURA_SDU               120        /* octets per LC3 frame = SDU: 120 like the S26 Ultra broadcast (48_4), which the Xtreme 5 plays cleanly */
 #define AURA_PD_US             80000
 #define AURA_BIG_HANDLE        0
 #define AURA_BN                2
