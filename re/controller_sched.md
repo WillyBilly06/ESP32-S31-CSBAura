@@ -2,7 +2,7 @@
 
 Source blobs: `components/bt/controller/lib_esp32s31/esp32s31-bt-lib/{libbtdm_common.a,libbredr_app.a,libble_app.a}`
 (IDF tree `esp-idf-v6.1-codecs`). Method: `ar x` + `objdump -dr` + rodata dumps (scratch:
-`C:\Users\ngocv\AppData\Local\Temp\claude\9db0574533c6a073\72a8b680-3494-45db-8bf5-04bd924bcbdb\scratchpad\re_ctrl\`).
+`...\scratchpad\re_ctrl\`, a local temp dir).
 Object names below: `common/N.o`, `ble/N.o` = numbered archive members, `bredr/*.c.o` = named members.
 Tags: **[C]** = confirmed in disassembly/data, **[I]** = inference.
 
