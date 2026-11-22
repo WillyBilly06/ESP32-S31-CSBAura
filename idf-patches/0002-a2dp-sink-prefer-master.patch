@@ -1,0 +1,14 @@
+--- a/components/bt/host/bluedroid/btc/profile/std/a2dp/btc_av.c
++++ b/components/bt/host/bluedroid/btc/profile/std/a2dp/btc_av.c
+@@ (inside btc_av_execute_service, the "A2DP Enable without AVRC" branch) @@
+         } else {
+             BTC_TRACE_WARNING("A2DP Enable without AVRC")
++#if defined(BTC_AV_SINK_PREFER_MASTER) && BTC_AV_SINK_PREFER_MASTER
++            /* local patch (s31-jbl-speaker): stream only as BR/EDR master so the
++             * controller schedules the A2DP link around the LE Audio BIG. */
++            BTA_AvEnable(BTA_SEC_AUTHENTICATE, BTA_AV_FEAT_NO_SCO_SSPD | BTA_AV_FEAT_DELAY_RPT |
++                         BTA_AV_FEAT_MASTER, bte_av_callback);
++#else
+             BTA_AvEnable(BTA_SEC_AUTHENTICATE, BTA_AV_FEAT_NO_SCO_SSPD | BTA_AV_FEAT_DELAY_RPT, bte_av_callback);
++#endif
+             BTA_AvRegister(BTA_AV_CHNL_AUDIO, BTC_AV_SERVICE_NAME, 0, bte_av_media_callback, &bta_av_a2d_cos, NULL, tsep);
