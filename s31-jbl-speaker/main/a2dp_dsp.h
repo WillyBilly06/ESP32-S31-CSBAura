@@ -78,7 +78,8 @@ static inline uint64_t rs_step_q32(uint32_t src_rate, uint32_t out_rate, float e
 {
     if (e > 1.0f) e = 1.0f;
     if (e < -1.0f) e = -1.0f;
-    float stepf = ((float)src_rate / (float)out_rate) * (1.0f + 0.002f * e);
+    /* out_rate is a power-of-ten constant (48000): multiply by its reciprocal */
+    float stepf = (float)src_rate * (1.0f / (float)out_rate) * (1.0f + 0.002f * e);
     return (uint64_t)(stepf * 4294967296.0f);
 }
 

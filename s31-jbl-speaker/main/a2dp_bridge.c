@@ -54,36 +54,9 @@ static volatile uint32_t s_acl_change_ms;   /* when that link last came up or we
 static void remember_phone(const uint8_t *a);
 extern uint8_t *BTM_ReadLocalFeatures(void);    /* Bluedroid: LMP features page 0 */
 
-/* ---- controller lever (re/controller_sched.md) -------------------------------
- * The BR/EDR scheduler takes each activity's base priority from a 36-byte
- * {default, increment} table in DRAM (olc_sched.c.o .dram1.38). A streaming
- * ACL sits at 2..4 while BIS subevents run at 9 (first copy) / 7 (repetitions),
- * so A2DP slots lose every overlap with the BIG. Raise ACL (index 0) to 8:
- * it now beats BIS repetitions but never the first copy of a frame. */
-#define ACL_PRIO_BOOST 8
-extern uint8_t r_olc_sched_pti_dft_get(uint8_t idx);
-extern uint8_t _data_start[], _data_end[];
-
-static void bt_raise_acl_priority(void)
-{
-    static const uint8_t sig[36] = {2,1,9,2,10,1,4,1,12,2,8,1,2,1,4,1,4,1,4,1,
-                                    2,1,10,1,3,1,11,1,6,1,6,1,4,1,4,1};
-    uint8_t *hit = NULL;
-    int hits = 0;
-    for (uint8_t *p = _data_start; p + sizeof(sig) <= _data_end; p++) {
-        if (memcmp(p, sig, sizeof(sig)) == 0) {
-            hit = p;
-            hits++;
-        }
-    }
-    if (hits != 1 || r_olc_sched_pti_dft_get(0) != 2) {
-        ESP_LOGE(TAG, "ACL priority table: %d matches, dft[0]=%u - NOT patched", hits, r_olc_sched_pti_dft_get(0));
-        return;
-    }
-    hit[0] = ACL_PRIO_BOOST;
-    ESP_LOGW(TAG, "controller: A2DP/ACL base priority 2 -> %u at %p (BIS first copy 9, repetitions 7)",
-             r_olc_sched_pti_dft_get(0), hit);
-}
+/* Controller radio-priority profiles (A2DP vs Auracast): see bt_sched_tune.c
+ * and re/controller_sched.md. */
+#include "bt_sched_tune.h"
 
 /* All ACL packet types, EDR (2/3 Mbps) DH1/DH3/DH5 allowed (no "NO_x_DHy" bits). */
 #define ACL_PKT_ALL_EDR (ESP_BT_ACL_PKT_TYPES_MASK_DM1 | ESP_BT_ACL_PKT_TYPES_MASK_DH1 |                          ESP_BT_ACL_PKT_TYPES_MASK_DM3 | ESP_BT_ACL_PKT_TYPES_MASK_DH3 |                          ESP_BT_ACL_PKT_TYPES_MASK_DM5 | ESP_BT_ACL_PKT_TYPES_MASK_DH5)
@@ -137,13 +110,17 @@ static void a2d_data_cb(const uint8_t *data, uint32_t len)
     const uint32_t src_rate = s_src_rate;
     uint32_t space = ring_space(&s_ring);
     uint32_t fill = RB_FRAMES - space;
-    const float e = ((float)fill - (float)TARGET_FRAMES) / (float)TARGET_FRAMES;
+    const float e = ((float)fill - (float)TARGET_FRAMES) * (1.0f / (float)TARGET_FRAMES);
     const uint64_t step = rs_step_q32(src_rate, OUT_RATE, e);
 
     /* Drop the whole packet if the encoder has fallen behind (keeps latency
      * bounded), as the byte ring did when a send did not fit. Bound: n input
      * frames give at most n / step + 1 outputs (+1 after a reset). */
-    uint32_t need = (uint32_t)(((uint64_t)n << 32) / step) + 3;
+    /* n / step without a 64-bit software divide: out/in rate ratio times
+     * (1 - 0.002 e) is the first-order inverse of the drift factor (error
+     * < 5e-6, far below the +3 margin). */
+    const float inv_step = ((float)OUT_RATE / (float)src_rate) * (1.0f - 0.002f * e);
+    uint32_t need = (uint32_t)((float)n * inv_step * 1.0001f) + 3;
     if (need > space) {
         s_drops++;
         return;
@@ -258,6 +235,7 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *p)
             s_have_peer = false;
             s_a2dp_connected = false;
             s_streaming = false;
+            bt_sched_tune_streaming(false);
             esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
             if (lost) {
                 s_retry_after_loss = true;   /* reconnect_task calls the phone back */
@@ -268,6 +246,7 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *p)
     case ESP_A2D_AUDIO_STATE_EVT:
         s_streaming = (p->audio_stat.state == ESP_A2D_AUDIO_STATE_STARTED);
         s_rs_reset = true;
+        bt_sched_tune_streaming(s_streaming);    /* A2DP highest only while music flows */
         ESP_LOGW(TAG, "A2DP audio %s", s_streaming ? "STARTED -> re-broadcasting on Auracast"
                                                    : "suspended -> broadcasting silence");
         break;
@@ -317,6 +296,7 @@ static void gap_bt_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *p)
         }
         break;
     case ESP_BT_GAP_ACL_DISCONN_CMPL_STAT_EVT:
+        bt_sched_tune_streaming(false);
         s_acl_up = false;
         s_acl_change_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
         break;
@@ -443,7 +423,7 @@ esp_err_t bt_dual_mode_init(void)
     esp_ble_gap_set_security_param(ESP_BLE_SM_MAX_KEY_SIZE, &key_size, sizeof(key_size));
     esp_ble_gap_set_security_param(ESP_BLE_SM_SET_INIT_KEY, &init_key, sizeof(init_key));
     esp_ble_gap_set_security_param(ESP_BLE_SM_SET_RSP_KEY, &rsp_key, sizeof(rsp_key));
-    bt_raise_acl_priority();
+    bt_sched_tune_init();
     return ESP_OK;
 }
 

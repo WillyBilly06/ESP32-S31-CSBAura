@@ -19,4 +19,10 @@ idf_build_set_property(COMPILE_DEFINITIONS "A2D_SBC_SINK_MIN_BITPOOL=53" APPEND)
 # Decode all SBC frames of a media packet, then call the A2DP data callback
 # once per packet instead of once per SBC frame (idf-patches/0006).
 idf_build_set_property(COMPILE_DEFINITIONS "A2D_SBC_DECODE_BATCH=1" APPEND)
+# Every component compiled from source (app, Bluedroid, LE Audio host,
+# FreeRTOS, IDF): float a/b -> a*(1/b) where it helps (rounding-only change;
+# keeps IEEE NaN/Inf/ordering, unlike full -ffast-math). Integer division by
+# constants is already strength-reduced to multiply/shift at -O2; prebuilt
+# blobs (controller, PHY, coex, libc/libm) are not affected.
+idf_build_set_property(COMPILE_OPTIONS "-freciprocal-math" APPEND)
 project(s31_jbl_speaker)

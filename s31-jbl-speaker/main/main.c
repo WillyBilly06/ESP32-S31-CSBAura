@@ -437,7 +437,7 @@ static void broadcast_source_tx(void)
                     g_clipped++;
                 }
             }
-            mad /= (fs - 1);
+            mad = (uint32_t)((float)mad * (1.0f / 479.0f));   /* fs is always 480: no divide */
             int jump = pcm[ch] - prev_last[ch];
             if (jump < 0) jump = -jump;
             if (jump > 2000 && (uint32_t)jump > 6 * mad + 500) {
@@ -472,20 +472,20 @@ static void broadcast_source_tx(void)
                     ESP_LOGW(TAG, "REPLAY: phone streaming again -> live audio");
                 }
                 memcpy(rec + (size_t)rec_w * 960, pcm, 960 * sizeof(int16_t));
-                rec_w = (rec_w + 1) % rec_frames;
+                if (++rec_w >= rec_frames) rec_w = 0;
                 if (rec_n < rec_frames) rec_n++;
             } else if (rec_n >= 300) {     /* >= 3 s recorded: loop it */
                 if (!replaying) {
                     g_replaying = true;
-                    rec_r = (rec_w + rec_frames - rec_n) % rec_frames;
+                    rec_r = rec_w + rec_frames - rec_n; if (rec_r >= rec_frames) rec_r -= rec_frames;
                     ESP_LOGW(TAG, "REPLAY: phone paused -> looping the last %lu s of its music over Auracast "
                              "(Classic link idle). Listen: clean now = coexistence problem.",
                              (unsigned long)(rec_n / 100));
                 }
                 memcpy(pcm, rec + (size_t)rec_r * 960, 960 * sizeof(int16_t));
-                rec_r = (rec_r + 1) % rec_frames;
+                if (++rec_r >= rec_frames) rec_r = 0;
                 if (rec_r == rec_w) {
-                    rec_r = (rec_w + rec_frames - rec_n) % rec_frames;
+                    rec_r = rec_w + rec_frames - rec_n; if (rec_r >= rec_frames) rec_r -= rec_frames;
                 }
             }
         }
@@ -988,6 +988,13 @@ static void stats_task(void *arg)
         btc_a2dp_sink_bitpool_max = 0;
         btc_a2dp_sink_media_pkts = 0;
         btc_a2dp_sink_media_seq_gaps = 0;
+        {
+            /* 200 encodes per 2 s: avg = sum / n via the reciprocal of n */
+            uint32_t n = g_enc_n, avg = n ? (uint32_t)((float)g_enc_us_sum * (1.0f / (float)n)) : 0;
+            ESP_LOGW(TAG, "LC3 2s: encode L+R avg %lu us, max %lu us per 10 ms frame (~%lu%% of one core)",
+                     (unsigned long)avg, (unsigned long)g_enc_us_max, (unsigned long)((avg * 41) >> 12));
+            g_enc_us_sum = g_enc_us_max = g_enc_n = 0;
+        }
         g_iso_done = g_iso_not_txd = g_iso_drift = g_late_ticks = g_max_gap_us = 0;
         last_sent = now;
     }
