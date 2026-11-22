@@ -10,7 +10,7 @@
  *     on the link; the S31 is master, so its LM sets the 3 Mbps packet table.
  *     With AVDTP MTU 1005 Android packs 8 SBC frames (bitpool 53) per 3-DH5
  *     instead of 5 per 2-DH5: ~40 % fewer media packets for the same audio.
- *   - QoS guaranteed, poll interval 10 slots (6.25 ms) as on the Bluedroid
+ *   - QoS guaranteed, poll interval 24 slots (15 ms; was 10 as on the Bluedroid
  *     build: the phone is polled often enough to empty its queue before the
  *     next BIG event instead of bursting late.
  *   - inquiry scan (discoverable) off while the phone is connected; page scan
@@ -32,7 +32,12 @@
 
 static const char *TAG = "LINK";
 
-#define POLL_SLOTS          10                    /* Tpoll, 0.625 ms slots */
+/* Tpoll 24 slots = 15 ms: room for ~67 3-DH5 exchanges/s (A2DP needs ~50).
+ * Each exchange reserves 3.56 ms as master (re/controller_sched.md s7), so
+ * 10 slots reserved ~57 % of the air and overlapped ~6 BIS subevents each. */
+#ifndef POLL_SLOTS
+#define POLL_SLOTS          32                    /* Tpoll = BIG interval (20 ms): exchanges settle into the BIG gap */
+#endif
 #define LE_UPDATE_DELAY_MS  6000
 #define LE_ITVL_MIN         48                    /* 60 ms in 1.25 ms */
 #define LE_ITVL_MAX         60                    /* 75 ms */

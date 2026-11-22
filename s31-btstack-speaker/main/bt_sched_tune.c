@@ -29,6 +29,9 @@ extern uint8_t r_olc_sched_pti_inc_get(uint8_t idx);   /* tbl[2*idx+1] */
  * half still works. */
 extern uint8_t *r_sym_ble_kBC0rRwtjATsFkriXVDL(void) __attribute__((weak));  /* returns r_sym_ble_u66q9VTswFBa3W6uzpwY */
 extern uint8_t *r_sym_ble_u66q9VTswFBa3W6uzpwY __attribute__((weak));        /* 64-byte ISO config block (heap) */
+/* Nov-2026 libs (IDF release/v6.1 c43d665a96): no getter, a global pointer to the
+ * same block (libble_app.a ble_56.o; NULL until ISO is initialised). re/controller_sched.md s7 */
+extern uint8_t *sym_ble_Ta1qTQXQA7wXSdDHIIz2 __attribute__((weak));
 extern uint8_t _data_start[], _data_end[];
 
 /* ---- profiles ------------------------------------------------------------ */
@@ -132,12 +135,19 @@ static uint8_t *pti_find(void)
 /* Returns the verified ISO config block or NULL. */
 static uint8_t *iso_cfg_find(void)
 {
-    if (r_sym_ble_kBC0rRwtjATsFkriXVDL == NULL || &r_sym_ble_u66q9VTswFBa3W6uzpwY == NULL) {
+    uint8_t *p = NULL;
+    if (r_sym_ble_kBC0rRwtjATsFkriXVDL != NULL && &r_sym_ble_u66q9VTswFBa3W6uzpwY != NULL) {
+        p = r_sym_ble_kBC0rRwtjATsFkriXVDL();                 /* Jul-2026 libs */
+        if (p != r_sym_ble_u66q9VTswFBa3W6uzpwY) {
+            p = NULL;
+        }
+    } else if (&sym_ble_Ta1qTQXQA7wXSdDHIIz2 != NULL) {
+        p = sym_ble_Ta1qTQXQA7wXSdDHIIz2;                       /* Nov-2026 libs */
+    } else {
         ESP_LOGW(TAG, "ISO priority block not known in this controller lib - BIS priorities left at stock");
         return NULL;
     }
-    uint8_t *p = r_sym_ble_kBC0rRwtjATsFkriXVDL();
-    if (p == NULL || p != r_sym_ble_u66q9VTswFBa3W6uzpwY || !esp_ptr_byte_accessible(p) ||
+    if (p == NULL || !esp_ptr_byte_accessible(p) ||
         !esp_ptr_byte_accessible(p + 63)) {
         ESP_LOGE(TAG, "ISO cfg block %p not valid - BIS priorities NOT tuned", p);
         return NULL;

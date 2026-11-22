@@ -241,10 +241,10 @@ static le_audio_big_params_t s_big_params = {
  * phone's A2DP link starved). The old Xtreme 5 layout was 16/8/100/2/4/0. */
 static const le_audio_big_test_params_t s_big_test = {
     .iso_interval_1250us = AURA_JBL_PROFILE ? 16 : 24,
-    .nse = AURA_JBL_PROFILE ? 6 : 9,       /* JBL master: NSE 8 / IRC 4; IRC 3 frees ~25 % BIG airtime for the phone's A2DP (time-stamped SDUs fill every slot) */
+    .nse = AURA_JBL_PROFILE ? 8 : 9,       /* JBL master: NSE 8 / IRC 4 */
     .max_pdu = AURA_SDU,
     .bn = AURA_BN,
-    .irc = AURA_JBL_PROFILE ? 3 : 3,       /* no pre-transmission: with PTO 1 (phone: IRC 2 + PTO 1) the controller */
+    .irc = AURA_JBL_PROFILE ? 4 : 3,
     .pto = 0,       /* skipped 2 BIG events every 10-20 s (4-11 / 90 s), PTO 0: none in 150 s */
 };
 
@@ -1200,6 +1200,7 @@ static void on_big_created(const uint8_t *packet)
     }
     set_phase(PH_ON);
     pipeline_reset(true);
+    bt_sched_tune_init();                         /* new controller libs: ISO priority block exists only once ISO is up */
     s_ts_valid = false;
     btstack_run_loop_remove_timer(&s_sync_timer);
     btstack_run_loop_set_timer_handler(&s_sync_timer, sync_timer_handler);

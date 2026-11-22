@@ -34,8 +34,8 @@ static const char *TAG = "A2DP";
 #define OUT_RATE        48000
 #define PKT_MAX         (AVDTP_L2CAP_MTU + 16)
 #define PKT_Q_LEN       24                    /* ~550 ms of 8-frame packets */
-#define RING_MS         160                   /* max S31-added delay: beyond it the OLDEST audio is dropped */
-#define TARGET_MS       80                    /* PCM fill the clock recovery aims at */
+#define RING_MS         220                   /* max S31-added delay: beyond it the OLDEST audio is dropped */
+#define TARGET_MS       120                    /* PCM fill the clock recovery aims at */
 #define PRIME_MS        TARGET_MS             /* start output at the target fill: no start-up underruns / integrator wind-up */
 #define MS_FRAMES(ms)   ((OUT_RATE / 1000) * (ms))
 
