@@ -17,6 +17,11 @@ int a2dp_in_read(int16_t *pcm, int n);
 
 void a2dp_in_log_stats(void);
 
+/* Any thread (button task): volume +-8/127 (phone slider follows via AVRCP),
+ * play/pause (AVRCP to the phone), pairing (discoverable + connectable 3 min). */
+typedef enum { A2DP_BTN_VOL_UP = 0, A2DP_BTN_VOL_DOWN, A2DP_BTN_PLAY_PAUSE, A2DP_BTN_PAIRING } a2dp_btn_t;
+void a2dp_in_button(a2dp_btn_t btn);
+
 /* Bench test: replace the phone audio with a 20 s cycle of
  *   0-9 s   up-sweep 50 Hz -> 18 kHz made at 48 kHz (straight to the encoder)
  *   10-19 s down-sweep 18 kHz -> 50 Hz made at 44.1 kHz and sent through the

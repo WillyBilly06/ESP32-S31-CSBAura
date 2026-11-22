@@ -1,0 +1,20 @@
+# liblc3: 48 kHz / 10 ms DECODER hot path in internal RAM (IRAM).
+#
+# Party LISTEN decodes 2 BIS x 100 frames/s. From flash, with the BT
+# controller busy on the other core, a decode measured 7 ms (cache thrash)
+# - 140 % of a core, so SDUs piled up and were dropped. Exported entry points
+# only: their static helpers are inlined at -O3 and move with them.
+# Disable with `idf.py -DLC3_DECODER_IRAM=OFF build`.
+
+[mapping:liblc3_iram_dec]
+archive: libliblc3.a
+entries:
+    lc3:lc3_decode (noflash_text)
+    mdct:lc3_mdct_inverse (noflash_text)
+    spec:lc3_spec_decode (noflash_text)
+    sns:lc3_sns_synthesize (noflash_text)
+    tns:lc3_tns_synthesize (noflash_text)
+    ltpf:lc3_ltpf_synthesize (noflash_text)
+    plc:lc3_plc_synthesize (noflash_text)
+    bits:lc3_get_bits_generic (noflash_text)
+    bits:lc3_ac_read_renorm (noflash_text)

@@ -25,12 +25,16 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "nvs_flash.h"
+#include "esp_timer.h"
+#include "esp_private/esp_clk.h"
 
 #include "a2dp_in.h"
 #include "auracast.h"
 #include "jbl.h"
 #include "link_tune.h"
 #include "party.h"
+#include "audio_out.h"
+#include "buttons.h"
 #include "sniffer.h"
 
 /* 1 = JBL party / Auracast sniffer only (no A2DP, no broadcast, no JBL GATT) */
@@ -48,8 +52,21 @@ extern uint32_t hci_transport_s31_iso_tx_errors(int *last);
 extern void hci_transport_s31_rx_counts(uint32_t *evt, uint32_t *acl, uint32_t *iso);
 static btstack_packet_callback_registration_t s_hci_reg;
 
+/* CPU speed probe: a fixed busy loop, timed (us); ~constant unless the clock changes */
+static uint32_t speed_probe_us(void)
+{
+    int64_t t0 = esp_timer_get_time();
+    volatile uint32_t x = 0;
+    for (uint32_t i = 0; i < 200000; i++) {
+        x += i;
+    }
+    return (uint32_t)(esp_timer_get_time() - t0);
+}
+
 static void log_heap(void)
 {
+    ESP_LOGW(TAG, "CPU: %lu MHz (esp_clk), speed probe %lu us on core %d",
+             (unsigned long)(esp_clk_cpu_freq() / 1000000), (unsigned long)speed_probe_us(), xPortGetCoreID());
     int iso_last = 0;
     uint32_t iso_err = hci_transport_s31_iso_tx_errors(&iso_last);
     ESP_LOGW(TAG, "HEAP: internal free %u KB (largest %u KB, lowest %u KB) | PSRAM free %u KB | VHCI rx drops %lu | ISO tx errors %lu (last %d)",
@@ -74,10 +91,45 @@ static void stats_task(void *arg)
             log_heap();
             continue;
         }
+        {   /* who uses each core (run-time stats, delta over this 2 s window) */
+            static TaskStatus_t st[40];
+            static uint32_t last_rt[40];
+            static TaskHandle_t last_h[40];
+            static uint32_t last_total;
+            uint32_t total = 0;
+            UBaseType_t n = uxTaskGetSystemState(st, 40, &total);
+            uint32_t dt = total - last_total;
+            char line[400];
+            int len = 0;
+            for (UBaseType_t i = 0; i < n && dt; i++) {
+                uint32_t prev = 0;
+                for (int j = 0; j < 40; j++) if (last_h[j] == st[i].xHandle) prev = last_rt[j];
+                uint32_t pct = (uint32_t)((uint64_t)(st[i].ulRunTimeCounter - prev) * 100 / dt);
+                if (pct >= 3 && len < (int)sizeof(line) - 40) {
+                    BaseType_t core = xTaskGetCoreID(st[i].xHandle);
+                    len += snprintf(line + len, sizeof(line) - len, "%s/%d %lu%% ", st[i].pcTaskName,
+                                    core == tskNO_AFFINITY ? -1 : (int)core, (unsigned long)pct);
+                }
+            }
+            for (UBaseType_t i = 0; i < n && i < 40; i++) { last_h[i] = st[i].xHandle; last_rt[i] = st[i].ulRunTimeCounter; }
+            last_total = total;
+            if (len) ESP_LOGW(TAG, "CPU use (2 s, %% of one core): %s", line);
+            static int hwm_tick;
+            if (++hwm_tick % 5 == 0) {                 /* every 10 s: unused stack per task (bytes) */
+                len = 0;
+                for (UBaseType_t i = 0; i < n && len < (int)sizeof(line) - 30; i++) {
+                    len += snprintf(line + len, sizeof(line) - len, "%s %u ", st[i].pcTaskName,
+                                    (unsigned)(st[i].usStackHighWaterMark * sizeof(StackType_t)));
+                }
+                ESP_LOGW(TAG, "stack free (min ever, B): %s", line);
+            }
+        }
         a2dp_in_log_stats();
         auracast_log_stats();
         party_log_stats();
-        jbl_set_streaming(a2dp_in_streaming());
+        audio_out_log_stats();
+        /* slow beacon (100 ms) while streaming OR listening: at 20 ms it collides with the master's 20 ms BIG */
+        jbl_set_streaming(a2dp_in_streaming() || party_listening());
         jbl_log_stats();
         log_heap();
     }
@@ -150,8 +202,10 @@ static void btstack_task(void *arg)
     } else {
         link_tune_setup();
         a2dp_in_setup();
+        audio_out_setup();
         auracast_setup();
         party_setup();
+        buttons_setup();
         jbl_setup();
     }
 

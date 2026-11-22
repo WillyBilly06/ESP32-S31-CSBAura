@@ -81,6 +81,13 @@ void auracast_set_iso_forward_handler(btstack_packet_handler_t handler);
  * encoder avg/max us, PCM underruns. */
 void auracast_log_stats(void);
 
+/* BT thread, only while Auracast is OFF: the shared LC3 workspace (internal
+ * RAM, allocated at setup) for the party decoders; the encoders are set up in
+ * it again on the next host start. Returns NULL while hosting. `half` = bytes
+ * per codec instance (2 instances fit). */
+#include <stddef.h>
+void *auracast_lc3_workspace_take(size_t *half);
+
 #ifdef __cplusplus
 }
 #endif

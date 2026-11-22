@@ -12,19 +12,24 @@
  *
  * Audio: ISO SDUs (Auracast forwards non-own ISO data here, BT thread) ->
  * queue -> "party_dec" task on core 0: liblc3 decode (PLC for lost SDUs) ->
- * I2S (APLL, 32-bit stereo, GPIO 2/3/4 as the Bluedroid build).
+ * audio_out (shared I2S line, AO_LISTEN), delayed by the master's presentation
+ * delay so the S31 plays with the master and its other party speakers.
+ *
+ * Auracast button off: no hosting, no listening - phone audio plays locally only.
  * Needs idf-patches/0010: received ISO data reaches the host at all.
  */
 #include "party.h"
 
 #include <inttypes.h>
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
 #include "btstack.h"
-#include "driver/i2s_std.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_memory_utils.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
@@ -32,6 +37,7 @@
 #include "lc3.h"
 
 #include "a2dp_in.h"
+#include "audio_out.h"
 #include "auracast.h"
 #include "jbl.h"
 
@@ -54,19 +60,21 @@ static const char *TAG = "PARTY";
 #define JBL_BROADCAST_ID        0x112233u
 #define HARMAN_COMPANY_ID       0x0057u
 
-#define I2S_BCLK_PIN            2
-#define I2S_WS_PIN              3
-#define I2S_DOUT_PIN            4
+#define LISTEN_RX_LAG_MS        5        /* ISO RX arrives ~ at the SDU reference; decode is ~1 ms */
 
 #define MAX_BIS                 2
 #define MAX_FS                  480      /* 10 ms @ 48 kHz */
 #define MAX_SDU                 320      /* 2 channels x up to 155 octets in one BIS */
-#define SDU_Q_LEN               16
+#define SDU_Q_LEN               48       /* 120 ms of 2-BIS SDUs: bursts never overflow */
 
 /* ---- state ------------------------------------------------------------------ */
-typedef enum { R_HOST, R_HOST_STOPPING, R_LISTEN, R_LISTEN_STOPPING } role_t;
+typedef enum { R_HOST, R_HOST_STOPPING, R_LISTEN, R_LISTEN_STOPPING, R_OFF } role_t;
 typedef enum { L_OFF, L_SCAN, L_PA_SYNC, L_W4_BASE, L_BIG_SYNC, L_STREAM } lstate_t;
-static const char *const role_names[] = { "HOST", "HOST_STOPPING", "LISTEN", "LISTEN_STOPPING" };
+static const char *const role_names[] = { "HOST", "HOST_STOPPING", "LISTEN", "LISTEN_STOPPING", "OFF (Auracast off)" };
+#ifndef PARTY_BOOT_AURACAST
+#define PARTY_BOOT_AURACAST 1
+#endif
+static volatile bool s_enabled = PARTY_BOOT_AURACAST;   /* Auracast button */
 static const char *const lstate_names[] = { "off", "scanning", "PA syncing", "waiting for BASE", "BIG syncing", "STREAMING" };
 
 static role_t s_role = R_HOST;
@@ -88,10 +96,16 @@ static hci_con_handle_t s_bis[MAX_BIS];
 static uint8_t s_num_bis;
 static bool s_have_base, s_have_biginfo, s_biginfo_enc;
 static struct { bd_addr_t a; uint32_t until; } s_black[4];
+/* A phone paging us: the LE scan (20 % duty) starves the LMP setup / role
+ * switch and the controller drops the link (0x16). Hold the scan meanwhile. */
+#define CONN_SETUP_HOLD_MS 4000
+static uint32_t s_scan_hold_until;
+static bool s_scan_held;
 
 /* BASE */
 typedef struct {
     uint32_t sr_hz;
+    uint32_t pd_us;        /* presentation delay */
     uint16_t dt_us;
     uint16_t opf;          /* octets per channel per frame */
     uint8_t nbis;
@@ -110,7 +124,6 @@ typedef struct {
 } sdu_t;
 static QueueHandle_t s_sdu_q;
 static SemaphoreHandle_t s_dec_lock;
-static i2s_chan_handle_t s_i2s;
 static lc3_decoder_t s_dec[MAX_BIS][2];
 static void *s_dec_mem[MAX_BIS][2];
 static volatile bool s_rx_on;
@@ -169,40 +182,100 @@ static void blacklist(const bd_addr_t a, uint32_t ms)
 /* ---- audio out (decode task, core 0) -------------------------------------------- */
 static void i2s_out(const int16_t *l, const int16_t *r, int fs)
 {
-    static int32_t out[MAX_FS * 2];
-    if (s_i2s == NULL) {
+    static int16_t lr[MAX_FS * 2];
+    for (int i = 0; i < fs; i++) {
+        lr[2 * i] = l[i];
+        lr[2 * i + 1] = r[i];
+    }
+    audio_out_push(AO_LISTEN, lr, fs);
+}
+
+/* Decoded frames per output side, paired by SDU sequence number - never by
+ * arrival order: with BN 2 an event delivers BIS1 k, BIS1 k+1, BIS2 k, BIS2 k+1. */
+#define SIDE_FIFO 6
+typedef struct {
+    int16_t pcm[SIDE_FIFO][MAX_FS];
+    uint16_t seq[SIDE_FIFO];
+    uint8_t head, n;
+} side_fifo_t;
+static side_fifo_t *s_side;   /* [2], PSRAM, allocated at BIG sync (lazy, as the codec fork) */
+static volatile uint32_t st_dec_us, st_dec_max_us, st_dec_n, st_mono_fill, st_seq_drop;
+
+static void fifo_reset(void)
+{
+    if (s_side == NULL) return;
+    s_side[0].head = s_side[0].n = 0;
+    s_side[1].head = s_side[1].n = 0;
+}
+
+static int16_t *fifo_slot_in(side_fifo_t *f, uint16_t seq)
+{
+    if (f->n == SIDE_FIFO) {                       /* other side gone for a while: oldest out */
+        f->head = (uint8_t)((f->head + 1) % SIDE_FIFO);
+        f->n--;
+        st_seq_drop++;
+    }
+    uint8_t i = (uint8_t)((f->head + f->n) % SIDE_FIFO);
+    f->seq[i] = seq;
+    f->n++;
+    return f->pcm[i];
+}
+
+static void fifo_pop(side_fifo_t *f)
+{
+    f->head = (uint8_t)((f->head + 1) % SIDE_FIFO);
+    f->n--;
+}
+
+static void pairs_out(int fs, bool mono_stream)
+{
+    side_fifo_t *l = &s_side[0], *r = &s_side[1];
+    if (mono_stream) {
+        side_fifo_t *f = l->n ? l : r;
+        while (f->n) {
+            i2s_out(f->pcm[f->head], f->pcm[f->head], fs);
+            fifo_pop(f);
+        }
         return;
     }
-    for (int i = 0; i < fs; i++) {
-        out[2 * i] = ((int32_t)l[i]) << 16;
-        out[2 * i + 1] = ((int32_t)r[i]) << 16;
-    }
-    size_t wr = 0;
-    i2s_channel_write(s_i2s, out, (size_t)fs * 2 * sizeof(int32_t), &wr, pdMS_TO_TICKS(40));
-    if (wr < (size_t)fs * 2 * sizeof(int32_t)) {
-        s_st.i2s_late++;
+    for (;;) {
+        if (l->n && r->n) {
+            int16_t d = (int16_t)(l->seq[l->head] - r->seq[r->head]);
+            if (d == 0) {
+                i2s_out(l->pcm[l->head], r->pcm[r->head], fs);
+                fifo_pop(l);
+                fifo_pop(r);
+            } else {                               /* partner of the older frame never came */
+                side_fifo_t *o = d < 0 ? l : r;
+                i2s_out(o->pcm[o->head], o->pcm[o->head], fs);
+                fifo_pop(o);
+                st_mono_fill++;
+            }
+        } else if (l->n > 3 || r->n > 3) {         /* one BIS silent: play the other on both */
+            side_fifo_t *o = l->n ? l : r;
+            i2s_out(o->pcm[o->head], o->pcm[o->head], fs);
+            fifo_pop(o);
+            st_mono_fill++;
+        } else {
+            break;
+        }
     }
 }
 
 static void decode_task(void *arg)
 {
     (void)arg;
-    static int16_t pcm[2][MAX_FS];
     static sdu_t it;
-    bool have[2] = { false, false };
-    int fs_have = 0;
     for (;;) {
         if (xQueueReceive(s_sdu_q, &it, pdMS_TO_TICKS(200)) != pdTRUE) {
-            have[0] = have[1] = false;
+            xSemaphoreTake(s_dec_lock, portMAX_DELAY);
+            fifo_reset();
+            xSemaphoreGive(s_dec_lock);
             continue;
         }
-        /* behind (master clock faster than our APLL, or a burst): keep 40 ms max */
-        while (uxQueueMessagesWaiting(s_sdu_q) > 4 && xQueueReceive(s_sdu_q, &it, 0) == pdTRUE) {
-            s_st.qdrops++;
-        }
         xSemaphoreTake(s_dec_lock, portMAX_DELAY);
-        if (!s_rx_on || it.idx >= s_dcfg.nbis) {
-            have[0] = have[1] = false;
+        if (!s_rx_on || s_side == NULL || it.idx >= s_dcfg.nbis) {
+            fifo_reset();
             xSemaphoreGive(s_dec_lock);
             continue;
         }
@@ -210,33 +283,25 @@ static void decode_task(void *arg)
         int nch = s_dcfg.nch[it.idx];
         for (int c = 0; c < nch; c++) {
             int side = nch >= 2 ? c : s_dcfg.side[it.idx];
-            if (have[side]) {                       /* the other side never came: play this one on both */
-                i2s_out(pcm[side], pcm[side], fs_have);
-                have[0] = have[1] = false;
-            }
+            int16_t *out = fifo_slot_in(&s_side[side], it.seq);
             const uint8_t *in = it.len >= (c + 1) * s_dcfg.opf ? it.data + c * s_dcfg.opf : NULL;
+            int64_t t0 = esp_timer_get_time();
             int r = s_dec[it.idx][c] ? lc3_decode(s_dec[it.idx][c], in, in ? s_dcfg.opf : 0,
-                                                  LC3_PCM_FORMAT_S16, pcm[side], 1) : -1;
+                                                  LC3_PCM_FORMAT_S16, out, 1) : -1;
+            uint32_t us = (uint32_t)(esp_timer_get_time() - t0);
+            st_dec_us += us;
+            st_dec_n++;
+            if (us > st_dec_max_us) st_dec_max_us = us;
             if (r < 0) {
                 s_st.errors++;
-                memset(pcm[side], 0, sizeof(int16_t) * fs);
+                memset(out, 0, sizeof(int16_t) * fs);
             } else if (r == 1 || in == NULL) {
                 s_st.plc++;
             } else {
                 s_st.decoded++;
             }
-            have[side] = true;
-            fs_have = fs;
         }
-        bool mono = s_dcfg.nbis == 1 && s_dcfg.nch[0] == 1;
-        if (mono && (have[0] || have[1])) {
-            int s = have[0] ? 0 : 1;
-            i2s_out(pcm[s], pcm[s], fs);
-            have[0] = have[1] = false;
-        } else if (have[0] && have[1]) {
-            i2s_out(pcm[0], pcm[1], fs);
-            have[0] = have[1] = false;
-        }
+        pairs_out(fs, s_dcfg.nbis == 1 && s_dcfg.nch[0] == 1);
         xSemaphoreGive(s_dec_lock);
     }
 }
@@ -246,52 +311,45 @@ static bool audio_start(void)
     xSemaphoreTake(s_dec_lock, portMAX_DELAY);
     s_dcfg = s_base;
     bool ok = true;
+    if (s_side == NULL) {
+        s_side = heap_caps_calloc(2, sizeof(side_fifo_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        ok = s_side != NULL;
+    }
+    /* decoders in the shared LC3 workspace (the encoders' memory while hosting) */
+    size_t half = 0;
+    uint8_t *ws = ok ? auracast_lc3_workspace_take(&half) : NULL;
+    int inst = 0;
+    ok = ok && ws != NULL;
     for (int b = 0; b < s_dcfg.nbis && ok; b++) {
         for (int c = 0; c < s_dcfg.nch[b]; c++) {
             unsigned sz = lc3_decoder_size(s_dcfg.dt_us, s_dcfg.sr_hz);
-            s_dec_mem[b][c] = heap_caps_malloc(sz, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-            if (s_dec_mem[b][c] == NULL) {
-                s_dec_mem[b][c] = heap_caps_malloc(sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (inst >= 2 || sz > half) {
+                ESP_LOGE(TAG, "LC3 workspace too small: %u B decoder #%d (slot %u B)", sz, inst, (unsigned)half);
+                ok = false;
+                break;
             }
-            s_dec[b][c] = s_dec_mem[b][c] ? lc3_setup_decoder(s_dcfg.dt_us, s_dcfg.sr_hz, 0, s_dec_mem[b][c]) : NULL;
+            s_dec_mem[b][c] = ws + (size_t)inst++ * half;
+            s_dec[b][c] = lc3_setup_decoder(s_dcfg.dt_us, s_dcfg.sr_hz, 0, s_dec_mem[b][c]);
             if (s_dec[b][c] == NULL) {
                 ok = false;
                 break;
             }
         }
     }
-    if (ok && s_i2s == NULL) {
-        i2s_chan_config_t cc = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-        cc.dma_desc_num = 6;
-        cc.dma_frame_num = 240;
-        cc.auto_clear_after_cb = true;              /* underrun -> silence, not a repeated buffer */
-        i2s_std_config_t std = {
-            .clk_cfg = {                            /* APLL: exact MCLK, no fractional divider off the XTAL */
-                .sample_rate_hz = s_dcfg.sr_hz, .clk_src = I2S_CLK_SRC_APLL,
-                .mclk_multiple = I2S_MCLK_MULTIPLE_256, .bclk_div = 8,
-            },
-            .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO),
-            .gpio_cfg = { .mclk = I2S_GPIO_UNUSED, .bclk = I2S_BCLK_PIN, .ws = I2S_WS_PIN,
-                          .dout = I2S_DOUT_PIN, .din = I2S_GPIO_UNUSED },
-        };
-        i2s_chan_handle_t h = NULL;
-        esp_err_t err = i2s_new_channel(&cc, &h, NULL);
-        if (err == ESP_OK) err = i2s_channel_init_std_mode(h, &std);
-        if (err == ESP_OK) err = i2s_channel_enable(h);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "I2S start failed: %s", esp_err_to_name(err));
-            if (h) i2s_del_channel(h);
-            ok = false;
-        } else {
-            s_i2s = h;
-        }
+    ESP_LOGW(TAG, "LC3 decoders %s in the shared workspace %p", ok ? "set up" : "FAILED", ws);
+    if (ok) {
+        uint32_t d = s_dcfg.pd_us / 1000u;
+        d = d > LISTEN_RX_LAG_MS + 20 ? d - LISTEN_RX_LAG_MS : 20;
+        audio_out_set_rate(s_dcfg.sr_hz);
+        audio_out_begin(AO_LISTEN, d);
     }
     xQueueReset(s_sdu_q);
+    fifo_reset();
     s_rx_on = ok;
     xSemaphoreGive(s_dec_lock);
-    ESP_LOGW(TAG, "audio out %s: %lu Hz, %u us frames, %u B/ch, %u BIS (%u+%u ch), I2S APLL BCLK=%d WS=%d DOUT=%d",
+    ESP_LOGW(TAG, "audio out %s: %lu Hz, %u us frames, %u B/ch, %u BIS (%u+%u ch), presentation delay %lu us",
              ok ? "ON" : "FAILED", (unsigned long)s_dcfg.sr_hz, s_dcfg.dt_us, s_dcfg.opf, s_dcfg.nbis,
-             s_dcfg.nch[0], s_dcfg.nbis > 1 ? s_dcfg.nch[1] : 0, I2S_BCLK_PIN, I2S_WS_PIN, I2S_DOUT_PIN);
+             s_dcfg.nch[0], s_dcfg.nbis > 1 ? s_dcfg.nch[1] : 0, (unsigned long)s_dcfg.pd_us);
     return ok;
 }
 
@@ -299,15 +357,13 @@ static void audio_stop(void)
 {
     s_rx_on = false;
     xSemaphoreTake(s_dec_lock, portMAX_DELAY);
-    if (s_i2s != NULL) {
-        i2s_channel_disable(s_i2s);
-        i2s_del_channel(s_i2s);
-        s_i2s = NULL;
-    }
+    audio_out_end(AO_LISTEN);
+    audio_out_set_rate(48000);
+    heap_caps_free(s_side);
+    s_side = NULL;
     for (int b = 0; b < MAX_BIS; b++) {
         for (int c = 0; c < 2; c++) {
-            free(s_dec_mem[b][c]);
-            s_dec_mem[b][c] = NULL;
+            s_dec_mem[b][c] = NULL;              /* shared workspace: not ours to free */
             s_dec[b][c] = NULL;
         }
     }
@@ -376,11 +432,13 @@ static bool parse_base(const uint8_t *d, uint16_t n, base_cfg_t *cfg)
         if (vl < 2 || little_endian_read_16(v, 0) != 0x1851) continue;
         const uint8_t *p = v + 2, *e = v + vl;
         if (e - p < 4) return false;
-        p += 3;                                        /* presentation delay */
+        uint32_t pd = little_endian_read_24(p, 0);    /* presentation delay */
+        p += 3;
         uint8_t nsub = *p++;
         memset(cfg, 0, sizeof(*cfg));
         cfg->sr_hz = 48000;
         cfg->dt_us = 10000;
+        cfg->pd_us = pd;
         for (uint8_t s = 0; s < nsub && p < e; s++) {
             if (e - p < 7) return false;
             uint8_t nb = *p++;
@@ -430,6 +488,11 @@ static bool parse_base(const uint8_t *d, uint16_t n, base_cfg_t *cfg)
 /* ---- LISTEN control (BT thread) ------------------------------------------------ */
 static void scan_start(void)
 {
+    if ((int32_t)(s_scan_hold_until - now_ms()) > 0) {
+        s_scan_held = true;                           /* resumed by listen_poll */
+        return;
+    }
+    s_scan_held = false;
     gap_set_scan_params(0 /* passive */, SCAN_ITVL, SCAN_WIN, 0);
     gap_start_scan();
 }
@@ -556,6 +619,17 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
         return;
     }
     switch (hci_event_packet_get_type(packet)) {
+    case HCI_EVENT_CONNECTION_REQUEST:
+        s_scan_hold_until = now_ms() + CONN_SETUP_HOLD_MS;
+        if (s_ls == L_SCAN && !s_scan_held) {
+            gap_stop_scan();
+            s_scan_held = true;
+            ESP_LOGW(TAG, "phone connecting: LE scan paused %d s", CONN_SETUP_HOLD_MS / 1000);
+        }
+        break;
+    case HCI_EVENT_CONNECTION_COMPLETE:
+        s_scan_hold_until = now_ms() + 2000;          /* encryption / AVDTP setup follows */
+        break;
     case GAP_EVENT_EXTENDED_ADVERTISING_REPORT:
         on_ext_adv(packet);
         break;
@@ -672,6 +746,12 @@ static void listen_poll(void)
     case L_OFF:
         if (now_ms() - s_state_ms >= TICK_MS) listen_reset("start listening");
         break;
+    case L_SCAN:
+        if (s_scan_held && (int32_t)(s_scan_hold_until - now_ms()) <= 0) {
+            scan_start();
+            ESP_LOGW(TAG, "LE scan resumed");
+        }
+        break;
     default:
         break;
     }
@@ -681,7 +761,25 @@ static void tick(btstack_timer_source_t *ts)
 {
     bool playing = a2dp_in_streaming();
     s_idle_ms = playing ? 0 : s_idle_ms + TICK_MS;
+    if (!s_enabled && s_role != R_OFF) {              /* Auracast button: off */
+        if (s_role == R_LISTEN || s_role == R_LISTEN_STOPPING) {
+            set_role(R_OFF, "Auracast turned off");
+            listen_reset("Auracast off");
+            jbl_assist_set_paused(false);
+        } else {
+            auracast_host_stop();
+            set_role(R_OFF, "Auracast turned off");
+        }
+        jbl_set_party_info(JBL_PARTY_INFO_HOST);
+    }
     switch (s_role) {
+    case R_OFF:
+        if (s_enabled && auracast_state() == AURACAST_STATE_OFF) {
+            int rc = auracast_host_start();               /* back on: host first, as at power-up */
+            s_idle_ms = 0;
+            set_role(R_HOST, rc == 0 ? "Auracast turned on" : "Auracast turned on (host start error)");
+        }
+        break;
     case R_HOST:
         if (!playing && s_idle_ms >= PARTY_IDLE_TO_LISTEN_MS) {
             auracast_host_stop();
@@ -724,8 +822,33 @@ static void tick(btstack_timer_source_t *ts)
 }
 
 /* ---- API ------------------------------------------------------------------------ */
+/* Boot benchmark (no radio yet): real 48 kHz / 10 ms / 100 B frame */
+static void decode_bench(void)
+{
+    unsigned esz = lc3_encoder_size(10000, 48000), dsz = lc3_decoder_size(10000, 48000);
+    void *em = heap_caps_malloc(esz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    void *dm = heap_caps_malloc(dsz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    static int16_t pcm[480];
+    static uint8_t frame[100];
+    if (em == NULL || dm == NULL) { free(em); free(dm); return; }
+    lc3_encoder_t enc = lc3_setup_encoder(10000, 48000, 0, em);
+    lc3_decoder_t dec = lc3_setup_decoder(10000, 48000, 0, dm);
+    for (int i = 0; i < 480; i++) pcm[i] = (int16_t)(8000.0f * sinf(2.0f * 3.14159265f * 1000.0f * (float)i / 48000.0f));
+    lc3_encode(enc, LC3_PCM_FORMAT_S16, pcm, 1, sizeof(frame), frame);
+    int64_t t0 = esp_timer_get_time();
+    for (int k = 0; k < 50; k++) lc3_decode(dec, frame, sizeof(frame), LC3_PCM_FORMAT_S16, pcm, 1);
+    int64_t t1 = esp_timer_get_time();
+    for (int k = 0; k < 20; k++) lc3_decode(dec, NULL, 0, LC3_PCM_FORMAT_S16, pcm, 1);
+    int64_t t2 = esp_timer_get_time();
+    ESP_LOGW(TAG, "LC3 decode bench (boot, core %d, state in PSRAM): %lld us/frame, PLC %lld us/frame",
+             xPortGetCoreID(), (t1 - t0) / 50, (t2 - t1) / 20);
+    free(em);
+    free(dm);
+}
+
 void party_setup(void)
 {
+    decode_bench();
     s_sdu_q = xQueueCreateWithCaps(SDU_Q_LEN, sizeof(sdu_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     s_dec_lock = xSemaphoreCreateMutex();
     static StackType_t s_stack[8192 / sizeof(StackType_t)];
@@ -748,6 +871,16 @@ void party_on_hci_working(void)
     btstack_run_loop_add_timer(&s_tick);
 }
 
+bool party_auracast_enabled(void) { return s_enabled; }
+
+void party_set_auracast_enabled(bool on)
+{
+    if (on != s_enabled) {
+        ESP_LOGW(TAG, "Auracast %s (button)", on ? "ON" : "OFF");
+        s_enabled = on;
+    }
+}
+
 bool party_listening(void)
 {
     return s_role == R_LISTEN || s_role == R_LISTEN_STOPPING;
@@ -757,6 +890,11 @@ void party_log_stats(void)
 {
     static uint32_t l_rx[MAX_BIS], l_lost[MAX_BIS], l_dec, l_plc, l_qd;
     if (s_role == R_LISTEN && s_ls == L_STREAM) {
+        uint32_t dn = st_dec_n ? st_dec_n : 1;
+        ESP_LOGW(TAG, "LISTEN decode: avg %lu us max %lu us (%lu calls) | mono fills %lu, seq drops %lu",
+                 (unsigned long)(st_dec_us / dn), (unsigned long)st_dec_max_us, (unsigned long)st_dec_n,
+                 (unsigned long)st_mono_fill, (unsigned long)st_seq_drop);
+        st_dec_us = st_dec_n = st_dec_max_us = 0;
         ESP_LOGW(TAG, "LISTEN '%s' 2s: BIS1 rx %lu lost %lu gaps %lu | BIS2 rx %lu lost %lu gaps %lu | decoded %lu PLC %lu errors %lu | q drops %lu, I2S late %lu",
                  s_cand_name,
                  (unsigned long)(s_st.rx[0] - l_rx[0]), (unsigned long)(s_st.lost[0] - l_lost[0]), (unsigned long)s_st.gaps[0],

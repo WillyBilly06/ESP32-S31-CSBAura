@@ -36,9 +36,11 @@
 #include "esp_random.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "lc3.h"
 
 #include "a2dp_in.h"
+#include "audio_out.h"
 #include "bt_sched_tune.h"
 
 static const char *TAG = "AURA";
@@ -157,7 +159,7 @@ extern uint16_t r_ble_ll_iso_free_buf_num_get(uint16_t conn_handle);
  * threw 30 ms of audio away and made the next SDUs late (not transmitted). */
 #define AURA_WDOG_MS           (4 * AURA_ISO_INTERVAL_MS)
 
-#define AURA_ENC_STACK         12288
+#define AURA_ENC_STACK         7168    /* measured peak ~5 KB */
 #define AURA_ENC_PRIO          (configMAX_PRIORITIES - 4)
 
 /* ---- JBL blocks (captured from a real Xtreme 5 master) --------------------- */
@@ -287,6 +289,16 @@ static uint32_t s_grant;
 static uint32_t s_produced;
 static volatile bool s_streaming;            /* BIG up: encoder watchdog keeps PCM in real time */
 
+/* Local I2S in sync with the receivers: a frame read by the encoder now is
+ * rendered at (its BIG event ~ our completion of it) + presentation delay.
+ * lead = completion time - encode time, measured per SDU pair (FIFO order). */
+#define LEAD_SLOTS 64
+static int64_t s_prod_us[LEAD_SLOTS];        /* encoder writes, BT thread reads */
+static uint16_t s_lead_done;                 /* BT thread: BIS0 completions seen this epoch */
+static float s_lead_ms = -1.0f;              /* EMA */
+static volatile uint32_t st_lead_ms, st_local_ms;
+#define LOCAL_SYNC_TRIM_MS 0                 /* + = S31 later (tune by ear against the Xtreme 5) */
+
 /* BT thread */
 static uint16_t s_epoch, s_granted;
 static hci_con_handle_t s_bis[AURA_NUM_BIS];
@@ -305,6 +317,17 @@ static volatile bool s_vendor_comp;          /* controller callback seen: ignore
 
 /* encoder (core 0), internal RAM */
 static lc3_encoder_t s_enc[AURA_NUM_BIS];
+/* Lazy (as the codec fork): encoder state exists only while hosting - in
+ * LISTEN that internal RAM is what the controller's BIG sync RX needs. */
+static void *s_enc_mem[AURA_NUM_BIS];
+/* One LC3 workspace shared by both roles (lazy reuse as in the codec fork's
+ * one-active-codec slots): the 2 encoders while hosting, the 2 decoders while
+ * listening - the S31 never does both. Allocated once at setup, before HCI
+ * power-on: allocated later the same encode ran 20x slower. */
+static uint8_t *s_lc3_ws;
+static size_t s_lc3_ws_size, s_lc3_half;
+static SemaphoreHandle_t s_enc_lock;
+static volatile bool s_enc_free_req;
 static int16_t s_pcm[AURA_FRAME_SAMPLES * 2];
 static TaskHandle_t s_enc_task;
 static StaticTask_t s_enc_tcb;
@@ -534,7 +557,7 @@ static void dump_frame(const uint8_t *sdu)
 }
 #endif
 
-static void enc_produce(sdu_pair_t *slot)
+static void enc_produce(sdu_pair_t *slot, uint16_t idx)
 {
     if (a2dp_in_read(s_pcm, AURA_FRAME_SAMPLES) < AURA_FRAME_SAMPLES && a2dp_in_streaming()) {
         st_pcm_underruns++;
@@ -542,12 +565,17 @@ static void enc_produce(sdu_pair_t *slot)
     if (!S31_TEST_SIGNAL && v5_eq_process != NULL) {
         v5_eq_process(s_pcm, AURA_FRAME_SAMPLES);
     }
+    s_prod_us[idx % LEAD_SLOTS] = esp_timer_get_time();
+    audio_out_push(AO_HOST, s_pcm, AURA_FRAME_SAMPLES);   /* same audio, played here in sync */
     int64_t t0 = esp_timer_get_time();
+    xSemaphoreTake(s_enc_lock, portMAX_DELAY);
     for (int ch = 0; ch < AURA_NUM_BIS; ch++) {
-        if (lc3_encode(s_enc[ch], LC3_PCM_FORMAT_S16, s_pcm + ch, 2, AURA_SDU, slot->sdu[ch]) != 0) {
+        if (s_enc[ch] == NULL ||
+            lc3_encode(s_enc[ch], LC3_PCM_FORMAT_S16, s_pcm + ch, 2, AURA_SDU, slot->sdu[ch]) != 0) {
             memcpy(slot->sdu[ch], s_silence, AURA_SDU);
         }
     }
+    xSemaphoreGive(s_enc_lock);
 #if AURA_SDU_DUMP
     dump_frame(slot->sdu[0]);
 #endif
@@ -588,7 +616,7 @@ static void enc_task(void *arg)
                 break;
             }
             sdu_pair_t *slot = &s_rq[head & (AURA_RQ_DEPTH - 1)];
-            enc_produce(slot);
+            enc_produce(slot, produced);
             slot->epoch = my_epoch;
             __atomic_store_n(&s_rq_head, head + 1, __ATOMIC_RELEASE);
             produced++;
@@ -601,6 +629,7 @@ static void enc_task(void *arg)
         if (!woken && !made && s_streaming) {
             for (int k = 0; k < AURA_WDOG_MS / 10; k++) {
                 a2dp_in_read(s_pcm, AURA_FRAME_SAMPLES);
+                audio_out_push(AO_HOST, s_pcm, AURA_FRAME_SAMPLES);
             }
             st_wdog++;
         }
@@ -843,8 +872,31 @@ static void deadline_handler(btstack_timer_source_t *ts)
 
 /* SDUs left the controller (sent or flushed): arm the underflow check for the
  * next BIG event and grant the encoder the freed pairs. */
+static void lead_update(void)
+{
+    uint16_t done = (uint16_t)s_done[0];
+    int64_t now = esp_timer_get_time();
+    while (s_lead_done != done) {
+        int64_t d = now - s_prod_us[s_lead_done % LEAD_SLOTS];
+        s_lead_done++;
+        if (d > 0 && d < 400000) {
+            float ms = (float)d / 1000.0f;
+            s_lead_ms = s_lead_ms < 0.0f ? ms : s_lead_ms + (ms - s_lead_ms) * 0.02f;
+        }
+    }
+    if (s_lead_ms >= 0.0f) {
+        uint32_t local = (uint32_t)(s_lead_ms + 0.5f) + AURA_PD_US / 1000u + LOCAL_SYNC_TRIM_MS;
+        st_lead_ms = (uint32_t)(s_lead_ms + 0.5f);
+        if (local != st_local_ms) {
+            st_local_ms = local;
+            audio_out_set_delay(AO_HOST, local);
+        }
+    }
+}
+
 static void completions_processed(void)
 {
+    lead_update();
     btstack_run_loop_remove_timer(&s_deadline_timer);
     btstack_run_loop_set_timer(&s_deadline_timer, AURA_DEADLINE_MS);
     btstack_run_loop_add_timer(&s_deadline_timer);
@@ -1003,6 +1055,7 @@ static void pipeline_reset(bool run)
     memset(s_sent, 0, sizeof(s_sent));
     memset(s_done, 0, sizeof(s_done));
     memset(s_seq, 0, sizeof(s_seq));
+    s_lead_done = 0;
     for (int i = 0; i < AURA_NUM_BIS; i++) {
         __atomic_store_n(&s_comp_pending[i], 0, __ATOMIC_RELEASE);
         if (!run) {
@@ -1028,6 +1081,8 @@ static void set_phase(phase_t ph)
     switch (ph) {
     case PH_OFF:
         s_pub_state = AURACAST_STATE_OFF;
+        audio_out_end(AO_HOST);
+
         break;
     case PH_ADV_ON_WAIT:
     case PH_BIG_WAIT:
@@ -1121,8 +1176,40 @@ static bool big_heap_ok(void)
     return true;
 }
 
+/* BT thread: (re)create the encoders for a new hosting session */
+static bool encoders_alloc(void)
+{
+    bool ok = true;
+    xSemaphoreTake(s_enc_lock, portMAX_DELAY);
+    for (int ch = 0; ch < AURA_NUM_BIS; ch++) {
+        s_enc[ch] = lc3_setup_encoder(AURA_FRAME_US, AURA_SR_HZ, 0, s_enc_mem[ch]);
+        ok = ok && s_enc[ch] != NULL;
+    }
+    xSemaphoreGive(s_enc_lock);
+    return ok;
+}
+
+/* BT thread, Auracast OFF: hand the workspace to the decoder side. */
+void *auracast_lc3_workspace_take(size_t *half)
+{
+    if (auracast_state() != AURACAST_STATE_OFF) {
+        return NULL;
+    }
+    xSemaphoreTake(s_enc_lock, portMAX_DELAY);
+    for (int ch = 0; ch < AURA_NUM_BIS; ch++) {
+        s_enc[ch] = NULL;                         /* encoder no longer valid: its memory is reused */
+    }
+    xSemaphoreGive(s_enc_lock);
+    if (half) *half = s_lc3_half;
+    return s_lc3_ws;
+}
+
 static int begin_start(void)
 {
+    if (!encoders_alloc()) {
+        ESP_LOGE(TAG, "no RAM for the LC3 encoders");
+        return -ENOMEM;
+    }
     if (!big_heap_ok()) {
         return -ENOMEM;
     }
@@ -1218,6 +1305,9 @@ static void on_big_created(const uint8_t *packet)
     ESP_LOGW(TAG, "broadcast ON: '%s' Broadcast_ID 0x%06x, BIS 0x%04x/0x%04x, ISO interval %u us",
              AURA_BROADCAST_NAME, (unsigned)AURA_BROADCAST_ID, s_bis[0], s_bis[1],
              gap_subevent_big_created_get_iso_interval_1250us(packet) * 1250u);
+    s_lead_ms = -1.0f;
+    st_local_ms = AURA_PIPELINE * 10u + AURA_PD_US / 1000u + LOCAL_SYNC_TRIM_MS;
+    audio_out_begin(AO_HOST, st_local_ms);
     notify(AURACAST_STATE_ON, 0);
 #if S31_TEST_SIGNAL
     s_exp = 0;
@@ -1349,14 +1439,21 @@ void auracast_setup(void)
     log_hex("EXT ADV", s_ext_adv, s_ext_adv_len);
     log_hex("PA (BASE + JBL)", s_pa, s_pa_len);
 
-    /* hot encoder state: internal RAM explicitly */
+    /* hot encoder state: internal RAM, allocated HERE (before HCI power-on).
+     * Allocated later (lazily at host start) the same encode ran 20x slower
+     * (lc3_enc 99 % of core 0 next to btdm 97 % of core 1): keep it at setup. */
     const unsigned esz = lc3_encoder_size(AURA_FRAME_US, AURA_SR_HZ);
+    const unsigned dsz = lc3_decoder_size(AURA_FRAME_US, AURA_SR_HZ);
+    s_enc_lock = xSemaphoreCreateMutex();
+    s_lc3_half = ((esz > dsz ? esz : dsz) + 15u) & ~15u;
+    s_lc3_ws_size = 2 * s_lc3_half;
+    s_lc3_ws = heap_caps_aligned_alloc(16, s_lc3_ws_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    btstack_assert(s_lc3_ws != NULL);
     for (int ch = 0; ch < AURA_NUM_BIS; ch++) {
-        void *mem = heap_caps_malloc(esz, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-        btstack_assert(mem != NULL);
-        s_enc[ch] = lc3_setup_encoder(AURA_FRAME_US, AURA_SR_HZ, 0, mem);
-        btstack_assert(s_enc[ch] != NULL);
+        s_enc_mem[ch] = s_lc3_ws + ch * s_lc3_half;
     }
+    ESP_LOGW(TAG, "LC3 workspace %u B at %p (2 x max(encoder %u, decoder %u)): encoders when hosting, decoders when listening",
+             (unsigned)s_lc3_ws_size, s_lc3_ws, esz, dsz);
     /* digital silence, from a throw-away encoder so the live ones keep their state */
     {
         void *mem = heap_caps_malloc(esz, MALLOC_CAP_8BIT);
@@ -1426,6 +1523,7 @@ int auracast_host_start(void)
     if (!s_hci_up) {
         return -ENODEV;
     }
+
     if (s_want_on) {
         return 0;                                 /* starting / on, or restart already queued */
     }

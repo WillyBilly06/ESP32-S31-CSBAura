@@ -17,6 +17,12 @@
  * only the <= 31-frame filter tail is moved between chunks.
  */
 #pragma once
+#ifdef ESP_PLATFORM
+#include "esp_heap_caps.h"
+#else
+#include <stdlib.h>
+#define heap_caps_malloc(n, caps) malloc(n)
+#endif
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -25,8 +31,8 @@
 
 #define RS_TAPS     32
 #define RS_HALF     (RS_TAPS / 2)
-#define RS_PHASES   256                         /* 2^RS_PHASE_BITS */
-#define RS_PHASE_BITS 8
+#define RS_PHASES   64                          /* 2^RS_PHASE_BITS; adjacent phases are linearly interpolated: worst kernel error -80 dB (256: -104 dB), below the SBC / LC3 coding noise */
+#define RS_PHASE_BITS 6
 #define RS_CHUNK    256                         /* input frames per FIR pass */
 #define RS_HIST_FRAMES (RS_TAPS + RS_CHUNK)
 /* worst-case outputs of one pass: 256 frames of 16 kHz input -> ~770 */
@@ -39,11 +45,22 @@ typedef struct {
     uint32_t pos_f;                             /* ... and Q32 fraction */
 } rs_state_t;
 
-/* [phase][tap]; row p+1 is the next phase, so one base pointer serves both */
-static float rs_kern[RS_PHASES + 1][RS_TAPS];
+/* [phase][tap]; row p+1 is the next phase, so one base pointer serves both.
+ * 65 x 32 floats = 8.3 KB (was 257 phases = 33 KB of internal .bss, which the
+ * BT controller needed: page scan / BIG sync asserted at 12 KB free).
+ * Allocated at init (as the codec fork does): internal RAM, PSRAM fallback. */
+static float (*rs_kern)[RS_TAPS];
 
 static void rs_init_kernel(void)
 {
+    if (rs_kern == NULL) {
+        rs_kern = (float (*)[RS_TAPS])heap_caps_malloc(sizeof(float) * (RS_PHASES + 1) * RS_TAPS,
+                                                        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (rs_kern == NULL) {
+            rs_kern = (float (*)[RS_TAPS])heap_caps_malloc(sizeof(float) * (RS_PHASES + 1) * RS_TAPS,
+                                                            MALLOC_CAP_8BIT);
+        }
+    }
     /* once at start-up: double is fine here */
     const double fc = 20000.0 / 44100.0;       /* cutoff as a fraction of the input rate */
     for (int p = 0; p <= RS_PHASES; p++) {
