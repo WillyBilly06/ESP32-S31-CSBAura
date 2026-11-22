@@ -231,6 +231,8 @@ static volatile uint32_t g_frames_sent;
 static volatile uint32_t g_send_errors;     /* ISO SDUs the stack refused (radio/buffer busy) */
 static volatile uint32_t g_glitches;        /* PCM discontinuities before encoding */
 static volatile uint32_t g_clipped;         /* full-scale samples before encoding */
+extern volatile uint8_t btc_a2dp_sink_bitpool_last, btc_a2dp_sink_bitpool_min, btc_a2dp_sink_bitpool_max;
+extern volatile uint32_t btc_a2dp_sink_media_pkts, btc_a2dp_sink_media_seq_gaps;
 static volatile uint32_t g_iso_done;        /* SDUs the controller reports as sent */
 static volatile uint32_t g_iso_not_txd;     /* SDUs the controller could NOT put on air */
 static volatile uint32_t g_iso_drift;       /* SDUs flagged as drifted vs the BIG anchor */
@@ -910,6 +912,17 @@ static void encode_task(void *arg)
             ESP_LOGW(TAG, "ISO 2s: on-air %lu, NOT SENT %lu, drift %lu | encode ticks late %lu, worst gap %lu us",
                      (unsigned long)g_iso_done, (unsigned long)g_iso_not_txd, (unsigned long)g_iso_drift,
                      (unsigned long)g_late_ticks, (unsigned long)g_max_gap_us);
+            if (a2dp_bridge_streaming()) {
+                ESP_LOGW(TAG, "SBC 2s: bitpool now %u (min %u, max %u), media pkts %lu, lost pkts %lu",
+                         btc_a2dp_sink_bitpool_last,
+                         btc_a2dp_sink_bitpool_min == 0xFF ? 0 : btc_a2dp_sink_bitpool_min,
+                         btc_a2dp_sink_bitpool_max, (unsigned long)btc_a2dp_sink_media_pkts,
+                         (unsigned long)btc_a2dp_sink_media_seq_gaps);
+            }
+            btc_a2dp_sink_bitpool_min = 0xFF;
+            btc_a2dp_sink_bitpool_max = 0;
+            btc_a2dp_sink_media_pkts = 0;
+            btc_a2dp_sink_media_seq_gaps = 0;
             g_iso_done = g_iso_not_txd = g_iso_drift = g_late_ticks = g_max_gap_us = 0;
             last_sent = now;
             last = xTaskGetTickCount();

@@ -50,6 +50,8 @@ static volatile bool s_a2dp_connected;
 static uint8_t s_peer[6];                   /* the one phone we're attached to */
 static volatile bool s_have_peer;
 static volatile bool s_retry_after_loss;
+static volatile bool s_acl_up;              /* a Classic link to the last phone exists (in or out) */
+static volatile uint32_t s_acl_change_ms;   /* when that link last came up or went down */
 
 static void remember_phone(const uint8_t *a);
 static void (*s_name_cb)(const char *name);
@@ -269,6 +271,16 @@ static void gap_bt_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *p)
             s_name_cb((const char *)p->read_rmt_name.rmt_name);
         }
         break;
+    case ESP_BT_GAP_ACL_CONN_CMPL_STAT_EVT:
+        if (p->acl_conn_cmpl_stat.stat == ESP_BT_STATUS_SUCCESS) {
+            s_acl_up = true;
+            s_acl_change_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+        }
+        break;
+    case ESP_BT_GAP_ACL_DISCONN_CMPL_STAT_EVT:
+        s_acl_up = false;
+        s_acl_change_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+        break;
     case ESP_BT_GAP_PIN_REQ_EVT: {
         esp_bt_pin_code_t pin = {'0', '0', '0', '0'};
         esp_bt_gap_pin_reply(p->pin_req.bda, true, 4, pin);
@@ -303,34 +315,53 @@ static bool recall_phone(uint8_t out[6])
 }
 
 /* Like a real speaker: on power-up (and after a lost link) call back the LAST
- * phone only - never cycle through every device ever paired. */
-static void call_back_last_phone(const char *why)
+ * phone only - never cycle through every device ever paired. Kept short and
+ * polite: never page while any Classic link is up (the phone may be connecting
+ * to us at that very moment - two pages collide and both fail), short page
+ * timeout, and long gaps so our page scan stays open for the phone. */
+static void call_back_last_phone(const char *why, int tries)
 {
     uint8_t a[6];
     if (!recall_phone(a)) {
         ESP_LOGI(TAG, "no previous phone - connect to 'S31 JBL Xtreme 5' from the phone's Bluetooth settings");
         return;
     }
-    for (int attempt = 0; attempt < 3 && !s_a2dp_connected; attempt++) {
-        ESP_LOGW(TAG, "%s: calling back last phone %02x:%02x:%02x:%02x:%02x:%02x (try %d/3)",
-                 why, a[0], a[1], a[2], a[3], a[4], a[5], attempt + 1);
+    for (int attempt = 0; attempt < tries && !s_a2dp_connected; attempt++) {
+        /* wait until no link is up and nothing changed for 1.5 s */
+        for (int w = 0; w < 100; w++) {
+            uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+            if (s_a2dp_connected) {
+                return;
+            }
+            if (!s_acl_up && now - s_acl_change_ms > 1500) {
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+        if (s_a2dp_connected || s_acl_up) {
+            return;                          /* the phone is (re)connecting on its own */
+        }
+        ESP_LOGW(TAG, "%s: calling back last phone %02x:%02x:%02x:%02x:%02x:%02x (try %d/%d)",
+                 why, a[0], a[1], a[2], a[3], a[4], a[5], attempt + 1, tries);
         esp_a2d_sink_connect(a);
-        for (int w = 0; w < 8 && !s_a2dp_connected; w++) {
-            vTaskDelay(pdMS_TO_TICKS(1000));
+        for (int w = 0; w < 50 && !s_a2dp_connected; w++) {   /* page 2.5 s + setup */
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+        for (int w = 0; w < 60 && !s_a2dp_connected; w++) {   /* then 6 s of page-scan only */
+            vTaskDelay(pdMS_TO_TICKS(100));
         }
     }
 }
 
 static void reconnect_task(void *arg)
 {
-    vTaskDelay(pdMS_TO_TICKS(2000));
-    call_back_last_phone("power-up");
+    vTaskDelay(pdMS_TO_TICKS(1500));
+    call_back_last_phone("power-up", 2);
     for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        vTaskDelay(pdMS_TO_TICKS(500));
         if (s_retry_after_loss && !s_a2dp_connected) {
             s_retry_after_loss = false;
-            vTaskDelay(pdMS_TO_TICKS(1500));
-            call_back_last_phone("link lost");
+            call_back_last_phone("link lost", 3);
         }
     }
 }
@@ -424,6 +455,9 @@ esp_err_t a2dp_bridge_start(const char *bredr_name)
     esp_a2d_sink_register_stream_endpoint(0, &mcc);
 
     esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+    /* 2.56 s page timeout (default 5.12 s): a call-back that gets no answer
+     * gives the radio back to page scan / the BIG sooner. */
+    esp_bt_gap_set_page_timeout(0x1000);
 
     const uint8_t *a = esp_bt_dev_get_address();
     ESP_LOGW(TAG, "BR/EDR speaker '%s' discoverable at %02x:%02x:%02x:%02x:%02x:%02x (A2DP sink)",

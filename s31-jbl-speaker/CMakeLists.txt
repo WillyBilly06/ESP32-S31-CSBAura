@@ -8,7 +8,9 @@ idf_build_set_property(MINIMAL_BUILD ON)
 # JBL One talks to a real Xtreme 5 over GATT on Classic Bluetooth (BR/EDR), so
 # compile Bluedroid's GATT-over-BR/EDR (ATT on L2CAP + SDP records) in.
 idf_build_set_property(COMPILE_DEFINITIONS "CLASSIC_BT_GATT_INCLUDED=1" APPEND)
-# Ask for the BR/EDR master role on the A2DP link (BTA_AV_FEAT_MASTER) so our
-# controller, not the phone, decides when Classic packets go - around the BIG.
-idf_build_set_property(COMPILE_DEFINITIONS "BTC_AV_SINK_PREFER_MASTER=1" APPEND)
+# NOTE: BTC_AV_SINK_PREFER_MASTER (idf-patches/0002) is deliberately NOT set:
+# phones refuse the role switch, the LMP requests collide, and Bluedroid then
+# drops the link to retry as master. As slave every Auracast SDU still goes out.
+# Log the SBC bitpool the phone really sends (idf btc_a2dp_sink.c tap).
+idf_build_set_property(COMPILE_DEFINITIONS "BTC_A2DP_SINK_BITPOOL_STATS=1" APPEND)
 project(s31_jbl_speaker)

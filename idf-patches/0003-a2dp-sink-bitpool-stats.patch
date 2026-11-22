@@ -1,0 +1,39 @@
+--- a/components/bt/host/bluedroid/btc/profile/std/a2dp/btc_a2dp_sink.c
++++ b/components/bt/host/bluedroid/btc/profile/std/a2dp/btc_a2dp_sink.c
+@@ (insert before btc_a2dp_sink_handle_inc_media, and call the tap first thing inside it) @@
++#if defined(BTC_A2DP_SINK_BITPOOL_STATS) && BTC_A2DP_SINK_BITPOOL_STATS
++/* local patch (s31-jbl-speaker): the bitpool the phone actually uses, read from
++ * the SBC frame header of every media packet (Android lowers it on the fly). */
++volatile uint8_t btc_a2dp_sink_bitpool_last;
++volatile uint8_t btc_a2dp_sink_bitpool_min = 0xFF;
++volatile uint8_t btc_a2dp_sink_bitpool_max;
++volatile uint32_t btc_a2dp_sink_media_pkts;
++volatile uint32_t btc_a2dp_sink_media_seq_gaps;
++static void btc_a2dp_sink_bitpool_tap(BT_HDR *p_msg)
++{
++    static uint16_t last_seq;
++    static bool have_seq;
++    const uint8_t *d = (const uint8_t *)(p_msg + 1) + p_msg->offset;
++    btc_a2dp_sink_media_pkts++;
++    if (have_seq && (uint16_t)(p_msg->layer_specific - last_seq) != 1) {
++        btc_a2dp_sink_media_seq_gaps++;
++    }
++    last_seq = p_msg->layer_specific;
++    have_seq = true;
++    for (int i = 0; i < 4 && i + 3 < p_msg->len; i++) {
++        if (d[i] == 0x9C) {
++            uint8_t bp = d[i + 2];
++            btc_a2dp_sink_bitpool_last = bp;
++            if (bp < btc_a2dp_sink_bitpool_min) btc_a2dp_sink_bitpool_min = bp;
++            if (bp > btc_a2dp_sink_bitpool_max) btc_a2dp_sink_bitpool_max = bp;
++            break;
++        }
++    }
++}
++#endif
++
+ static void btc_a2dp_sink_handle_inc_media(BT_HDR *p_msg)
+ {
++#if defined(BTC_A2DP_SINK_BITPOOL_STATS) && BTC_A2DP_SINK_BITPOOL_STATS
++    btc_a2dp_sink_bitpool_tap(p_msg);
++#endif
