@@ -49,6 +49,7 @@
 #include "esp_bt_device.h"
 #include "jbl_assistant.h"
 #include "jbl_v5_server.h"
+#include "app_task.h"
 
 /* 48 kHz / 10 ms stereo â€” the "High Quality" Auracast format. */
 /* 48_2_2 = high-reliability variant: same codec (48 kHz/10 ms/100 B), RTN 4 but
@@ -216,8 +217,13 @@ static const uint8_t jbl_beacon_addr[6] = { 0xC4, 0x58, 0x34, 0x53, 0x31, 0x04 }
 #define TEST_TONE              0
 /* A/B test for the garble: record the last REPLAY_SECONDS of phone music (as
  * encoded) into PSRAM; when the phone pauses, loop it over Auracast while the
- * Classic link is idle. Clean replay => BR/EDR coexistence breaks the BIG. */
-#define REPLAY_TEST            1
+ * Classic link is idle. Clean replay => BR/EDR coexistence breaks the BIG.
+ * Debug only, off by default: it costs ~5.8 MB of PSRAM (30 s of PCM, taken on
+ * the first frame) plus a 1.9 KB memcpy every 10 ms on the encode path. Build
+ * with -DREPLAY_TEST=1 (or flip the default) to bring it back. */
+#ifndef REPLAY_TEST
+#define REPLAY_TEST            0
+#endif
 #define REPLAY_SECONDS         30
 static volatile bool g_replaying;   /* replay loop is on air (beacon stays slow, like streaming) */
 
@@ -246,16 +252,68 @@ static volatile uint32_t g_iso_drift;       /* SDUs flagged as drifted vs the BI
 static volatile uint32_t g_late_ticks;      /* encode ticks > 15 ms after the previous one */
 static volatile uint32_t g_max_gap_us;      /* worst gap between encode ticks */
 static volatile uint32_t g_enc_us_sum, g_enc_us_max, g_enc_n;   /* lc3_encode time, both channels */
+static volatile uint32_t g_iso_backlog_drops; /* SDU pairs not handed over: too many already in flight */
+static volatile uint32_t g_send_backoffs;     /* SDU pairs not attempted: backing off after repeated send errors */
+static volatile uint32_t g_tick_skips;        /* encode ticks dropped because the encoder fell behind */
 
 #define STREAM_COUNT            CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT
 #define SUBGROUP_COUNT          CONFIG_BT_BAP_BROADCAST_SRC_SUBGROUP_COUNT
+
+/* ---- ISO TX queue policy ----------------------------------------------------
+ * The controller holds CONFIG_BT_LE_ISO_NSFC_NUM (12) SDUs for all BIS
+ * together (non-standard flow control). When it is full, the LE Audio host
+ * (esp_ble_iso common/iso.c, iso_tx_sdu_insert) does not refuse the SDU: it
+ * mallocs it into a list with NO length limit and drains it on TX-complete.
+ * If the BIG stalls (controller starved, radio taken by BR/EDR) that list
+ * grows by 2 x 128 B of internal heap every 10 ms, and every queued SDU is
+ * stale audio anyway. So we count our own SDUs in flight per BIS (handed over
+ * minus completed/flushed in the sent callback) and drop a whole L+R frame
+ * (seq_num still advances, receivers run PLC) once ISO_TX_INFLIGHT_MAX are
+ * outstanding: 8 x 10 ms = 80 ms, above the normal 2-4 of the BN 2 / 20 ms
+ * BIG and above the 65 ms max transport latency, and 2 x 8 > 12 so the host
+ * list is already in use when it trips. If a completion is ever lost
+ * (iso_tx_comp_cb drops it when its calloc fails) the count would stick high:
+ * after ISO_TX_INFLIGHT_MAX dropped frames with completions still arriving,
+ * the estimate is clamped back to half the cap. */
+#define ISO_TX_INFLIGHT_MAX     8
+/* After this many consecutive refused sends, skip ISO_TX_BACKOFF_TICKS ticks
+ * before trying again: the host logs every refusal (ChanNotConn, IsoTxNoMem)
+ * on the UART, 200 lines/s would be a log storm on core 0. */
+#define ISO_TX_FAIL_BURST       10
+#define ISO_TX_BACKOFF_TICKS    20
+/* Encoder catch-up: at most this many ticks may be waiting behind the one
+ * being encoded (30 ms). Older ones are dropped (PCM consumed, seq_num
+ * advanced) instead of bursting 16 late SDUs into the queue above. */
+#define ENC_MAX_BACKLOG         3
 
 static struct broadcast_source_stream {
     esp_ble_audio_bap_stream_t stream;
     uint16_t seq_num;
     uint8_t *data;
     example_audio_tx_scheduler_t scheduler;
+    uint32_t sent;                      /* SDUs handed to the host (lc3_enc task) */
+    volatile uint32_t done;             /* completed + not-transmitted (iso_task, sent cb) */
 } streams[STREAM_COUNT];
+
+static uint32_t g_tx_fail_run;          /* consecutive refused sends (lc3_enc task only) */
+static uint32_t g_tx_backoff;           /* ticks left to skip */
+static uint32_t g_tx_blocked;           /* consecutive frames dropped by the in-flight cap */
+static uint32_t g_tx_blocked_done;      /* stream 0 'done' when that run started */
+
+/* lc3_enc task only. If completions overtake our count (SDUs from before a
+ * stream restart; the 2 s stats show on-air + not-sent a few counts above
+ * frames sent), re-base 'sent' so the estimate never goes negative and the
+ * cap does not silently drift open. */
+static uint32_t iso_inflight(struct broadcast_source_stream *s)
+{
+    uint32_t d = __atomic_load_n(&s->done, __ATOMIC_ACQUIRE);
+    int32_t n = (int32_t)(s->sent - d);
+    if (n < 0) {
+        s->sent = d;
+        n = 0;
+    }
+    return (uint32_t)n;
+}
 
 static esp_ble_audio_bap_broadcast_source_t *broadcast_source;
 
@@ -294,6 +352,9 @@ static void stream_started_cb(esp_ble_audio_bap_stream_t *stream)
     }
 
     source_stream->seq_num = 0;
+    source_stream->sent = 0;
+    __atomic_store_n(&source_stream->done, 0, __ATOMIC_RELEASE);
+    g_tx_fail_run = g_tx_backoff = g_tx_blocked = 0;
     /* Stream 0's drift-compensated scheduler paces BOTH channels. */
     if (idx == 0) {
         example_audio_tx_scheduler_reset(&source_stream->scheduler);
@@ -331,6 +392,10 @@ static void stream_sent_cb(esp_ble_audio_bap_stream_t *stream, void *user_data)
     char name[24];
 
     const esp_ble_iso_tx_cb_info_t *info = user_data;
+    if (info != NULL) {
+        __atomic_fetch_add(&source_stream->done, (uint32_t)info->completed_pkts + info->not_txd_pkts,
+                           __ATOMIC_RELEASE);
+    }
     if (info != NULL && stream_index(stream) == 0) {
         g_iso_done += info->completed_pkts;
         g_iso_not_txd += info->not_txd_pkts;
@@ -492,11 +557,45 @@ static void broadcast_source_tx(void)
     }
 #endif
 
-    /* JBL One EQ (7 JBL biquads), applied before encoding like the real speaker */
+    /* ISO queue policy: decide before spending CPU on the encode. */
+    bool send = true;
+    if (g_tx_backoff > 0) {
+        g_tx_backoff--;
+        g_send_backoffs++;
+        send = false;
+    } else {
+        uint32_t worst = 0;
+        for (int ch = 0; ch < 2 && ch < (int)ARRAY_SIZE(streams); ch++) {
+            uint32_t n = iso_inflight(&streams[ch]);
+            if (n > worst) worst = n;
+        }
+        if (worst >= ISO_TX_INFLIGHT_MAX) {
+            uint32_t d0 = __atomic_load_n(&streams[0].done, __ATOMIC_ACQUIRE);
+            if (g_tx_blocked == 0) {
+                g_tx_blocked_done = d0;
+            }
+            if (++g_tx_blocked >= ISO_TX_INFLIGHT_MAX && d0 != g_tx_blocked_done) {
+                /* the BIG is moving but our count stays high: a completion
+                 * was lost; clamp the estimate instead of staying muted */
+                for (int ch = 0; ch < 2 && ch < (int)ARRAY_SIZE(streams); ch++) {
+                    streams[ch].sent = __atomic_load_n(&streams[ch].done, __ATOMIC_ACQUIRE) +
+                                       ISO_TX_INFLIGHT_MAX / 2;
+                }
+                g_tx_blocked = 0;
+            }
+            g_iso_backlog_drops++;
+            send = false;
+        } else {
+            g_tx_blocked = 0;
+        }
+    }
+
+    /* JBL One EQ (7 JBL biquads), applied before encoding like the real speaker.
+     * Runs even for a dropped frame so its filter state stays continuous. */
     v5_eq_process(pcm, fs);
 
     int64_t enc_t0 = esp_timer_get_time();
-    for (int ch = 0; ch < 2 && ch < (int)ARRAY_SIZE(streams); ch++) {
+    for (int ch = 0; send && ch < 2 && ch < (int)ARRAY_SIZE(streams); ch++) {
         struct broadcast_source_stream *s = &streams[ch];
         if (g_enc[ch] == NULL || s->data == NULL ||
             s->stream.qos == NULL || s->stream.qos->sdu == 0) {
@@ -506,8 +605,17 @@ static void broadcast_source_tx(void)
         if (lc3_encode(g_enc[ch], LC3_PCM_FORMAT_S16, pcm + ch, 2, opf, s->data) != 0) {
             continue;
         }
+        /* One attempt per SDU, never retried: a late SDU is worthless, and the
+         * host copies s->data, so the buffer is free again on return. */
         if (esp_ble_audio_bap_stream_send(&s->stream, s->data, opf, streams[0].seq_num) != 0) {
             g_send_errors++;
+            if (++g_tx_fail_run >= ISO_TX_FAIL_BURST) {
+                g_tx_fail_run = 0;
+                g_tx_backoff = ISO_TX_BACKOFF_TICKS;
+            }
+        } else {
+            s->sent++;
+            g_tx_fail_run = 0;
         }
     }
     {
@@ -518,6 +626,18 @@ static void broadcast_source_tx(void)
     }
     streams[0].seq_num++;
     g_frames_sent++;
+}
+
+/* A tick the encoder is too late for: keep the PCM ring and the sequence
+ * number in step with the BIG clock, but encode and send nothing. */
+static void broadcast_source_skip_tick(void)
+{
+    if (!stream_is_streaming(&streams[0].stream)) {
+        return;
+    }
+    a2dp_bridge_discard(g_frame_samples);
+    streams[0].seq_num++;
+    g_tick_skips++;
 }
 
 static void tx_scheduler_cb(void *arg)
@@ -839,7 +959,10 @@ end:
     return err;
 }
 
-static uint8_t s_v5_prep[600];      /* reassembly of long (prepared) writes */
+/* reassembly of long (prepared) writes: cold, so PSRAM, allocated on the
+ * first prepared write */
+#define V5_PREP_MAX 600
+static uint8_t *s_v5_prep;
 static uint16_t s_v5_prep_len;
 
 /* Log anything a speaker does over a connection to the beacon, then re-arm it. */
@@ -867,6 +990,9 @@ static void gatts_cb(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
         v5_server_on_disconnect(p->disconnect.conn_id);
         beacon_adv_restart();
         break;
+    case ESP_GATTS_CONGEST_EVT:
+        v5_server_set_congested(p->congest.conn_id, p->congest.congested);
+        break;
     case ESP_GATTS_MTU_EVT:
         ESP_LOGW(TAG, "peer MTU %u (conn %u)", p->mtu.mtu, p->mtu.conn_id);
         v5_server_set_mtu(p->mtu.mtu);
@@ -884,7 +1010,13 @@ static void gatts_cb(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
         if (jbl_gatt_is_v5_write(p->write.handle)) {
             /* JBL One command channel (long writes arrive as prepared writes) */
             if (p->write.is_prep) {
-                if (p->write.offset + p->write.len <= sizeof(s_v5_prep)) {
+                if (s_v5_prep == NULL) {
+                    s_v5_prep = heap_caps_malloc(V5_PREP_MAX, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                    if (s_v5_prep == NULL) {
+                        s_v5_prep = heap_caps_malloc(V5_PREP_MAX, MALLOC_CAP_8BIT);
+                    }
+                }
+                if (s_v5_prep != NULL && p->write.offset + p->write.len <= V5_PREP_MAX) {
                     memcpy(s_v5_prep + p->write.offset, p->write.value, p->write.len);
                     s_v5_prep_len = p->write.offset + p->write.len;
                 }
@@ -936,7 +1068,10 @@ static esp_err_t tone_lc3_init(void)
 {
     g_frame_samples = lc3_frame_samples(TONE_DT_US, TONE_SR_HZ);   /* 480 @ 48k/10ms */
     for (int ch = 0; ch < 2; ch++) {
-        g_enc_mem[ch] = malloc(lc3_encoder_size(TONE_DT_US, TONE_SR_HZ));
+        /* hot (touched every 10 ms by the encoder): pin it to internal RAM
+         * explicitly instead of relying on the 16 KB malloc threshold */
+        g_enc_mem[ch] = heap_caps_malloc(lc3_encoder_size(TONE_DT_US, TONE_SR_HZ),
+                                         MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
         if (g_enc_mem[ch] == NULL) {
             return ESP_ERR_NO_MEM;
         }
@@ -963,20 +1098,24 @@ static void stats_task(void *arg)
         vTaskDelayUntil(&last, pdMS_TO_TICKS(2000));
 
         uint32_t now = g_frames_sent;
-        uint32_t ur, dr, fill;
-        a2dp_bridge_stats(&ur, &dr, &fill);
+        uint32_t ur, dr, sk, fill;
+        a2dp_bridge_stats(&ur, &dr, &sk, &fill);
         ESP_LOGW(TAG, "TX 2s: %lu frames (expect 200), send_err %lu | %s, a2dp pkts %lu, "
-                 "buf %lu ms, underruns %lu, drops %lu, PCM glitches %lu, clipped %lu",
+                 "buf %lu ms, underruns %lu, drops %lu, latency skips %lu, PCM glitches %lu, clipped %lu",
                  (unsigned long)(now - last_sent), (unsigned long)g_send_errors,
                  a2dp_bridge_streaming() ? "PHONE MUSIC" :
                  a2dp_bridge_connected() ? "phone paused (silence)" :
                  TEST_TONE ? "test tone" : "no phone (silence)",
                  (unsigned long)a2dp_bridge_packets(), (unsigned long)fill,
-                 (unsigned long)ur, (unsigned long)dr,
+                 (unsigned long)ur, (unsigned long)dr, (unsigned long)sk,
                  (unsigned long)g_glitches, (unsigned long)g_clipped);
-        ESP_LOGW(TAG, "ISO 2s: on-air %lu, NOT SENT %lu, drift %lu | encode ticks late %lu, worst gap %lu us",
+        ESP_LOGW(TAG, "ISO 2s: on-air %lu, NOT SENT %lu, drift %lu | encode ticks late %lu, worst gap %lu us | "
+                 "in flight %ld/%d, totals: backlog drops %lu, backoff %lu, ticks skipped %lu",
                  (unsigned long)g_iso_done, (unsigned long)g_iso_not_txd, (unsigned long)g_iso_drift,
-                 (unsigned long)g_late_ticks, (unsigned long)g_max_gap_us);
+                 (unsigned long)g_late_ticks, (unsigned long)g_max_gap_us,
+                 (long)(int32_t)(streams[0].sent - streams[0].done), ISO_TX_INFLIGHT_MAX,
+                 (unsigned long)g_iso_backlog_drops, (unsigned long)g_send_backoffs,
+                 (unsigned long)g_tick_skips);
         if (a2dp_bridge_streaming()) {
             ESP_LOGW(TAG, "SBC 2s: bitpool now %u (min %u, max %u), media pkts %lu, lost pkts %lu",
                      btc_a2dp_sink_bitpool_last,
@@ -1004,6 +1143,15 @@ static void encode_task(void *arg)
 {
     for (;;) {
         if (xSemaphoreTake(g_encode_sem, pdMS_TO_TICKS(500)) == pdTRUE) {
+            /* Late by more than ENC_MAX_BACKLOG ticks (core 0 overloaded):
+             * drop the oldest ticks instead of bursting them all out late.
+             * Sheds load exactly when there is none to spare, and keeps the
+             * ISO queue short. */
+            UBaseType_t behind = uxSemaphoreGetCount(g_encode_sem);
+            while (behind > ENC_MAX_BACKLOG && xSemaphoreTake(g_encode_sem, 0) == pdTRUE) {
+                broadcast_source_skip_tick();
+                behind--;
+            }
             broadcast_source_tx();
         }
     }
@@ -1081,7 +1229,10 @@ void app_main(void)
      * k_work tick that gives g_encode_sem is followed at once by the encode. */
     xTaskCreatePinnedToCore(encode_task, "lc3_enc", 12288, NULL,
                             configMAX_PRIORITIES - 4, NULL, 0);
-    xTaskCreatePinnedToCore(stats_task, "tx_stats", 4096, NULL, 2, NULL, 1);
+    /* Cold tasks (log / adv-data housekeeping, never touch flash) get their
+     * stacks in PSRAM: frees internal RAM for Bluetooth. A PSRAM stack must
+     * not be used while the cache is off, i.e. no NVS/flash calls in them. */
+    app_task_cold("tx_stats", stats_task, 4096, 2);
 
     err = broadcast_start();
     if (err) {
@@ -1095,7 +1246,7 @@ void app_main(void)
     }
 
     if (JBL_PA_BLOCK) {
-        xTaskCreatePinnedToCore(pa_update_task, "jbl_pa", 4096, NULL, 5, NULL, 1);   /* core 1: keep core 0 for the BT controller */
+        app_task_cold("jbl_pa", pa_update_task, 4096, 5);   /* core 1: keep core 0 for the BT controller */
     }
     ESP_LOGW(TAG, "JBL party block in periodic data: %s", JBL_PA_BLOCK ? "ON" : "OFF");
 

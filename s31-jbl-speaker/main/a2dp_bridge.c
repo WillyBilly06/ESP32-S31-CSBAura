@@ -36,9 +36,23 @@
 #define RB_BYTES        MS_BYTES(400)           /* 400 ms of 48 kHz stereo s16 */
 #define PRIME_BYTES     MS_BYTES(120)           /* start reading after 120 ms */
 #define TARGET_BYTES    MS_BYTES(150)           /* steady-state fill the drift control aims for */
+/* Latency cap. The +-0.2 % drift control needs minutes to work off a big
+ * excess (250 ms at 0.2 % = 125 s), so after a burst (phone catching up after
+ * a radio stall) the reader drops the OLDEST audio once, straight back to
+ * TARGET: one short skip instead of minutes of extra delay, and the writer
+ * (drop-newest, whole packet, only when the ring is completely full) almost
+ * never has to fire. 300 ms leaves 150 ms over target for normal jitter
+ * (measured fill 137-187 ms while streaming). */
+#define HIGH_BYTES      MS_BYTES(300)
 
 static volatile uint32_t s_underruns;           /* encoder found too little phone audio */
 static volatile uint32_t s_drops;               /* phone audio dropped (buffer full) */
+static volatile uint32_t s_skips;               /* latency cap hit: oldest audio dropped back to TARGET */
+/* Set by the A2DP callbacks (BTC task) on start / suspend / codec change /
+ * disconnect; the encoder task (the ring's consumer, the only side allowed to
+ * move rd) empties the ring on its next read, so audio from before a pause or
+ * from the previous phone is never played. */
+static volatile bool s_flush_req;
 
 static volatile uint32_t s_src_rate = 44100;
 static volatile bool s_streaming;
@@ -82,6 +96,7 @@ void a2dp_bridge_on_phone_name(void (*cb)(const char *name))
 #define RB_FRAMES       (RB_BYTES / 4)
 #define PRIME_FRAMES    (PRIME_BYTES / 4)
 #define TARGET_FRAMES   (TARGET_BYTES / 4)
+#define HIGH_FRAMES     (HIGH_BYTES / 4)
 
 static rs_state_t s_rs;                        /* touched only by the A2DP decoder task */
 static uint32_t s_rs_out[RS_OUT_MAX];          /* one FIR pass of output, internal RAM */
@@ -144,6 +159,13 @@ static void a2d_data_cb(const uint8_t *data, uint32_t len)
 bool a2dp_bridge_read(int16_t *pcm, int frames)
 {
     size_t want = frames * 4;
+    if (s_flush_req && s_ring.buf != NULL) {
+        /* consumer-side flush: rd = wr. Anything the writer adds after this
+         * (fresh audio, after its resampler reset) is kept. */
+        s_flush_req = false;
+        ring_skip(&s_ring, ring_fill(&s_ring));
+        s_primed = false;
+    }
     if (s_ring.buf == NULL || !s_streaming) {
         s_primed = false;
         if (s_a2dp_connected) {
@@ -160,6 +182,11 @@ bool a2dp_bridge_read(int16_t *pcm, int frames)
         }
         s_primed = true;
     }
+    if (buffered > HIGH_FRAMES) {
+        ring_skip(&s_ring, buffered - TARGET_FRAMES);   /* drop the oldest: latency back to TARGET */
+        buffered = TARGET_FRAMES;
+        s_skips++;
+    }
     if (buffered < (uint32_t)frames) {
         /* Underrun mid-song: play silence and re-prime; never fall back to the tone. */
         s_primed = false;
@@ -169,6 +196,15 @@ bool a2dp_bridge_read(int16_t *pcm, int frames)
     }
     ring_read(&s_ring, (uint32_t *)pcm, frames);
     return true;
+}
+
+void a2dp_bridge_discard(int frames)
+{
+    if (s_ring.buf == NULL || !s_streaming || !s_primed || frames <= 0) {
+        return;                            /* nothing being played out yet */
+    }
+    uint32_t fill = ring_fill(&s_ring);
+    ring_skip(&s_ring, fill < (uint32_t)frames ? fill : (uint32_t)frames);
 }
 
 bool a2dp_bridge_streaming(void)
@@ -186,10 +222,11 @@ uint32_t a2dp_bridge_packets(void)
     return s_in_pkts;
 }
 
-void a2dp_bridge_stats(uint32_t *underruns, uint32_t *drops, uint32_t *fill_ms)
+void a2dp_bridge_stats(uint32_t *underruns, uint32_t *drops, uint32_t *skips, uint32_t *fill_ms)
 {
     *underruns = s_underruns;
     *drops = s_drops;
+    *skips = s_skips;
     *fill_ms = s_ring.buf ? ring_fill(&s_ring) * 4 / MS_BYTES(1) : 0;
 }
 
@@ -235,6 +272,8 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *p)
             s_have_peer = false;
             s_a2dp_connected = false;
             s_streaming = false;
+            s_rs_reset = true;           /* next phone starts from a clean resampler ... */
+            s_flush_req = true;          /* ... and an empty ring */
             bt_sched_tune_streaming(false);
             esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
             if (lost) {
@@ -244,8 +283,15 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *p)
         break;
     }
     case ESP_A2D_AUDIO_STATE_EVT:
-        s_streaming = (p->audio_stat.state == ESP_A2D_AUDIO_STATE_STARTED);
+        /* Start and suspend/stop alike: restart the resampler (its history
+         * holds the end of the old audio) and empty the PCM ring, so a resume
+         * re-primes on fresh audio only. Bluedroid already flushes its own
+         * encoded-packet queue (rx_flush) on suspend/stop. Flags first, then
+         * s_streaming, so the reader never sees "streaming" with stale data. */
         s_rs_reset = true;
+        s_flush_req = true;
+        __atomic_thread_fence(__ATOMIC_RELEASE);
+        s_streaming = (p->audio_stat.state == ESP_A2D_AUDIO_STATE_STARTED);
         bt_sched_tune_streaming(s_streaming);    /* A2DP highest only while music flows */
         ESP_LOGW(TAG, "A2DP audio %s", s_streaming ? "STARTED -> re-broadcasting on Auracast"
                                                    : "suspended -> broadcasting silence");
@@ -260,6 +306,8 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *p)
             else                                                        r = 16000;
         }
         s_src_rate = r;
+        s_rs_reset = true;               /* new source rate: old history/phase is meaningless */
+        s_flush_req = true;
         ESP_LOGW(TAG, "A2DP codec configured: type %d, %lu Hz -> resampled to 48000 Hz",
                  m->type, (unsigned long)r);
         break;

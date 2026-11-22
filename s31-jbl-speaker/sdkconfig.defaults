@@ -10,6 +10,15 @@ CONFIG_BTDM_CTRL_MODE_BTDM=y
 CONFIG_BT_CLASSIC_ENABLED=y
 CONFIG_BT_A2DP_ENABLE=y
 CONFIG_BT_SSP_ENABLED=y
+# Unused Bluedroid features (the app never calls esp_avrc_*; AVRCP itself is
+# hard-wired to A2DP in Bluedroid and stays). Cover Art pulls in GOEP client +
+# OBEX + RFCOMM (rfc_cb ~2 KB .bss, plus their code and pools).
+# CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED is not set
+# No LE DTM test commands. (BT_BLE_FEAT_ISO_BIG_SYNCER / ISO_CIG_CENTRAL /
+# ISO_CIG_PERIPHERAL stay on although we only broadcast: the LE Audio host's
+# Bluedroid adapter, esp_ble_iso/host/adapter/bluedroid/iso.c, uses their
+# BTM CIS/BIG-sync APIs unconditionally and does not compile without them.)
+# CONFIG_BT_BLE_50_DTM_TEST_EN is not set
 CONFIG_BT_CONTROLLER_ENABLED=y
 CONFIG_BT_BLE_ENABLED=y
 CONFIG_BT_BLE_50_FEATURES_SUPPORTED=y
@@ -32,6 +41,19 @@ CONFIG_SPIRAM_USE_MALLOC=y
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
 CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=65536
 CONFIG_SPIRAM_IGNORE_NOTFOUND=y
+# Deliberately OFF (internal heap is ~190 KB free after BT init, no pressure):
+#  - SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY: moves ALL of libbt.a's .bss to PSRAM,
+#    including the controller OSAL (btdm_osal_freertos.c event queues/callouts)
+#    whose IRAM code runs from the controller ISR while the cache is off during
+#    flash writes (NVS bonding) -> crash. App cold buffers use heap_caps_malloc
+#    (MALLOC_CAP_SPIRAM) on first use instead.
+#  - BT_ALLOCATION_FROM_SPIRAM_FIRST: functionally safe (VHCI is a RAM/memcpy
+#    interface, no DMA; controller pools are its own), but it moves EVERY
+#    osi_malloc to PSRAM, incl. the buffer of every HCI event and A2DP media
+#    packet (the SBC decoder then reads them through the cache) and the
+#    Bluedroid control blocks, on cores that are already the bottleneck.
+#  - BT_BLE_DYNAMIC_ENV_MEMORY: without the option above the control blocks
+#    just move from .bss to internal heap (< 16 KB each), no saving.
 
 # 16 MB flash on the S31 board; dual-mode Bluetooth needs a bigger app slot
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
