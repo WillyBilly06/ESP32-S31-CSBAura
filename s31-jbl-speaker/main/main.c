@@ -591,7 +591,7 @@ static esp_err_t broadcast_source_setup(void)
      * but each frame goes out twice instead of 4 times. Halves the BIG's
      * airtime (~9.6 -> ~4.8 ms per 20 ms) so the phone's A2DP link has room
      * for SBC bitpool 53. Set BIG_IRC 4 to go back to the Xtreme 5's numbers. */
-#define BIG_IRC 2
+#define BIG_IRC 4   /* Xtreme 5 value; the ACL priority boost now gives A2DP its room */
     preset_active.qos.rtn = 2;
     preset_active.qos.num_subevents = 2 * BIG_IRC;   /* NSE = BN x IRC */
     preset_active.qos.burst_number = 2;

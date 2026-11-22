@@ -56,6 +56,37 @@ static volatile uint32_t s_acl_change_ms;   /* when that link last came up or we
 static void remember_phone(const uint8_t *a);
 extern uint8_t *BTM_ReadLocalFeatures(void);    /* Bluedroid: LMP features page 0 */
 
+/* ---- controller lever (re/controller_sched.md) -------------------------------
+ * The BR/EDR scheduler takes each activity's base priority from a 36-byte
+ * {default, increment} table in DRAM (olc_sched.c.o .dram1.38). A streaming
+ * ACL sits at 2..4 while BIS subevents run at 9 (first copy) / 7 (repetitions),
+ * so A2DP slots lose every overlap with the BIG. Raise ACL (index 0) to 8:
+ * it now beats BIS repetitions but never the first copy of a frame. */
+#define ACL_PRIO_BOOST 8
+extern uint8_t r_olc_sched_pti_dft_get(uint8_t idx);
+extern uint8_t _data_start[], _data_end[];
+
+static void bt_raise_acl_priority(void)
+{
+    static const uint8_t sig[36] = {2,1,9,2,10,1,4,1,12,2,8,1,2,1,4,1,4,1,4,1,
+                                    2,1,10,1,3,1,11,1,6,1,6,1,4,1,4,1};
+    uint8_t *hit = NULL;
+    int hits = 0;
+    for (uint8_t *p = _data_start; p + sizeof(sig) <= _data_end; p++) {
+        if (memcmp(p, sig, sizeof(sig)) == 0) {
+            hit = p;
+            hits++;
+        }
+    }
+    if (hits != 1 || r_olc_sched_pti_dft_get(0) != 2) {
+        ESP_LOGE(TAG, "ACL priority table: %d matches, dft[0]=%u - NOT patched", hits, r_olc_sched_pti_dft_get(0));
+        return;
+    }
+    hit[0] = ACL_PRIO_BOOST;
+    ESP_LOGW(TAG, "controller: A2DP/ACL base priority 2 -> %u at %p (BIS first copy 9, repetitions 7)",
+             r_olc_sched_pti_dft_get(0), hit);
+}
+
 /* All ACL packet types, EDR (2/3 Mbps) DH1/DH3/DH5 allowed (no "NO_x_DHy" bits). */
 #define ACL_PKT_ALL_EDR (ESP_BT_ACL_PKT_TYPES_MASK_DM1 | ESP_BT_ACL_PKT_TYPES_MASK_DH1 |                          ESP_BT_ACL_PKT_TYPES_MASK_DM3 | ESP_BT_ACL_PKT_TYPES_MASK_DH3 |                          ESP_BT_ACL_PKT_TYPES_MASK_DM5 | ESP_BT_ACL_PKT_TYPES_MASK_DH5)
 static void (*s_name_cb)(const char *name);
@@ -79,7 +110,8 @@ void a2dp_bridge_on_phone_name(void (*cb)(const char *name))
 static float s_kern[RS_PHASES + 1][RS_TAPS];
 static float s_hist[2][RS_HIST];
 static int s_hlen;                             /* valid frames in s_hist */
-static double s_rpos;                          /* read position (frames) in s_hist */
+static int s_rpos_i;                           /* read position (frames) in s_hist: integer part */
+static float s_rpos_f;                         /* ... and fraction 0..1 (single precision: FPU only does float) */
 static volatile bool s_rs_reset = true;
 
 static void rs_init_kernel(void)
@@ -124,7 +156,8 @@ static void a2d_data_cb(const uint8_t *data, uint32_t len)
         s_rs_reset = false;
         memset(s_hist, 0, sizeof(s_hist));
         s_hlen = RS_TAPS;                  /* start on a short run of silence */
-        s_rpos = RS_HALF - 1;
+        s_rpos_i = RS_HALF - 1;
+        s_rpos_f = 0.0f;
     }
     if (n > RS_HIST - s_hlen) {
         n = RS_HIST - s_hlen;              /* never happens with SBC packets (< 2k frames) */
@@ -142,38 +175,46 @@ static void a2d_data_cb(const uint8_t *data, uint32_t len)
         float e = (fill - (float)TARGET_BYTES) / (float)TARGET_BYTES;
         if (e > 1.0f) e = 1.0f;
         if (e < -1.0f) e = -1.0f;
-        const double step = ((double)s_src_rate / (double)OUT_RATE) * (1.0 + 0.002 * e);
-        double pos = s_rpos;
-        while ((int)pos + RS_HALF < s_hlen && o < out_max) {
-            int i = (int)pos;
-            float ph = (float)(pos - i) * RS_PHASES;
+        const float stepf = ((float)s_src_rate / (float)OUT_RATE) * (1.0f + 0.002f * e);
+        const int step_i = (int)stepf;
+        const float step_f = stepf - (float)step_i;
+        int i = s_rpos_i;
+        float fr = s_rpos_f;
+        while (i + RS_HALF < s_hlen && o < out_max) {
+            float ph = fr * RS_PHASES;
             int p0 = (int)ph;
             float t = ph - (float)p0;
             const float *k0 = s_kern[p0], *k1 = s_kern[p0 + 1];
             const float *x0 = &s_hist[0][i - (RS_HALF - 1)];
             const float *x1 = &s_hist[1][i - (RS_HALF - 1)];
-            float acc0 = 0, acc1 = 0;
+            float a0 = 0, a1 = 0, b0 = 0, b1 = 0;   /* both phases, then interpolate the outputs */
             for (int k = 0; k < RS_TAPS; k++) {
-                float c = k0[k] + (k1[k] - k0[k]) * t;
-                acc0 += c * x0[k];
-                acc1 += c * x1[k];
+                a0 += k0[k] * x0[k];
+                a1 += k0[k] * x1[k];
+                b0 += k1[k] * x0[k];
+                b1 += k1[k] * x1[k];
             }
+            float acc0 = a0 + (b0 - a0) * t;
+            float acc1 = a1 + (b1 - a1) * t;
             if (acc0 > 32767.f) acc0 = 32767.f; else if (acc0 < -32768.f) acc0 = -32768.f;
             if (acc1 > 32767.f) acc1 = 32767.f; else if (acc1 < -32768.f) acc1 = -32768.f;
             out[2 * o] = (int16_t)lrintf(acc0);
             out[2 * o + 1] = (int16_t)lrintf(acc1);
             o++;
-            pos += step;
+            i += step_i;
+            fr += step_f;
+            if (fr >= 1.0f) { fr -= 1.0f; i++; }
         }
         /* drop consumed input, keep the taps' history */
-        int keep_from = (int)pos - (RS_HALF - 1);
+        int keep_from = i - (RS_HALF - 1);
         if (keep_from > 0) {
             s_hlen -= keep_from;
             memmove(s_hist[0], s_hist[0] + keep_from, s_hlen * sizeof(float));
             memmove(s_hist[1], s_hist[1] + keep_from, s_hlen * sizeof(float));
-            pos -= keep_from;
+            i -= keep_from;
         }
-        s_rpos = pos;
+        s_rpos_i = i;
+        s_rpos_f = fr;
     }
 
     /* Drop if the encoder falls behind (keeps latency bounded). */
@@ -476,6 +517,7 @@ esp_err_t bt_dual_mode_init(void)
     esp_ble_gap_set_security_param(ESP_BLE_SM_MAX_KEY_SIZE, &key_size, sizeof(key_size));
     esp_ble_gap_set_security_param(ESP_BLE_SM_SET_INIT_KEY, &init_key, sizeof(init_key));
     esp_ble_gap_set_security_param(ESP_BLE_SM_SET_RSP_KEY, &rsp_key, sizeof(rsp_key));
+    bt_raise_acl_priority();
     return ESP_OK;
 }
 
