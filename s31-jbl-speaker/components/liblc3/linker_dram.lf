@@ -1,0 +1,35 @@
+# liblc3: tables read on every frame by the 48 kHz / 10 ms ENCODER,
+# copied to internal DRAM (opt-in, `idf.py -DLC3_ENCODER_TABLES_DRAM=ON build`).
+#
+# All liblc3 tables are `const` and live in flash .rodata (pulled into the
+# cache only when touched).  This fragment moves only the ~23 KB the encoder
+# reads per frame at 48 kHz / 10 ms: MDCT window and rotation, FFT twiddles
+# of the 240-point FFT, band limits, SNS codebooks, spectral / TNS arithmetic
+# coder models, LTPF 48k->12.8k resampling filter.  Every other
+# samplerate / frame-duration table and all decoder / PLC tables stay in
+# flash.  Off by default: the gain depends on flash data-cache pressure and
+# has not been measured on hardware.
+
+[mapping:liblc3_dram]
+archive: libliblc3.a
+entries:
+    tables:mdct_win_10m_48k (noflash_data)
+    tables:mdct_rot_960_t (noflash_data)
+    tables:fft_twiddles_15_t (noflash_data)
+    tables:fft_twiddles_30_t (noflash_data)
+    tables:fft_twiddles_60_t (noflash_data)
+    tables:fft_twiddles_120_t (noflash_data)
+    tables:fft_twiddles_240_t (noflash_data)
+    tables:band_lim_10m_48k (noflash_data)
+    tables:lc3_sns_lfcb (noflash_data)
+    tables:lc3_sns_hfcb (noflash_data)
+    tables:lc3_sns_mpvq_offsets (noflash_data)
+    tables:lc3_spectrum_lookup (noflash_data)
+    tables:lc3_spectrum_models (noflash_data)
+    tables:lc3_spectrum_bits (noflash_data)
+    tables:lc3_tns_order_models (noflash_data)
+    tables:lc3_tns_order_bits (noflash_data)
+    tables:lc3_tns_coeffs_models (noflash_data)
+    tables:lc3_tns_coeffs_bits (noflash_data)
+    ltpf:h_48k_12k8_q15 (noflash_data)
+    sns:dct16_m (noflash_data)

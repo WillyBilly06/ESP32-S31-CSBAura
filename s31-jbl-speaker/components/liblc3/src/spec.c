@@ -34,7 +34,22 @@ static int resolve_gain_offset(enum lc3_srate sr, int nbytes)
 {
     int sr_ind = lc3_hr(sr) ? 4 + (sr - LC3_SRATE_48K_HR) : sr;
 
-    int g_off = (nbytes * 8) / (10 * (1 + sr_ind));
+    /* `(nbytes * 8) / (10 * (1 + sr_ind))`, with constant divisors
+     * (multiply-high instead of a run-time division) */
+
+    unsigned nbits = nbytes * 8;
+    int g_off;
+
+    switch (sr_ind) {
+        case 4 : g_off = nbits / 50; break;
+        case 0 : g_off = nbits / 10; break;
+        case 1 : g_off = nbits / 20; break;
+        case 2 : g_off = nbits / 30; break;
+        case 3 : g_off = nbits / 40; break;
+        case 5 : g_off = nbits / 60; break;
+        default: g_off = nbits / 70; break;
+    }
+
     return LC3_MIN(sr >= LC3_SRATE_96K_HR ? 181 : 255,
         105 + 5*(1 + sr_ind) + LC3_MIN(g_off, 115));
 }
@@ -206,21 +221,34 @@ LC3_HOT static int adjust_gain(
         { 680, 2600, 4250 }, { 830, 3125, 5100 }
     }[sr];
 
-    int delta, den = 48;
+    int delta;
 
     if (nbits < t[0]) {
-        delta = 3*(nbits + 48);
+        delta = (3*(nbits + 48) + 24) / 48;
 
     } else if (nbits < t[1]) {
         int n0 = 3*(t[0] + 48), range = t[1] - t[0];
-        delta = n0 * range + (nbits - t[0]) * (t[1] - n0);
-        den *= range;
+        unsigned num = n0 * range + (nbits - t[0]) * (t[1] - n0);
+
+        /* `(num + 24 range) / (48 range)`, the numerator is positive.
+         * Constant divisors by samplerate (multiply-high instead of a
+         * run-time division), with `range = t[1] - t[0]` of the table. */
+
+        num += 24 * range;
+
+        switch (sr) {
+            case LC3_SRATE_48K   :
+            case LC3_SRATE_48K_HR: delta = num / (48 * (2600 - 680)); break;
+            case LC3_SRATE_8K    : delta = num / (48 * ( 500 -  80)); break;
+            case LC3_SRATE_16K   : delta = num / (48 * (1025 - 230)); break;
+            case LC3_SRATE_24K   : delta = num / (48 * (1550 - 380)); break;
+            case LC3_SRATE_32K   : delta = num / (48 * (2075 - 530)); break;
+            default              : delta = num / (48 * (3125 - 830)); break;
+        }
 
     } else {
-        delta = LC3_MIN(nbits, t[2]);
+        delta = (LC3_MIN(nbits, t[2]) + 24) / 48;
     }
-
-    delta = (delta + den/2) / den;
 
     /* --- Adjust gain --- */
 
@@ -406,7 +434,7 @@ LC3_HOT static int compute_nbits(
     if (nbits_budget >= INT_MAX)
         nbits_end += nbits_lsb * 2048;
 
-    return (nbits_end + 2047) / 2048;
+    return (nbits_end + 2047) >> 11;    /* `nbits_end` >= 0 */
 }
 
 /**

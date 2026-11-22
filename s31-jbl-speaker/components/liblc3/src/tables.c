@@ -82,8 +82,7 @@ const int lc3_frame_bytes_hr_lim
  *     cos(-2Pi * 2i/N) + j sin(-2Pi * 2i/N) } , N=15, 45
  */
 
-static const struct lc3_fft_bf3_twiddles fft_twiddles_15 = {
-    .n3 = 15/3, .t = (const struct lc3_complex [][2]){
+static const struct lc3_complex fft_twiddles_15_t[][2] = {
         { {  1.0000000e+0, -0.0000000e+0 }, {  1.0000000e+0, -0.0000000e+0 } },
         { {  9.1354546e-1, -4.0673664e-1 }, {  6.6913061e-1, -7.4314483e-1 } },
         { {  6.6913061e-1, -7.4314483e-1 }, { -1.0452846e-1, -9.9452190e-1 } },
@@ -99,11 +98,13 @@ static const struct lc3_fft_bf3_twiddles fft_twiddles_15 = {
         { {  3.0901699e-1,  9.5105652e-1 }, { -8.0901699e-1,  5.8778525e-1 } },
         { {  6.6913061e-1,  7.4314483e-1 }, { -1.0452846e-1,  9.9452190e-1 } },
         { {  9.1354546e-1,  4.0673664e-1 }, {  6.6913061e-1,  7.4314483e-1 } },
-    }
 };
 
-static const struct lc3_fft_bf3_twiddles fft_twiddles_45 = {
-    .n3 = 45/3, .t = (const struct lc3_complex [][2]){
+static const struct lc3_fft_bf3_twiddles fft_twiddles_15 = {
+    .n3 = 15/3, .t = fft_twiddles_15_t
+};
+
+static const struct lc3_complex fft_twiddles_45_t[][2] = {
         { {  1.0000000e+0, -0.0000000e+0 }, {  1.0000000e+0, -0.0000000e+0 } },
         { {  9.9026807e-1, -1.3917310e-1 }, {  9.6126170e-1, -2.7563736e-1 } },
         { {  9.6126170e-1, -2.7563736e-1 }, {  8.4804810e-1, -5.2991926e-1 } },
@@ -149,10 +150,13 @@ static const struct lc3_fft_bf3_twiddles fft_twiddles_45 = {
         { {  9.1354546e-1,  4.0673664e-1 }, {  6.6913061e-1,  7.4314483e-1 } },
         { {  9.6126170e-1,  2.7563736e-1 }, {  8.4804810e-1,  5.2991926e-1 } },
         { {  9.9026807e-1,  1.3917310e-1 }, {  9.6126170e-1,  2.7563736e-1 } },
-    }
 };
 
-const struct lc3_fft_bf3_twiddles *lc3_fft_twiddles_bf3[] =
+static const struct lc3_fft_bf3_twiddles fft_twiddles_45 = {
+    .n3 = 45/3, .t = fft_twiddles_45_t
+};
+
+const struct lc3_fft_bf3_twiddles * const lc3_fft_twiddles_bf3[] =
     { &fft_twiddles_15, &fft_twiddles_45 };
 
 
@@ -163,26 +167,29 @@ const struct lc3_fft_bf3_twiddles *lc3_fft_twiddles_bf3[] =
  *   cos(-2Pi * i/N) + j sin(-2Pi * i/N) , N=10, 20, ...
  */
 
-static const struct lc3_fft_bf2_twiddles fft_twiddles_10 = {
-    .n2 = 10/2, .t = (const struct lc3_complex []){
+static const struct lc3_complex fft_twiddles_10_t[] = {
         {  1.0000000e+00, -0.0000000e+00 }, {  8.0901699e-01, -5.8778525e-01 },
         {  3.0901699e-01, -9.5105652e-01 }, { -3.0901699e-01, -9.5105652e-01 },
         { -8.0901699e-01, -5.8778525e-01 },
-    }
 };
 
-static const struct lc3_fft_bf2_twiddles fft_twiddles_20 = {
-    .n2 = 20/2, .t = (const struct lc3_complex []){
+static const struct lc3_fft_bf2_twiddles fft_twiddles_10 = {
+    .n2 = 10/2, .t = fft_twiddles_10_t
+};
+
+static const struct lc3_complex fft_twiddles_20_t[] = {
         {  1.0000000e+00, -0.0000000e+00 }, {  9.5105652e-01, -3.0901699e-01 },
         {  8.0901699e-01, -5.8778525e-01 }, {  5.8778525e-01, -8.0901699e-01 },
         {  3.0901699e-01, -9.5105652e-01 }, {  6.1232340e-17, -1.0000000e+00 },
         { -3.0901699e-01, -9.5105652e-01 }, { -5.8778525e-01, -8.0901699e-01 },
         { -8.0901699e-01, -5.8778525e-01 }, { -9.5105652e-01, -3.0901699e-01 },
-    }
 };
 
-static const struct lc3_fft_bf2_twiddles fft_twiddles_30 = {
-    .n2 = 30/2, .t = (const struct lc3_complex []){
+static const struct lc3_fft_bf2_twiddles fft_twiddles_20 = {
+    .n2 = 20/2, .t = fft_twiddles_20_t
+};
+
+static const struct lc3_complex fft_twiddles_30_t[] = {
         {  1.0000000e+00, -0.0000000e+00 }, {  9.7814760e-01, -2.0791169e-01 },
         {  9.1354546e-01, -4.0673664e-01 }, {  8.0901699e-01, -5.8778525e-01 },
         {  6.6913061e-01, -7.4314483e-01 }, {  5.0000000e-01, -8.6602540e-01 },
@@ -191,11 +198,13 @@ static const struct lc3_fft_bf2_twiddles fft_twiddles_30 = {
         { -5.0000000e-01, -8.6602540e-01 }, { -6.6913061e-01, -7.4314483e-01 },
         { -8.0901699e-01, -5.8778525e-01 }, { -9.1354546e-01, -4.0673664e-01 },
         { -9.7814760e-01, -2.0791169e-01 },
-    }
 };
 
-static const struct lc3_fft_bf2_twiddles fft_twiddles_40 = {
-    .n2 = 40/2, .t = (const struct lc3_complex []){
+static const struct lc3_fft_bf2_twiddles fft_twiddles_30 = {
+    .n2 = 30/2, .t = fft_twiddles_30_t
+};
+
+static const struct lc3_complex fft_twiddles_40_t[] = {
         {  1.0000000e+00, -0.0000000e+00 }, {  9.8768834e-01, -1.5643447e-01 },
         {  9.5105652e-01, -3.0901699e-01 }, {  8.9100652e-01, -4.5399050e-01 },
         {  8.0901699e-01, -5.8778525e-01 }, {  7.0710678e-01, -7.0710678e-01 },
@@ -206,11 +215,13 @@ static const struct lc3_fft_bf2_twiddles fft_twiddles_40 = {
         { -5.8778525e-01, -8.0901699e-01 }, { -7.0710678e-01, -7.0710678e-01 },
         { -8.0901699e-01, -5.8778525e-01 }, { -8.9100652e-01, -4.5399050e-01 },
         { -9.5105652e-01, -3.0901699e-01 }, { -9.8768834e-01, -1.5643447e-01 },
-    }
 };
 
-static const struct lc3_fft_bf2_twiddles fft_twiddles_60 = {
-    .n2 = 60/2, .t = (const struct lc3_complex []){
+static const struct lc3_fft_bf2_twiddles fft_twiddles_40 = {
+    .n2 = 40/2, .t = fft_twiddles_40_t
+};
+
+static const struct lc3_complex fft_twiddles_60_t[] = {
         {  1.0000000e+00, -0.0000000e+00 }, {  9.9452190e-01, -1.0452846e-01 },
         {  9.7814760e-01, -2.0791169e-01 }, {  9.5105652e-01, -3.0901699e-01 },
         {  9.1354546e-01, -4.0673664e-01 }, {  8.6602540e-01, -5.0000000e-01 },
@@ -226,11 +237,13 @@ static const struct lc3_fft_bf2_twiddles fft_twiddles_60 = {
         { -8.0901699e-01, -5.8778525e-01 }, { -8.6602540e-01, -5.0000000e-01 },
         { -9.1354546e-01, -4.0673664e-01 }, { -9.5105652e-01, -3.0901699e-01 },
         { -9.7814760e-01, -2.0791169e-01 }, { -9.9452190e-01, -1.0452846e-01 },
-    }
 };
 
-static const struct lc3_fft_bf2_twiddles fft_twiddles_80 = {
-    .n2 = 80/2, .t = (const struct lc3_complex []){
+static const struct lc3_fft_bf2_twiddles fft_twiddles_60 = {
+    .n2 = 60/2, .t = fft_twiddles_60_t
+};
+
+static const struct lc3_complex fft_twiddles_80_t[] = {
         {  1.0000000e+00, -0.0000000e+00 }, {  9.9691733e-01, -7.8459096e-02 },
         {  9.8768834e-01, -1.5643447e-01 }, {  9.7236992e-01, -2.3344536e-01 },
         {  9.5105652e-01, -3.0901699e-01 }, {  9.2387953e-01, -3.8268343e-01 },
@@ -251,11 +264,13 @@ static const struct lc3_fft_bf2_twiddles fft_twiddles_80 = {
         { -8.9100652e-01, -4.5399050e-01 }, { -9.2387953e-01, -3.8268343e-01 },
         { -9.5105652e-01, -3.0901699e-01 }, { -9.7236992e-01, -2.3344536e-01 },
         { -9.8768834e-01, -1.5643447e-01 }, { -9.9691733e-01, -7.8459096e-02 },
-    }
 };
 
-static const struct lc3_fft_bf2_twiddles fft_twiddles_90 = {
-    .n2 = 90/2, .t = (const struct lc3_complex []){
+static const struct lc3_fft_bf2_twiddles fft_twiddles_80 = {
+    .n2 = 80/2, .t = fft_twiddles_80_t
+};
+
+static const struct lc3_complex fft_twiddles_90_t[] = {
         {  1.0000000e+00, -0.0000000e+00 }, {  9.9756405e-01, -6.9756474e-02 },
         {  9.9026807e-01, -1.3917310e-01 }, {  9.7814760e-01, -2.0791169e-01 },
         {  9.6126170e-01, -2.7563736e-01 }, {  9.3969262e-01, -3.4202014e-01 },
@@ -279,11 +294,13 @@ static const struct lc3_fft_bf2_twiddles fft_twiddles_90 = {
         { -9.3969262e-01, -3.4202014e-01 }, { -9.6126170e-01, -2.7563736e-01 },
         { -9.7814760e-01, -2.0791169e-01 }, { -9.9026807e-01, -1.3917310e-01 },
         { -9.9756405e-01, -6.9756474e-02 },
-    }
 };
 
-static const struct lc3_fft_bf2_twiddles fft_twiddles_120 = {
-    .n2 = 120/2, .t = (const struct lc3_complex []){
+static const struct lc3_fft_bf2_twiddles fft_twiddles_90 = {
+    .n2 = 90/2, .t = fft_twiddles_90_t
+};
+
+static const struct lc3_complex fft_twiddles_120_t[] = {
         {  1.0000000e+00, -0.0000000e+00 }, {  9.9862953e-01, -5.2335956e-02 },
         {  9.9452190e-01, -1.0452846e-01 }, {  9.8768834e-01, -1.5643447e-01 },
         {  9.7814760e-01, -2.0791169e-01 }, {  9.6592583e-01, -2.5881905e-01 },
@@ -314,11 +331,13 @@ static const struct lc3_fft_bf2_twiddles fft_twiddles_120 = {
         { -9.5105652e-01, -3.0901699e-01 }, { -9.6592583e-01, -2.5881905e-01 },
         { -9.7814760e-01, -2.0791169e-01 }, { -9.8768834e-01, -1.5643447e-01 },
         { -9.9452190e-01, -1.0452846e-01 }, { -9.9862953e-01, -5.2335956e-02 },
-    }
 };
 
-static const struct lc3_fft_bf2_twiddles fft_twiddles_160 = {
-    .n2 = 160/2, .t = (const struct lc3_complex []){
+static const struct lc3_fft_bf2_twiddles fft_twiddles_120 = {
+    .n2 = 120/2, .t = fft_twiddles_120_t
+};
+
+static const struct lc3_complex fft_twiddles_160_t[] = {
         {  1.0000000e+00, -0.0000000e+00 }, {  9.9922904e-01, -3.9259816e-02 },
         {  9.9691733e-01, -7.8459096e-02 }, {  9.9306846e-01, -1.1753740e-01 },
         {  9.8768834e-01, -1.5643447e-01 }, {  9.8078528e-01, -1.9509032e-01 },
@@ -359,11 +378,13 @@ static const struct lc3_fft_bf2_twiddles fft_twiddles_160 = {
         { -9.7236992e-01, -2.3344536e-01 }, { -9.8078528e-01, -1.9509032e-01 },
         { -9.8768834e-01, -1.5643447e-01 }, { -9.9306846e-01, -1.1753740e-01 },
         { -9.9691733e-01, -7.8459096e-02 }, { -9.9922904e-01, -3.9259816e-02 },
-    }
 };
 
-static const struct lc3_fft_bf2_twiddles fft_twiddles_180 = {
-    .n2 = 180/2, .t = (const struct lc3_complex []){
+static const struct lc3_fft_bf2_twiddles fft_twiddles_160 = {
+    .n2 = 160/2, .t = fft_twiddles_160_t
+};
+
+static const struct lc3_complex fft_twiddles_180_t[] = {
         {  1.0000000e+00, -0.0000000e+00 }, {  9.9939083e-01, -3.4899497e-02 },
         {  9.9756405e-01, -6.9756474e-02 }, {  9.9452190e-01, -1.0452846e-01 },
         {  9.9026807e-01, -1.3917310e-01 }, {  9.8480775e-01, -1.7364818e-01 },
@@ -409,11 +430,13 @@ static const struct lc3_fft_bf2_twiddles fft_twiddles_180 = {
         { -9.7814760e-01, -2.0791169e-01 }, { -9.8480775e-01, -1.7364818e-01 },
         { -9.9026807e-01, -1.3917310e-01 }, { -9.9452190e-01, -1.0452846e-01 },
         { -9.9756405e-01, -6.9756474e-02 }, { -9.9939083e-01, -3.4899497e-02 },
-    }
 };
 
-static const struct lc3_fft_bf2_twiddles fft_twiddles_240 = {
-    .n2 = 240/2, .t = (const struct lc3_complex []){
+static const struct lc3_fft_bf2_twiddles fft_twiddles_180 = {
+    .n2 = 180/2, .t = fft_twiddles_180_t
+};
+
+static const struct lc3_complex fft_twiddles_240_t[] = {
         {  1.0000000e+00, -0.0000000e+00 }, {  9.9965732e-01, -2.6176948e-02 },
         {  9.9862953e-01, -5.2335956e-02 }, {  9.9691733e-01, -7.8459096e-02 },
         {  9.9452190e-01, -1.0452846e-01 }, {  9.9144486e-01, -1.3052619e-01 },
@@ -474,13 +497,15 @@ static const struct lc3_fft_bf2_twiddles fft_twiddles_240 = {
         { -9.8768834e-01, -1.5643447e-01 }, { -9.9144486e-01, -1.3052619e-01 },
         { -9.9452190e-01, -1.0452846e-01 }, { -9.9691733e-01, -7.8459096e-02 },
         { -9.9862953e-01, -5.2335956e-02 }, { -9.9965732e-01, -2.6176948e-02 },
-    }
+};
+
+static const struct lc3_fft_bf2_twiddles fft_twiddles_240 = {
+    .n2 = 240/2, .t = fft_twiddles_240_t
 };
 
 #if LC3_PLUS_HR
 
-static const struct lc3_fft_bf2_twiddles fft_twiddles_480 = {
-    .n2 = 480/2, .t = (const struct lc3_complex []){
+static const struct lc3_complex fft_twiddles_480_t[] = {
         {  1.0000000e+00, -0.0000000e+00 }, {  9.9991433e-01, -1.3089596e-02 },
         {  9.9965732e-01, -2.6176948e-02 }, {  9.9922904e-01, -3.9259816e-02 },
         {  9.9862953e-01, -5.2335956e-02 }, {  9.9785892e-01, -6.5403129e-02 },
@@ -601,12 +626,15 @@ static const struct lc3_fft_bf2_twiddles fft_twiddles_480 = {
         { -9.9691733e-01, -7.8459096e-02 }, { -9.9785892e-01, -6.5403129e-02 },
         { -9.9862953e-01, -5.2335956e-02 }, { -9.9922904e-01, -3.9259816e-02 },
         { -9.9965732e-01, -2.6176948e-02 }, { -9.9991433e-01, -1.3089596e-02 },
-    }
+};
+
+static const struct lc3_fft_bf2_twiddles fft_twiddles_480 = {
+    .n2 = 480/2, .t = fft_twiddles_480_t
 };
 
 #endif /* LC3_PLUS_HR */
 
-const struct lc3_fft_bf2_twiddles *lc3_fft_twiddles_bf2[][3] = {
+const struct lc3_fft_bf2_twiddles * const lc3_fft_twiddles_bf2[][3] = {
     { &fft_twiddles_10 , &fft_twiddles_30 , &fft_twiddles_90  },
     { &fft_twiddles_20 , &fft_twiddles_60 , &fft_twiddles_180 },
     { &fft_twiddles_40 , &fft_twiddles_120 },
@@ -624,18 +652,19 @@ const struct lc3_fft_bf2_twiddles *lc3_fft_twiddles_bf2[][3] = {
 
 #if LC3_PLUS
 
-static const struct lc3_mdct_rot_def mdct_rot_40 = {
-    .n4 = 40/4, .w = (const struct lc3_complex []){
+static const struct lc3_complex mdct_rot_40_t[] = {
         { 5.6223293e-01, 1.1040837e-02 }, { 5.5358374e-01, 9.8857513e-02 },
         { 5.3130348e-01, 1.8423999e-01 }, { 4.9594077e-01, 2.6508587e-01 },
         { 4.4836635e-01, 3.3940445e-01 }, { 3.8975167e-01, 4.0536577e-01 },
         { 3.2154000e-01, 4.6134563e-01 }, { 2.4541095e-01, 5.0596564e-01 },
         { 1.6323907e-01, 5.3812710e-01 }, { 7.7047702e-02, 5.5703808e-01 },
-    }
 };
 
-static const struct lc3_mdct_rot_def mdct_rot_80 = {
-    .n4 = 80/4, .w = (const struct lc3_complex []){
+static const struct lc3_mdct_rot_def mdct_rot_40 = {
+    .n4 = 40/4, .w = mdct_rot_40_t
+};
+
+static const struct lc3_complex mdct_rot_80_t[] = {
         { 4.7284802e-01, 4.6423237e-03 }, { 4.7102615e-01, 4.1727241e-02 },
         { 4.6630025e-01, 7.8554895e-02 }, { 4.5869946e-01, 1.1489823e-01 },
         { 4.4827063e-01, 1.5053319e-01 }, { 4.3507806e-01, 1.8524005e-01 },
@@ -646,13 +675,15 @@ static const struct lc3_mdct_rot_def mdct_rot_80 = {
         { 2.1053217e-01, 4.2341824e-01 }, { 1.7666215e-01, 4.3863114e-01 },
         { 1.4170296e-01, 4.5113974e-01 }, { 1.0587012e-01, 4.6086692e-01 },
         { 6.9384558e-02, 4.6775269e-01 }, { 3.2471215e-02, 4.7175462e-01 },
-    }
+};
+
+static const struct lc3_mdct_rot_def mdct_rot_80 = {
+    .n4 = 80/4, .w = mdct_rot_80_t
 };
 
 #endif /* LC3_PLUS */
 
-static const struct lc3_mdct_rot_def mdct_rot_120 = {
-    .n4 = 120/4, .w = (const struct lc3_complex []){
+static const struct lc3_complex mdct_rot_120_t[] = {
         { 4.2727785e-01, 2.7965670e-03 }, { 4.2654592e-01, 2.5154729e-02 },
         { 4.2464486e-01, 4.7443945e-02 }, { 4.2157988e-01, 6.9603119e-02 },
         { 4.1735937e-01, 9.1571516e-02 }, { 4.1199491e-01, 1.1328892e-01 },
@@ -668,11 +699,13 @@ static const struct lc3_mdct_rot_def mdct_rot_120 = {
         { 1.2937643e-01, 4.0722957e-01 }, { 1.0788637e-01, 4.1344252e-01 },
         { 8.6100606e-02, 4.1852225e-01 }, { 6.4078846e-02, 4.2245483e-01 },
         { 4.1881450e-02, 4.2522950e-01 }, { 1.9569261e-02, 4.2683865e-01 },
-    }
 };
 
-static const struct lc3_mdct_rot_def mdct_rot_160 = {
-    .n4 = 160/4, .w = (const struct lc3_complex []){
+static const struct lc3_mdct_rot_def mdct_rot_120 = {
+    .n4 = 120/4, .w = mdct_rot_120_t
+};
+
+static const struct lc3_complex mdct_rot_160_t[] = {
         { 3.9763057e-01, 1.9518802e-03 }, { 3.9724738e-01, 1.7561278e-02 },
         { 3.9625167e-01, 3.3143598e-02 }, { 3.9464496e-01, 4.8674813e-02 },
         { 3.9242974e-01, 6.4130975e-02 }, { 3.8960942e-01, 7.9488252e-02 },
@@ -693,11 +726,13 @@ static const struct lc3_mdct_rot_def mdct_rot_160 = {
         { 9.0927064e-02, 3.8709967e-01 }, { 7.5659501e-02, 3.9037101e-01 },
         { 6.0275277e-02, 3.9304042e-01 }, { 4.4798112e-02, 3.9510380e-01 },
         { 2.9251872e-02, 3.9655795e-01 }, { 1.3660528e-02, 3.9740065e-01 },
-    }
 };
 
-static const struct lc3_mdct_rot_def mdct_rot_240 = {
-    .n4 = 240/4, .w = (const struct lc3_complex []){
+static const struct lc3_mdct_rot_def mdct_rot_160 = {
+    .n4 = 160/4, .w = mdct_rot_160_t
+};
+
+static const struct lc3_complex mdct_rot_240_t[] = {
         { 3.5930219e-01, 1.1758179e-03 }, { 3.5914828e-01, 1.0580850e-02 },
         { 3.5874824e-01, 1.9978630e-02 }, { 3.5810233e-01, 2.9362718e-02 },
         { 3.5721099e-01, 3.8726682e-02 }, { 3.5607483e-01, 4.8064105e-02 },
@@ -728,11 +763,13 @@ static const struct lc3_mdct_rot_def mdct_rot_240 = {
         { 5.5045904e-02, 3.5506252e-01 }, { 4.5732588e-02, 3.5638178e-01 },
         { 3.6387929e-02, 3.5745680e-01 }, { 2.7018332e-02, 3.5828683e-01 },
         { 1.7630217e-02, 3.5887131e-01 }, { 8.2300199e-03, 3.5920984e-01 },
-    }
 };
 
-static const struct lc3_mdct_rot_def mdct_rot_320 = {
-    .n4 = 320/4, .w = (const struct lc3_complex []){
+static const struct lc3_mdct_rot_def mdct_rot_240 = {
+    .n4 = 240/4, .w = mdct_rot_240_t
+};
+
+static const struct lc3_complex mdct_rot_320_t[] = {
         { 3.3436915e-01, 8.2066700e-04 }, { 3.3428858e-01, 7.3854098e-03 },
         { 3.3407914e-01, 1.3947305e-02 }, { 3.3374091e-01, 2.0503824e-02 },
         { 3.3327401e-01, 2.7052438e-02 }, { 3.3267863e-01, 3.3590623e-02 },
@@ -773,11 +810,13 @@ static const struct lc3_mdct_rot_def mdct_rot_320 = {
         { 3.8485901e-02, 3.3214791e-01 }, { 3.1957192e-02, 3.3283951e-01 },
         { 2.5416164e-02, 3.3340279e-01 }, { 1.8865337e-02, 3.3383753e-01 },
         { 1.2307237e-02, 3.3414358e-01 }, { 5.7443922e-03, 3.3432081e-01 },
-    }
 };
 
-static const struct lc3_mdct_rot_def mdct_rot_360 = {
-    .n4 = 360/4, .w = (const struct lc3_complex []){
+static const struct lc3_mdct_rot_def mdct_rot_320 = {
+    .n4 = 320/4, .w = mdct_rot_320_t
+};
+
+static const struct lc3_complex mdct_rot_360_t[] = {
         { 3.2466714e-01, 7.0831495e-04 }, { 3.2460533e-01, 6.3744300e-03 },
         { 3.2444464e-01, 1.2038603e-02 }, { 3.2418513e-01, 1.7699110e-02 },
         { 3.2382686e-01, 2.3354225e-02 }, { 3.2336995e-01, 2.9002226e-02 },
@@ -823,11 +862,13 @@ static const struct lc3_mdct_rot_def mdct_rot_360 = {
         { 3.3232523e-02, 3.2296262e-01 }, { 2.7590986e-02, 3.2349342e-01 },
         { 2.1941045e-02, 3.2392568e-01 }, { 1.6284421e-02, 3.2425927e-01 },
         { 1.0622836e-02, 3.2449408e-01 }, { 4.9580159e-03, 3.2463006e-01 },
-    }
 };
 
-static const struct lc3_mdct_rot_def mdct_rot_480 = {
-    .n4 = 480/4, .w = (const struct lc3_complex []){
+static const struct lc3_mdct_rot_def mdct_rot_360 = {
+    .n4 = 360/4, .w = mdct_rot_360_t
+};
+
+static const struct lc3_complex mdct_rot_480_t[] = {
         { 3.0213714e-01, 4.9437117e-04 }, { 3.0210478e-01, 4.4491817e-03 },
         { 3.0202066e-01, 8.4032299e-03 }, { 3.0188479e-01, 1.2355838e-02 },
         { 3.0169719e-01, 1.6306330e-02 }, { 3.0145790e-01, 2.0254027e-02 },
@@ -888,11 +929,13 @@ static const struct lc3_mdct_rot_def mdct_rot_480 = {
         { 2.3212559e-02, 3.0124454e-01 }, { 1.9267401e-02, 3.0152257e-01 },
         { 1.5318942e-02, 3.0174894e-01 }, { 1.1367858e-02, 3.0192361e-01 },
         { 7.4148264e-03, 3.0204654e-01 }, { 3.4605241e-03, 3.0211772e-01 },
-    }
 };
 
-static const struct lc3_mdct_rot_def mdct_rot_640 = {
-    .n4 = 640/4, .w = (const struct lc3_complex []){
+static const struct lc3_mdct_rot_def mdct_rot_480 = {
+    .n4 = 480/4, .w = mdct_rot_480_t
+};
+
+static const struct lc3_complex mdct_rot_640_t[] = {
         { 2.8117045e-01, 3.4504823e-04 }, { 2.8115351e-01, 3.1053717e-03 },
         { 2.8110948e-01, 5.8653959e-03 }, { 2.8103835e-01, 8.6248547e-03 },
         { 2.8094013e-01, 1.1383482e-02 }, { 2.8081484e-01, 1.4141013e-02 },
@@ -973,11 +1016,13 @@ static const struct lc3_mdct_rot_def mdct_rot_640 = {
         { 1.6208281e-02, 2.8070310e-01 }, { 1.3451748e-02, 2.8084870e-01 },
         { 1.0693918e-02, 2.8096723e-01 }, { 7.9350576e-03, 2.8105867e-01 },
         { 5.1754324e-03, 2.8112303e-01 }, { 2.4153085e-03, 2.8116029e-01 },
-    }
 };
 
-static const struct lc3_mdct_rot_def mdct_rot_720 = {
-    .n4 = 720/4, .w = (const struct lc3_complex []){
+static const struct lc3_mdct_rot_def mdct_rot_640 = {
+    .n4 = 640/4, .w = mdct_rot_640_t
+};
+
+static const struct lc3_complex mdct_rot_720_t[] = {
         { 2.7301192e-01, 2.9780993e-04 }, { 2.7299893e-01, 2.6802468e-03 },
         { 2.7296515e-01, 5.0624796e-03 }, { 2.7291057e-01, 7.4443269e-03 },
         { 2.7283522e-01, 9.8256072e-03 }, { 2.7273909e-01, 1.2206139e-02 },
@@ -1068,11 +1113,13 @@ static const struct lc3_mdct_rot_def mdct_rot_720 = {
         { 1.3990938e-02, 2.7265336e-01 }, { 1.1611086e-02, 2.7276507e-01 },
         { 9.2303502e-03, 2.7285601e-01 }, { 6.8489111e-03, 2.7292617e-01 },
         { 4.4669505e-03, 2.7297554e-01 }, { 2.0846497e-03, 2.7300413e-01 },
-    }
 };
 
-static const struct lc3_mdct_rot_def mdct_rot_960 = {
-    .n4 = 960/4, .w = (const struct lc3_complex []){
+static const struct lc3_mdct_rot_def mdct_rot_720 = {
+    .n4 = 720/4, .w = mdct_rot_720_t
+};
+
+static const struct lc3_complex mdct_rot_960_t[] = {
         { 2.5406629e-01, 2.0785754e-04 }, { 2.5405949e-01, 1.8707012e-03 },
         { 2.5404180e-01, 3.5334647e-03 }, { 2.5401323e-01, 5.1960769e-03 },
         { 2.5397379e-01, 6.8584664e-03 }, { 2.5392346e-01, 8.5205622e-03 },
@@ -1193,13 +1240,15 @@ static const struct lc3_mdct_rot_def mdct_rot_960 = {
         { 9.7668984e-03, 2.5387857e-01 }, { 8.1050697e-03, 2.5393706e-01 },
         { 6.4428938e-03, 2.5398467e-01 }, { 4.7804419e-03, 2.5402140e-01 },
         { 3.1177852e-03, 2.5404724e-01 }, { 1.4549950e-03, 2.5406221e-01 },
-    }
+};
+
+static const struct lc3_mdct_rot_def mdct_rot_960 = {
+    .n4 = 960/4, .w = mdct_rot_960_t
 };
 
 #if LC3_PLUS_HR
 
-static const struct lc3_mdct_rot_def mdct_rot_1920 = {
-    .n4 = 1920/4, .w = (const struct lc3_complex []){
+static const struct lc3_complex mdct_rot_1920_t[] = {
         { 2.1364349e-01, 8.7393339e-05 }, { 2.1364206e-01, 7.8653829e-04 },
         { 2.1363834e-01, 1.4856748e-03 }, { 2.1363233e-01, 2.1847954e-03 },
         { 2.1362404e-01, 2.8838927e-03 }, { 2.1361346e-01, 3.5829590e-03 },
@@ -1440,12 +1489,15 @@ static const struct lc3_mdct_rot_def mdct_rot_1920 = {
         { 4.1072340e-03, 2.1360402e-01 }, { 3.4081957e-03, 2.1361632e-01 },
         { 2.7091210e-03, 2.1362633e-01 }, { 2.0100172e-03, 2.1363405e-01 },
         { 1.3108919e-03, 2.1363948e-01 }, { 6.1175255e-04, 2.1364263e-01 },
-    }
+};
+
+static const struct lc3_mdct_rot_def mdct_rot_1920 = {
+    .n4 = 1920/4, .w = mdct_rot_1920_t
 };
 
 #endif /* LC3_PLUS_HR */
 
-const struct lc3_mdct_rot_def * lc3_mdct_rot[LC3_NUM_DT][LC3_NUM_SRATE] = {
+const struct lc3_mdct_rot_def * const lc3_mdct_rot[LC3_NUM_DT][LC3_NUM_SRATE] = {
 
     [LC3_DT_2M5] = {
         LC3_IF_PLUS(&mdct_rot_40, NULL),
@@ -4037,7 +4089,7 @@ static const float mdct_win_10m_96k_hr[__LC3_MDCT_WIN_LEN(10000, 96000)] = {
 
 #undef __LC3_MDCT_WIN_LEN
 
-const float *lc3_mdct_win[LC3_NUM_DT][LC3_NUM_SRATE] = {
+const float * const lc3_mdct_win[LC3_NUM_DT][LC3_NUM_SRATE] = {
 
     [LC3_DT_2M5] = {
         LC3_IF_PLUS( mdct_win_2m5_8k , NULL ),
@@ -4322,7 +4374,7 @@ static const int band_lim_10m_96k_hr[] = {
 
 #endif /* LC3_PLUS_HR */
 
-const int *lc3_band_lim[LC3_NUM_DT][LC3_NUM_SRATE] = {
+const int * const lc3_band_lim[LC3_NUM_DT][LC3_NUM_SRATE] = {
 
     [LC3_DT_2M5] = {
         LC3_IF_PLUS( band_lim_2m5_8k , NULL ),
@@ -4752,7 +4804,7 @@ const uint16_t lc3_tns_coeffs_bits[][17] = {
  *      - remove of first 0 den coefficients
  */
 
-const float *lc3_ltpf_cnum[LC3_NUM_SRATE][4] = {
+const float * const lc3_ltpf_cnum[LC3_NUM_SRATE][4] = {
 
     [LC3_SRATE_8K] = {
         (const float []){
@@ -4826,7 +4878,7 @@ const float *lc3_ltpf_cnum[LC3_NUM_SRATE][4] = {
     }
 };
 
-const float *lc3_ltpf_cden[LC3_NUM_SRATE][4] = {
+const float * const lc3_ltpf_cden[LC3_NUM_SRATE][4] = {
 
     [LC3_SRATE_8K] = {
         (const float []){
