@@ -14,3 +14,6 @@ bool party_listening(void);        /* any thread */
 bool party_auracast_enabled(void); /* any thread: Auracast button state (default on) */
 void party_set_auracast_enabled(bool on); /* any thread; applied on the next 100 ms tick */
 void party_log_stats(void);        /* any thread, every 2 s */
+/* BT thread: S31 volume buttons while listening. Steps our own output (0..127);
+ * the next master volume change takes over again. Returns false when not listening. */
+bool party_listen_volume_step(int delta);

@@ -180,6 +180,73 @@ static void blacklist(const bd_addr_t a, uint32_t ms)
     next = (next + 1) % (sizeof(s_black) / sizeof(s_black[0]));
 }
 
+/* ---- LISTEN volume ----------------------------------------------------------------
+ * The master's broadcast is full scale; its volume rides in the JBL block of its PA
+ * (TLV 02 02 <vol>, 0..100) and every member plays at it. Ours = master + our own
+ * offset: master changes move us by the same amount, the S31's buttons set how far
+ * above/below the master we sit (kept across master changes and re-syncs). */
+static volatile int s_master_vol = -1;           /* last JBL PA volume 0..100, -1 = none */
+static volatile int s_listen_offset;             /* our buttons, in 0..127 steps */
+static uint32_t st_master_vol_updates;
+
+static int master_base(void)                      /* master volume on our 0..127 scale */
+{
+    int m = s_master_vol;
+    return m < 0 ? a2dp_in_volume() : (m * 127 + 50) / 100;
+}
+
+static uint8_t listen_volume(void)
+{
+    int v = master_base() + s_listen_offset;
+    return (uint8_t)(v < 0 ? 0 : v > 127 ? 127 : v);
+}
+
+static void pa_master_volume(const uint8_t *d, uint16_t n)
+{
+    for (uint16_t i = 0; i < n;) {
+        uint8_t len = d[i];
+        if (len == 0 || (uint32_t)i + 1u + len > n) break;
+        const uint8_t *ad = d + i + 1;           /* AD type, then data */
+        if (len >= 6 && ad[0] == 0xFF && ad[1] == 0xDF && ad[2] == 0xFD && ad[3] == 0x02 && ad[4] == 0x02) {
+            int v = ad[5] > 100 ? 100 : ad[5];
+            if (v != s_master_vol) {
+                s_master_vol = v;
+                st_master_vol_updates++;
+                ESP_LOGW(TAG, "master volume %d/100 -> our output %u/127 (offset %+d)", v, listen_volume(),
+                         s_listen_offset);
+            }
+            return;
+        }
+        i = (uint16_t)(i + 1u + len);
+    }
+}
+
+bool party_listen_volume_step(int delta)
+{
+    if (!party_listening()) return false;
+    int v = (int)listen_volume() + delta;        /* step what is heard now, clamped at the ends */
+    v = v < 0 ? 0 : v > 127 ? 127 : v;
+    s_listen_offset = v - master_base();
+    ESP_LOGW(TAG, "LISTEN volume %d/127 <- button (master %d/100, our offset %+d)", v, s_master_vol,
+             s_listen_offset);
+    return true;
+}
+
+static void listen_gain(int16_t *lr, int fs)
+{
+    static float cur = -1.0f;
+    uint8_t v = listen_volume();
+    float x = (float)v / 127.0f, target = x * x * x;  /* same curve as the phone volume */
+    if (cur < 0.0f) cur = target;
+    if (target == 1.0f && cur == 1.0f) return;
+    float g = cur, dg = (target - g) / (float)fs;     /* ramp: no zipper on steps */
+    for (int i = 0; i < fs; i++, g += dg) {
+        lr[2 * i] = (int16_t)lrintf((float)lr[2 * i] * g);
+        lr[2 * i + 1] = (int16_t)lrintf((float)lr[2 * i + 1] * g);
+    }
+    cur = target;
+}
+
 /* ---- audio out (decode task, core 0) -------------------------------------------- */
 static void i2s_out(const int16_t *l, const int16_t *r, int fs)
 {
@@ -188,6 +255,7 @@ static void i2s_out(const int16_t *l, const int16_t *r, int fs)
         lr[2 * i] = l[i];
         lr[2 * i + 1] = r[i];
     }
+    listen_gain(lr, fs);
     audio_out_push(AO_LISTEN, lr, fs);
 }
 
@@ -516,6 +584,7 @@ static void listen_reset(const char *why)
         audio_stop();
     }
     s_have_base = s_have_biginfo = s_biginfo_enc = false;
+    s_master_vol = -1;
     s_num_bis = 0;
     memset(s_have_seq, 0, sizeof(s_have_seq));
     if (s_role == R_LISTEN) {
@@ -653,6 +722,11 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
             set_ls(L_W4_BASE, "PA synced");
             break;
         case HCI_SUBEVENT_LE_PERIODIC_ADVERTISING_REPORT:
+            if (hci_subevent_le_periodic_advertising_report_get_sync_handle(packet) == s_pa_handle &&
+                hci_subevent_le_periodic_advertising_report_get_data_status(packet) == 0) {
+                pa_master_volume(hci_subevent_le_periodic_advertising_report_get_data(packet),
+                                 hci_subevent_le_periodic_advertising_report_get_data_length(packet));
+            }
             if (s_ls == L_W4_BASE && !s_have_base &&
                 hci_subevent_le_periodic_advertising_report_get_sync_handle(packet) == s_pa_handle &&
                 hci_subevent_le_periodic_advertising_report_get_data_status(packet) == 0 &&
@@ -902,9 +976,10 @@ void party_log_stats(void)
     static uint32_t l_rx[MAX_BIS], l_lost[MAX_BIS], l_dec, l_plc, l_qd;
     if (s_role == R_LISTEN && s_ls == L_STREAM) {
         uint32_t dn = st_dec_n ? st_dec_n : 1;
-        ESP_LOGW(TAG, "LISTEN decode: avg %lu us max %lu us (%lu calls) | mono fills %lu, seq drops %lu",
+        ESP_LOGW(TAG, "LISTEN decode: avg %lu us max %lu us (%lu calls) | mono fills %lu, seq drops %lu | volume %d/127 (master %d/100, offset %+d, %lu changes)",
                  (unsigned long)(st_dec_us / dn), (unsigned long)st_dec_max_us, (unsigned long)st_dec_n,
-                 (unsigned long)st_mono_fill, (unsigned long)st_seq_drop);
+                 (unsigned long)st_mono_fill, (unsigned long)st_seq_drop,
+                 (int)listen_volume(), s_master_vol, s_listen_offset, (unsigned long)st_master_vol_updates);
         st_dec_us = st_dec_n = st_dec_max_us = 0;
         ESP_LOGW(TAG, "LISTEN '%s' 2s: BIS1 rx %lu lost %lu gaps %lu | BIS2 rx %lu lost %lu gaps %lu | decoded %lu PLC %lu errors %lu | q drops %lu, I2S late %lu",
                  s_cand_name,

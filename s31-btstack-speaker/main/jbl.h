@@ -29,7 +29,7 @@ extern "C" {
 #define JBL_PARTY_INFO_HOST      0xB440u   /* on, Party, connected, PRIMARY */
 #define JBL_PARTY_INFO_LOOKING   0xAA40u   /* on, Party, connecting, SECONDARY */
 #define JBL_PARTY_INFO_SECONDARY 0xB240u   /* on, Party, connected, SECONDARY */
-#define JBL_PARTY_INFO_OFF       0x0000u   /* Auracast off (b15 clear) */
+#define JBL_PARTY_INFO_OFF       0x0040u   /* Auracast off (b15 clear), as a real speaker advertises */
 
 /* BTstack thread, after a2dp_in_setup() (needs l2cap_init + sdp_init) and
  * before hci_power_control(HCI_POWER_ON). Owns sm_init(), att_server_init()

@@ -30,6 +30,7 @@
 #include "a2dp_dsp.h"
 #include "bt_sched_tune.h"
 #include "auracast.h"
+#include "party.h"
 
 static const char *TAG = "A2DP";
 
@@ -637,6 +638,10 @@ static void btn_run(void *ctx)
 {
     (void)ctx;
     uint32_t b = __atomic_exchange_n(&s_btn_pending, 0, __ATOMIC_ACQ_REL);
+    if ((b & (1u << A2DP_BTN_VOL_UP | 1u << A2DP_BTN_VOL_DOWN)) &&
+        party_listen_volume_step(((b & (1u << A2DP_BTN_VOL_UP)) ? 8 : 0) - ((b & (1u << A2DP_BTN_VOL_DOWN)) ? 8 : 0))) {
+        b &= ~(1u << A2DP_BTN_VOL_UP | 1u << A2DP_BTN_VOL_DOWN);   /* listening: our output, not the phone */
+    }
     if (b & (1u << A2DP_BTN_VOL_UP | 1u << A2DP_BTN_VOL_DOWN)) {
         int v = s_volume + ((b & (1u << A2DP_BTN_VOL_UP)) ? 8 : 0) - ((b & (1u << A2DP_BTN_VOL_DOWN)) ? 8 : 0);
         volume_set((uint8_t)(v < 0 ? 0 : v > 127 ? 127 : v), "button");
