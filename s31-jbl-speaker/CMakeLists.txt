@@ -13,4 +13,7 @@ idf_build_set_property(COMPILE_DEFINITIONS "CLASSIC_BT_GATT_INCLUDED=1" APPEND)
 # drops the link to retry as master. As slave every Auracast SDU still goes out.
 # Log the SBC bitpool the phone really sends (idf btc_a2dp_sink.c tap).
 idf_build_set_property(COMPILE_DEFINITIONS "BTC_A2DP_SINK_BITPOOL_STATS=1" APPEND)
+# Pin the phone's SBC bitpool at 53 (idf-patches/0005; this IDF fork ignores
+# esp_a2d_sink_register_stream_endpoint, so the stack's own sink caps are used).
+idf_build_set_property(COMPILE_DEFINITIONS "A2D_SBC_SINK_MIN_BITPOOL=53" APPEND)
 project(s31_jbl_speaker)

@@ -37,6 +37,7 @@
 #include "freertos/task.h"
 
 #include "jbl_assistant.h"
+#include "a2dp_bridge.h"
 
 #define TAG "JBL_ASSIST"
 
@@ -55,7 +56,7 @@ static const uint8_t com_c2_uuid[16]  = { 0x02, 0x00, 0x6d, 0x6f, 0x63, 0x2e, 0x
                                           0x69, 0x6f, 0x70, 0x6c, 0x65, 0x63, 0x78, 0x65 };
 
 typedef enum {
-    ST_IDLE, ST_SCANNING, ST_STOPPING, ST_CONNECTING, ST_CONNECTED, ST_PROBING,
+    ST_IDLE, ST_SCAN_PAUSED, ST_SCANNING, ST_STOPPING, ST_CONNECTING, ST_CONNECTED, ST_PROBING,
     ST_SEARCHING, ST_JOINING, ST_DONE,
 } state_t;
 
@@ -571,6 +572,22 @@ static void assistant_task(void *arg)
             state_since = xTaskGetTickCount();
         }
         TickType_t age = xTaskGetTickCount() - state_since;
+        /* While phone music streams, stop the LE scan: each 30 ms scan window
+         * blocks the phone's A2DP link, which then can't carry bitpool 53.
+         * Native join doesn't need it - speakers find us by our own adverts. */
+        if (s_state == ST_SCANNING && a2dp_bridge_streaming()) {
+            ESP_LOGW(TAG, "phone music streaming -> pausing the JBL speaker scan (frees airtime for A2DP)");
+            s_state = ST_SCAN_PAUSED;
+            esp_ble_gap_stop_ext_scan();
+            continue;
+        }
+        if (s_state == ST_SCAN_PAUSED) {
+            if (!a2dp_bridge_streaming()) {
+                ESP_LOGW(TAG, "phone music stopped -> resuming the JBL speaker scan");
+                s_state = ST_IDLE;
+            }
+            continue;
+        }
         switch (s_state) {
         case ST_IDLE:
             if (s_gattc_if != ESP_GATT_IF_NONE) {

@@ -219,6 +219,7 @@ static const uint8_t jbl_beacon_addr[6] = { 0xC4, 0x58, 0x34, 0x53, 0x31, 0x04 }
  * Classic link is idle. Clean replay => BR/EDR coexistence breaks the BIG. */
 #define REPLAY_TEST            1
 #define REPLAY_SECONDS         30
+static volatile bool g_replaying;   /* replay loop is on air (beacon stays slow, like streaming) */
 
 /* Tone generator */
 #define TONE_SR_HZ             48000
@@ -455,7 +456,7 @@ static void broadcast_source_tx(void)
     {
         static int16_t *rec;               /* PSRAM ring of 10 ms stereo frames */
         static uint32_t rec_frames, rec_w, rec_r, rec_n;
-        static bool replaying;
+        bool replaying = g_replaying;
         if (rec == NULL && rec_frames == 0) {
             rec_frames = REPLAY_SECONDS * 100;
             rec = heap_caps_malloc((size_t)rec_frames * 480 * 2 * sizeof(int16_t), MALLOC_CAP_SPIRAM);
@@ -466,7 +467,7 @@ static void broadcast_source_tx(void)
         if (rec != NULL && fs == 480) {
             if (a2dp_bridge_streaming()) {
                 if (replaying) {
-                    replaying = false;
+                    g_replaying = false;
                     ESP_LOGW(TAG, "REPLAY: phone streaming again -> live audio");
                 }
                 memcpy(rec + (size_t)rec_w * 960, pcm, 960 * sizeof(int16_t));
@@ -474,7 +475,7 @@ static void broadcast_source_tx(void)
                 if (rec_n < rec_frames) rec_n++;
             } else if (rec_n >= 300) {     /* >= 3 s recorded: loop it */
                 if (!replaying) {
-                    replaying = true;
+                    g_replaying = true;
                     rec_r = (rec_w + rec_frames - rec_n) % rec_frames;
                     ESP_LOGW(TAG, "REPLAY: phone paused -> looping the last %lu s of its music over Auracast "
                              "(Classic link idle). Listen: clean now = coexistence problem.",
@@ -586,11 +587,16 @@ static esp_err_t broadcast_source_setup(void)
      * One radio burst every 20 ms carrying two frames, each sent 4 times,
      * leaves a long gap each cycle for the phone's A2DP link.
      * Applied through LE Create BIG Test (CONFIG_BT_ISO_TEST_PARAMS). */
+    /* IRC 4 -> 2 (NSE 8 -> 4): same 20 ms interval, BN 2, 100 B PDUs, 2M PHY,
+     * but each frame goes out twice instead of 4 times. Halves the BIG's
+     * airtime (~9.6 -> ~4.8 ms per 20 ms) so the phone's A2DP link has room
+     * for SBC bitpool 53. Set BIG_IRC 4 to go back to the Xtreme 5's numbers. */
+#define BIG_IRC 2
     preset_active.qos.rtn = 2;
-    preset_active.qos.num_subevents = 8;
+    preset_active.qos.num_subevents = 2 * BIG_IRC;   /* NSE = BN x IRC */
     preset_active.qos.burst_number = 2;
     preset_active.qos.max_pdu = 100;
-    create_param.irc = 4;
+    create_param.irc = BIG_IRC;
     create_param.pto = 0;
     create_param.iso_interval = 16;
 
@@ -763,7 +769,7 @@ static void pa_update_task(void *arg)
             s_beacon_dirty = false;
             beacon_adv_data_update(adv, n);
         }
-        bool want_slow = a2dp_bridge_streaming();
+        bool want_slow = a2dp_bridge_streaming() || g_replaying;
         if (want_slow != slow) {
             slow = want_slow;
             beacon_set_interval(slow ? BEACON_STREAMING_MS : BEACON_INTERVAL_MS);
