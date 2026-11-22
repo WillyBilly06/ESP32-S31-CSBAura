@@ -30,6 +30,7 @@
 #include "auracast.h"
 #include "jbl.h"
 #include "link_tune.h"
+#include "party.h"
 #include "sniffer.h"
 
 /* 1 = JBL party / Auracast sniffer only (no A2DP, no broadcast, no JBL GATT) */
@@ -75,6 +76,7 @@ static void stats_task(void *arg)
         }
         a2dp_in_log_stats();
         auracast_log_stats();
+        party_log_stats();
         jbl_set_streaming(a2dp_in_streaming());
         jbl_log_stats();
         log_heap();
@@ -120,6 +122,7 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
         auracast_on_hci_working();
         jbl_on_hci_working();
         auracast_host_start();
+        party_on_hci_working();
     }
 }
 
@@ -148,6 +151,7 @@ static void btstack_task(void *arg)
         link_tune_setup();
         a2dp_in_setup();
         auracast_setup();
+        party_setup();
         jbl_setup();
     }
 
