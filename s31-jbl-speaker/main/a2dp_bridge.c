@@ -54,6 +54,10 @@ static volatile bool s_acl_up;              /* a Classic link to the last phone 
 static volatile uint32_t s_acl_change_ms;   /* when that link last came up or went down */
 
 static void remember_phone(const uint8_t *a);
+extern uint8_t *BTM_ReadLocalFeatures(void);    /* Bluedroid: LMP features page 0 */
+
+/* All ACL packet types, EDR (2/3 Mbps) DH1/DH3/DH5 allowed (no "NO_x_DHy" bits). */
+#define ACL_PKT_ALL_EDR (ESP_BT_ACL_PKT_TYPES_MASK_DM1 | ESP_BT_ACL_PKT_TYPES_MASK_DH1 |                          ESP_BT_ACL_PKT_TYPES_MASK_DM3 | ESP_BT_ACL_PKT_TYPES_MASK_DH3 |                          ESP_BT_ACL_PKT_TYPES_MASK_DM5 | ESP_BT_ACL_PKT_TYPES_MASK_DH5)
 static void (*s_name_cb)(const char *name);
 
 void a2dp_bridge_on_phone_name(void (*cb)(const char *name))
@@ -217,6 +221,7 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *p)
             s_a2dp_connected = true;
             remember_phone(a);
             esp_bt_gap_read_remote_name(a);   /* phone name -> CRC in the JBL beacon */
+            esp_bt_gap_set_acl_pkt_types(a, ACL_PKT_ALL_EDR);   /* let the phone use 2/3-DH5 */
             /* stop inquiry/page scanning while a phone is attached: frees radio time */
             esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
         } else if (p->conn_stat.state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
@@ -270,6 +275,11 @@ static void gap_bt_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *p)
         if (p->read_rmt_name.stat == ESP_BT_STATUS_SUCCESS && s_name_cb) {
             s_name_cb((const char *)p->read_rmt_name.rmt_name);
         }
+        break;
+    case ESP_BT_GAP_ACL_PKT_TYPE_CHANGED_EVT:
+        ESP_LOGW(TAG, "ACL packet types now 0x%04x (status %d)%s", p->set_acl_pkt_types.pkt_types,
+                 p->set_acl_pkt_types.status,
+                 (p->set_acl_pkt_types.pkt_types & 0x3306) == 0x3306 ? " - NO EDR packets!" : " - EDR allowed");
         break;
     case ESP_BT_GAP_ACL_CONN_CMPL_STAT_EVT:
         if (p->acl_conn_cmpl_stat.stat == ESP_BT_STATUS_SUCCESS) {
@@ -450,7 +460,7 @@ esp_err_t a2dp_bridge_start(const char *bredr_name)
                                  ESP_A2D_SBC_CIE_BLOCK_LEN_12 | ESP_A2D_SBC_CIE_BLOCK_LEN_16;
     mcc.cie.sbc_info.num_subbands = ESP_A2D_SBC_CIE_NUM_SUBBANDS_4 | ESP_A2D_SBC_CIE_NUM_SUBBANDS_8;
     mcc.cie.sbc_info.alloc_mthd = ESP_A2D_SBC_CIE_ALLOC_MTHD_SRN | ESP_A2D_SBC_CIE_ALLOC_MTHD_LOUDNESS;
-    mcc.cie.sbc_info.min_bitpool = 2;
+    mcc.cie.sbc_info.min_bitpool = 53;  /* pin SBC High Quality: the phone may not drop below 53 */
     mcc.cie.sbc_info.max_bitpool = 53;   /* full SBC High Quality, as before */
     esp_a2d_sink_register_stream_endpoint(0, &mcc);
 
@@ -459,6 +469,13 @@ esp_err_t a2dp_bridge_start(const char *bredr_name)
      * gives the radio back to page scan / the BIG sooner. */
     esp_bt_gap_set_page_timeout(0x1000);
 
+    const uint8_t *lf = BTM_ReadLocalFeatures();
+    if (lf) {
+        ESP_LOGW(TAG, "local LMP features %02x %02x %02x %02x %02x %02x %02x %02x -> EDR 2M %s, 3M %s, 3-slot EDR %s, 5-slot EDR %s",
+                 lf[0], lf[1], lf[2], lf[3], lf[4], lf[5], lf[6], lf[7],
+                 (lf[3] & 0x02) ? "yes" : "NO", (lf[3] & 0x04) ? "yes" : "NO",
+                 (lf[4] & 0x80) ? "yes" : "NO", (lf[5] & 0x01) ? "yes" : "NO");
+    }
     const uint8_t *a = esp_bt_dev_get_address();
     ESP_LOGW(TAG, "BR/EDR speaker '%s' discoverable at %02x:%02x:%02x:%02x:%02x:%02x (A2DP sink)",
              bredr_name, a[0], a[1], a[2], a[3], a[4], a[5]);

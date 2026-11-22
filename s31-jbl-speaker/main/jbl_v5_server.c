@@ -79,18 +79,38 @@ void v5_server_set_notify_handle(uint16_t h)
     s_notify_handle = h;
 }
 
+static volatile uint16_t s_att_mtu = 0;      /* 0 = unknown (BR/EDR links often report none) */
+
+void v5_server_set_mtu(uint16_t mtu)
+{
+    s_att_mtu = mtu;
+}
+
+/* One V5 message; split into pktCount packets when it doesn't fit one ATT
+ * notification (the app reassembles until pktIdx == pktCount-1). */
 static void send_frame(uint16_t cmd, const uint8_t *payload, uint16_t len)
 {
-    uint8_t f[8 + 240];
-    if (!s_linked || s_notify_handle == 0 || len > 240) {
+    uint8_t f[8 + 400];
+    if (!s_linked || s_notify_handle == 0 || len > 400) {
+        if (len > 400) ESP_LOGE(TAG, "V5 reply too long (%u B) - dropped", len);
         return;
     }
-    f[0] = 0x00; f[1] = 0xDD;
-    f[2] = cmd & 0xFF; f[3] = cmd >> 8;
-    f[4] = 0x01; f[5] = 0x00;
-    f[6] = len & 0xFF; f[7] = len >> 8;
-    memcpy(f + 8, payload, len);
-    esp_ble_gatts_send_indicate(s_gif, s_conn_id, s_notify_handle, 8 + len, f, false);
+    uint16_t room = s_att_mtu > 3 + 8 + 16 ? s_att_mtu - 3 - 8 : 160;   /* payload bytes per packet */
+    uint8_t count = (len + room - 1) / room;
+    if (count == 0) count = 1;
+    for (uint8_t idx = 0; idx < count; idx++) {
+        uint16_t o = idx * room;
+        uint16_t n = len - o < room ? len - o : room;
+        f[0] = 0x00; f[1] = 0xDD;
+        f[2] = cmd & 0xFF; f[3] = cmd >> 8;
+        f[4] = count; f[5] = idx;
+        f[6] = n & 0xFF; f[7] = n >> 8;
+        memcpy(f + 8, payload + o, n);
+        esp_err_t e = esp_ble_gatts_send_indicate(s_gif, s_conn_id, s_notify_handle, 8 + n, f, false);
+        if (e != ESP_OK) {
+            ESP_LOGE(TAG, "V5 notify failed (%d), %u B", e, 8 + n);
+        }
+    }
 }
 
 /* append {id,len,value} */
@@ -116,10 +136,16 @@ static bool feat_value(uint16_t id, uint8_t *v, uint16_t *n)
     case 0x000C: memcpy(v, s_fw, 3); *n = 3; return true;                     /* FirmwareVersion */
     case 0x000D: v[0] = st.battery; *n = 1; return true;
     case 0x0012: v[0] = st.auto_off & 0xFF; v[1] = st.auto_off >> 8; *n = 2; return true;
+    case 0x0013: v[0] = st.auto_off & 0xFF; v[1] = st.auto_off >> 8; *n = 2; return true; /* AutoStandby */
     case 0x0045: v[0] = 0x01; *n = 1; return true;                            /* PowerStatus on */
+    case 0x0056: v[0] = 0x00; *n = 1; return true;                            /* RemotePowerEnableStatus */
+    case 0x0D45: v[0] = 0x00; *n = 1; return true;                            /* BassBoostLight */
+    case 0x0D62: v[0] = 0x00; *n = 1; return true;                            /* ChargingLight */
     case 0x0C40: v[0] = st.feedback_tone; *n = 1; return true;
     case 0x1008: u32 = 600; memcpy(v, &u32, 4); *n = 4; return true;          /* TotalPlaybackTime */
     case 0x0B80: *n = 0; return true;                                         /* Auracast assistant: idle */
+    case 0x0B86: v[0] = 0x01; *n = 1; return true;                            /* BroadcasterEnable: we host */
+    case 0x0B87: v[0] = 0x01; *n = 1; return true;                            /* BroadcasterStart: on air */
     case 0x0BA0: v[0] = 0x00; *n = 1; return true;
     case 0x0BA1: v[0] = 0x01; *n = 1; return true;                            /* ActiveAudioSource BT */
     case 0x0E7E: memcpy(v, st.eq, 8); *n = 8; return true;
@@ -234,20 +260,35 @@ static void notify_feature(uint16_t id)
 
 static void handle_get(const uint8_t *pl, uint16_t len)
 {
-    uint8_t out[240], v[64];
+    uint8_t out[400], v[64];
     uint16_t off = 2;
+    uint8_t miss[64];
+    uint16_t nmiss = 0;
     out[0] = 0; out[1] = 0;                       /* status OK */
-    char dbg[96]; int dl = 0;
+    char dbg[200], mdbg[120]; int dl = 0, ml = 0;
+    dbg[0] = mdbg[0] = 0;
     for (uint16_t i = 0; i + 1 < len; i += 2) {
         uint16_t id = pl[i] | (pl[i + 1] << 8);
         uint16_t n = 0;
-        dl += snprintf(dbg + dl, sizeof(dbg) - dl, "%04x ", id);
-        if (feat_value(id, v, &n) && off + 4 + n <= sizeof(out)) {
+        if (dl < (int)sizeof(dbg) - 6) dl += snprintf(dbg + dl, sizeof(dbg) - dl, "%04x ", id);
+        if (feat_value(id, v, &n) && off + 4 + n <= 380) {
             off = put_tlv(out, off, id, v, n);
+        } else if (nmiss + 2 <= sizeof(miss)) {
+            miss[nmiss++] = id & 0xFF;
+            miss[nmiss++] = id >> 8;
+            if (ml < (int)sizeof(mdbg) - 6) ml += snprintf(mdbg + ml, sizeof(mdbg) - ml, "%04x ", id);
         }
     }
-    ESP_LOGW(TAG, "app Get [%s] -> %u B", dbg, off);
+    ESP_LOGW(TAG, "app Get [%s] -> %u B%s%s", dbg, off, nmiss ? " | UNSUPPORTED: " : "", mdbg);
     send_frame(1, out, off);
+    if (nmiss) {
+        /* like the real Xtreme 5: a second Get reply carrying 0x0000
+         * UnsupportedFeatureList with the IDs it doesn't have */
+        uint8_t u[2 + 4 + sizeof(miss)];
+        u[0] = 0; u[1] = 0;
+        uint16_t uo = put_tlv(u, 2, 0x0000, miss, nmiss);
+        send_frame(1, u, uo);
+    }
 }
 
 static void handle_set(const uint8_t *pl, uint16_t len)
@@ -301,7 +342,7 @@ static void handle_set(const uint8_t *pl, uint16_t len)
         default:
             break;
         }
-        ESP_LOGI(TAG, "app Set 0x%04x (%u B)", id, n);
+        ESP_LOGW(TAG, "app Set 0x%04x (%u B)", id, n);
         i += 4 + n;
     }
     send_frame(2, ok, 2);                         /* every Set gets "00 00" */
@@ -341,7 +382,12 @@ void v5_server_on_write(const uint8_t *d, uint16_t len)
     case 1: handle_get(pl, have); break;
     case 2: handle_set(pl, have); break;
     case 4: break;                                /* heartbeat ack from app */
-    default: ESP_LOGI(TAG, "app cmd %u (%u B)", cmd, have); break;
+    default: {
+        char h[3 * 24 + 1]; int hl = 0;
+        for (uint16_t k = 0; k < len && k < 24; k++) hl += snprintf(h + hl, sizeof(h) - hl, "%02x ", d[k]);
+        ESP_LOGW(TAG, "app cmd 0x%04x (%u B): %s", cmd, have, h);
+        break;
+    }
     }
 }
 
@@ -357,6 +403,7 @@ void v5_server_on_disconnect(uint16_t conn_id)
 {
     if (conn_id == s_conn_id) {
         s_linked = false;
+        s_att_mtu = 0;
         ESP_LOGW(TAG, "JBL One control link down");
     }
 }

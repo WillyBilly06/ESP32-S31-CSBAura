@@ -45,6 +45,7 @@
 #include "adv.h"
 #include "jbl_gatt.h"
 #include "a2dp_bridge.h"
+#include "esp_heap_caps.h"
 #include "esp_bt_device.h"
 #include "jbl_assistant.h"
 #include "jbl_v5_server.h"
@@ -213,6 +214,11 @@ static const uint8_t jbl_beacon_addr[6] = { 0xC4, 0x58, 0x34, 0x53, 0x31, 0x04 }
 
 /* 0 = silence when no phone is streaming; 1 = test beeps. */
 #define TEST_TONE              0
+/* A/B test for the garble: record the last REPLAY_SECONDS of phone music (as
+ * encoded) into PSRAM; when the phone pauses, loop it over Auracast while the
+ * Classic link is idle. Clean replay => BR/EDR coexistence breaks the BIG. */
+#define REPLAY_TEST            1
+#define REPLAY_SECONDS         30
 
 /* Tone generator */
 #define TONE_SR_HZ             48000
@@ -444,6 +450,45 @@ static void broadcast_source_tx(void)
             memset(pcm, 0, sizeof(int16_t) * 2 * fs);
         }
     }
+
+#if REPLAY_TEST
+    {
+        static int16_t *rec;               /* PSRAM ring of 10 ms stereo frames */
+        static uint32_t rec_frames, rec_w, rec_r, rec_n;
+        static bool replaying;
+        if (rec == NULL && rec_frames == 0) {
+            rec_frames = REPLAY_SECONDS * 100;
+            rec = heap_caps_malloc((size_t)rec_frames * 480 * 2 * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+            if (rec == NULL) {
+                ESP_LOGE(TAG, "REPLAY: no PSRAM for the test buffer");
+            }
+        }
+        if (rec != NULL && fs == 480) {
+            if (a2dp_bridge_streaming()) {
+                if (replaying) {
+                    replaying = false;
+                    ESP_LOGW(TAG, "REPLAY: phone streaming again -> live audio");
+                }
+                memcpy(rec + (size_t)rec_w * 960, pcm, 960 * sizeof(int16_t));
+                rec_w = (rec_w + 1) % rec_frames;
+                if (rec_n < rec_frames) rec_n++;
+            } else if (rec_n >= 300) {     /* >= 3 s recorded: loop it */
+                if (!replaying) {
+                    replaying = true;
+                    rec_r = (rec_w + rec_frames - rec_n) % rec_frames;
+                    ESP_LOGW(TAG, "REPLAY: phone paused -> looping the last %lu s of its music over Auracast "
+                             "(Classic link idle). Listen: clean now = coexistence problem.",
+                             (unsigned long)(rec_n / 100));
+                }
+                memcpy(pcm, rec + (size_t)rec_r * 960, 960 * sizeof(int16_t));
+                rec_r = (rec_r + 1) % rec_frames;
+                if (rec_r == rec_w) {
+                    rec_r = (rec_w + rec_frames - rec_n) % rec_frames;
+                }
+            }
+        }
+    }
+#endif
 
     /* JBL One EQ (7 JBL biquads), applied before encoding like the real speaker */
     v5_eq_process(pcm, fs);
@@ -804,7 +849,8 @@ static void gatts_cb(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
         beacon_adv_restart();
         break;
     case ESP_GATTS_MTU_EVT:
-        ESP_LOGI(TAG, "peer MTU %u", p->mtu.mtu);
+        ESP_LOGW(TAG, "peer MTU %u (conn %u)", p->mtu.mtu, p->mtu.conn_id);
+        v5_server_set_mtu(p->mtu.mtu);
         break;
     case ESP_GATTS_EXEC_WRITE_EVT:
         if (p->exec_write.exec_write_flag == ESP_GATT_PREP_WRITE_EXEC && s_v5_prep_len) {
@@ -887,45 +933,52 @@ static esp_err_t tone_lc3_init(void)
 
 /* Encoder task (lc3_encode needs several KB of stack), paced by the
  * drift-compensated scheduler via the semaphore. */
-static void encode_task(void *arg)
+/* 2 s stats, printed from its own low-priority task so UART logging never
+ * delays an LC3 encode tick (the encoder must hand an SDU over every 10 ms). */
+static void stats_task(void *arg)
 {
     TickType_t last = xTaskGetTickCount();
     uint32_t   last_sent = 0;
 
     for (;;) {
+        vTaskDelayUntil(&last, pdMS_TO_TICKS(2000));
+
+        uint32_t now = g_frames_sent;
+        uint32_t ur, dr, fill;
+        a2dp_bridge_stats(&ur, &dr, &fill);
+        ESP_LOGW(TAG, "TX 2s: %lu frames (expect 200), send_err %lu | %s, a2dp pkts %lu, "
+                 "buf %lu ms, underruns %lu, drops %lu, PCM glitches %lu, clipped %lu",
+                 (unsigned long)(now - last_sent), (unsigned long)g_send_errors,
+                 a2dp_bridge_streaming() ? "PHONE MUSIC" :
+                 a2dp_bridge_connected() ? "phone paused (silence)" :
+                 TEST_TONE ? "test tone" : "no phone (silence)",
+                 (unsigned long)a2dp_bridge_packets(), (unsigned long)fill,
+                 (unsigned long)ur, (unsigned long)dr,
+                 (unsigned long)g_glitches, (unsigned long)g_clipped);
+        ESP_LOGW(TAG, "ISO 2s: on-air %lu, NOT SENT %lu, drift %lu | encode ticks late %lu, worst gap %lu us",
+                 (unsigned long)g_iso_done, (unsigned long)g_iso_not_txd, (unsigned long)g_iso_drift,
+                 (unsigned long)g_late_ticks, (unsigned long)g_max_gap_us);
+        if (a2dp_bridge_streaming()) {
+            ESP_LOGW(TAG, "SBC 2s: bitpool now %u (min %u, max %u), media pkts %lu, lost pkts %lu",
+                     btc_a2dp_sink_bitpool_last,
+                     btc_a2dp_sink_bitpool_min == 0xFF ? 0 : btc_a2dp_sink_bitpool_min,
+                     btc_a2dp_sink_bitpool_max, (unsigned long)btc_a2dp_sink_media_pkts,
+                     (unsigned long)btc_a2dp_sink_media_seq_gaps);
+        }
+        btc_a2dp_sink_bitpool_min = 0xFF;
+        btc_a2dp_sink_bitpool_max = 0;
+        btc_a2dp_sink_media_pkts = 0;
+        btc_a2dp_sink_media_seq_gaps = 0;
+        g_iso_done = g_iso_not_txd = g_iso_drift = g_late_ticks = g_max_gap_us = 0;
+        last_sent = now;
+    }
+}
+
+static void encode_task(void *arg)
+{
+    for (;;) {
         if (xSemaphoreTake(g_encode_sem, pdMS_TO_TICKS(500)) == pdTRUE) {
             broadcast_source_tx();
-        }
-        if (xTaskGetTickCount() - last >= pdMS_TO_TICKS(2000)) {
-            uint32_t now = g_frames_sent;
-            uint32_t ur, dr, fill;
-            a2dp_bridge_stats(&ur, &dr, &fill);
-            ESP_LOGW(TAG, "TX 2s: %lu frames (expect 200), send_err %lu | %s, a2dp pkts %lu, "
-                     "buf %lu ms, underruns %lu, drops %lu, PCM glitches %lu, clipped %lu",
-                     (unsigned long)(now - last_sent), (unsigned long)g_send_errors,
-                     a2dp_bridge_streaming() ? "PHONE MUSIC" :
-                     a2dp_bridge_connected() ? "phone paused (silence)" :
-                     TEST_TONE ? "test tone" : "no phone (silence)",
-                     (unsigned long)a2dp_bridge_packets(), (unsigned long)fill,
-                     (unsigned long)ur, (unsigned long)dr,
-                     (unsigned long)g_glitches, (unsigned long)g_clipped);
-            ESP_LOGW(TAG, "ISO 2s: on-air %lu, NOT SENT %lu, drift %lu | encode ticks late %lu, worst gap %lu us",
-                     (unsigned long)g_iso_done, (unsigned long)g_iso_not_txd, (unsigned long)g_iso_drift,
-                     (unsigned long)g_late_ticks, (unsigned long)g_max_gap_us);
-            if (a2dp_bridge_streaming()) {
-                ESP_LOGW(TAG, "SBC 2s: bitpool now %u (min %u, max %u), media pkts %lu, lost pkts %lu",
-                         btc_a2dp_sink_bitpool_last,
-                         btc_a2dp_sink_bitpool_min == 0xFF ? 0 : btc_a2dp_sink_bitpool_min,
-                         btc_a2dp_sink_bitpool_max, (unsigned long)btc_a2dp_sink_media_pkts,
-                         (unsigned long)btc_a2dp_sink_media_seq_gaps);
-            }
-            btc_a2dp_sink_bitpool_min = 0xFF;
-            btc_a2dp_sink_bitpool_max = 0;
-            btc_a2dp_sink_media_pkts = 0;
-            btc_a2dp_sink_media_seq_gaps = 0;
-            g_iso_done = g_iso_not_txd = g_iso_drift = g_late_ticks = g_max_gap_us = 0;
-            last_sent = now;
-            last = xTaskGetTickCount();
         }
     }
 }
@@ -997,6 +1050,7 @@ void app_main(void)
     }
     xTaskCreatePinnedToCore(encode_task, "lc3_enc", 12288, NULL,
                             configMAX_PRIORITIES - 4, NULL, 1);
+    xTaskCreatePinnedToCore(stats_task, "tx_stats", 4096, NULL, 2, NULL, 1);
 
     err = broadcast_start();
     if (err) {

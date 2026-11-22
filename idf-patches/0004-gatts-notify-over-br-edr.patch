@@ -1,0 +1,20 @@
+diff --git a/components/bt/host/bluedroid/api/esp_gatts_api.c b/components/bt/host/bluedroid/api/esp_gatts_api.c
+index c93b2bdc..361dcf45 100644
+--- a/components/bt/host/bluedroid/api/esp_gatts_api.c
++++ b/components/bt/host/bluedroid/api/esp_gatts_api.c
+@@ -310,7 +310,15 @@ esp_err_t esp_ble_gatts_send_indicate(esp_gatt_if_t gatts_if, uint16_t conn_id,
+         return ESP_ERR_INVALID_STATE;
+     }
+ 
++#if (CLASSIC_BT_GATT_INCLUDED == TRUE)
++    /* local patch (s31-jbl-speaker): L2CA_CheckIsCongest() only knows the LE
++     * fixed ATT channel and reports "congested" when there is no LE link, so
++     * every notification over BR/EDR GATT was refused. Only check it on LE. */
++    if (p_tcb->transport == BT_TRANSPORT_LE &&
++        L2CA_CheckIsCongest(L2CAP_ATT_CID, p_tcb->peer_bda)) {
++#else
+     if (L2CA_CheckIsCongest(L2CAP_ATT_CID, p_tcb->peer_bda)) {
++#endif
+         LOG_DEBUG("%s, the l2cap channel is congest.", __func__);
+         return ESP_FAIL;
+     }
