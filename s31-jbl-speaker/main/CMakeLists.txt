@@ -8,4 +8,4 @@ endif()
 
 idf_component_register(SRCS ${srcs}
                        INCLUDE_DIRS "."
-                       REQUIRES bt nvs_flash liblc3 esp_ringbuf esp_psram)
+                       REQUIRES bt nvs_flash liblc3 esp_ringbuf esp_psram esp_timer)

@@ -35,6 +35,7 @@
 #include "ble_audio_example_utils.h"
 
 #include "freertos/FreeRTOS.h"
+#include "esp_timer.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "lc3.h"
@@ -230,6 +231,11 @@ static volatile uint32_t g_frames_sent;
 static volatile uint32_t g_send_errors;     /* ISO SDUs the stack refused (radio/buffer busy) */
 static volatile uint32_t g_glitches;        /* PCM discontinuities before encoding */
 static volatile uint32_t g_clipped;         /* full-scale samples before encoding */
+static volatile uint32_t g_iso_done;        /* SDUs the controller reports as sent */
+static volatile uint32_t g_iso_not_txd;     /* SDUs the controller could NOT put on air */
+static volatile uint32_t g_iso_drift;       /* SDUs flagged as drifted vs the BIG anchor */
+static volatile uint32_t g_late_ticks;      /* encode ticks > 15 ms after the previous one */
+static volatile uint32_t g_max_gap_us;      /* worst gap between encode ticks */
 
 #define STREAM_COUNT            CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT
 #define SUBGROUP_COUNT          CONFIG_BT_BAP_BROADCAST_SRC_SUBGROUP_COUNT
@@ -314,6 +320,16 @@ static void stream_sent_cb(esp_ble_audio_bap_stream_t *stream, void *user_data)
                                                                  stream);
     char name[24];
 
+    const esp_ble_iso_tx_cb_info_t *info = user_data;
+    if (info != NULL && stream_index(stream) == 0) {
+        g_iso_done += info->completed_pkts;
+        g_iso_not_txd += info->not_txd_pkts;
+        for (size_t i = 0; i < info->pkt_cnt && i < 2; i++) {
+            if (info->pkt[i].drift) {
+                g_iso_drift++;
+            }
+        }
+    }
     snprintf(name, sizeof(name), "SRC #%d", stream_index(stream));
     example_audio_tx_scheduler_on_sent(&source_stream->scheduler, user_data, TAG, name);
 }
@@ -379,6 +395,16 @@ static void broadcast_source_tx(void)
 
     if (!stream_is_streaming(&streams[0].stream)) {
         return;
+    }
+    {
+        static int64_t last_us;
+        int64_t now_us = esp_timer_get_time();
+        if (last_us != 0) {
+            uint32_t gap = (uint32_t)(now_us - last_us);
+            if (gap > g_max_gap_us) g_max_gap_us = gap;
+            if (gap > 15000) g_late_ticks++;
+        }
+        last_us = now_us;
     }
 
     int fs = g_frame_samples;
@@ -881,6 +907,10 @@ static void encode_task(void *arg)
                      (unsigned long)a2dp_bridge_packets(), (unsigned long)fill,
                      (unsigned long)ur, (unsigned long)dr,
                      (unsigned long)g_glitches, (unsigned long)g_clipped);
+            ESP_LOGW(TAG, "ISO 2s: on-air %lu, NOT SENT %lu, drift %lu | encode ticks late %lu, worst gap %lu us",
+                     (unsigned long)g_iso_done, (unsigned long)g_iso_not_txd, (unsigned long)g_iso_drift,
+                     (unsigned long)g_late_ticks, (unsigned long)g_max_gap_us);
+            g_iso_done = g_iso_not_txd = g_iso_drift = g_late_ticks = g_max_gap_us = 0;
             last_sent = now;
             last = xTaskGetTickCount();
         }

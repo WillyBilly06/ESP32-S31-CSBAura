@@ -63,7 +63,7 @@ void a2dp_bridge_on_phone_name(void (*cb)(const char *name))
 static float s_pos;               /* read position; -1 == previous chunk's last sample */
 static int16_t s_prev[2];
 
-static uint8_t s_out_buf[4096 * 2];
+static uint8_t s_out_buf[4096 * 4];   /* 4096 stereo frames at 48 kHz */
 
 /* ---- audio path --------------------------------------------------------- */
 
@@ -101,6 +101,9 @@ static void a2d_data_cb(const uint8_t *data, uint32_t len)
             pos += step;
         }
         s_pos = pos - (float)n;            /* re-base so index -1 is this chunk's last frame */
+        if (s_pos < -1.0f || s_pos > 1.0f) {
+            s_pos = -1.0f + (s_pos - floorf(s_pos));  /* output buffer was full: never index outside the next chunk */
+        }
         s_prev[0] = in[2 * (n - 1)];
         s_prev[1] = in[2 * (n - 1) + 1];
     }
