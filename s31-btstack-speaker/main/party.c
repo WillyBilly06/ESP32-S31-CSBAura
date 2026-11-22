@@ -72,7 +72,7 @@ typedef enum { R_HOST, R_HOST_STOPPING, R_LISTEN, R_LISTEN_STOPPING, R_OFF } rol
 typedef enum { L_OFF, L_SCAN, L_PA_SYNC, L_W4_BASE, L_BIG_SYNC, L_STREAM } lstate_t;
 static const char *const role_names[] = { "HOST", "HOST_STOPPING", "LISTEN", "LISTEN_STOPPING", "OFF (Auracast off)" };
 #ifndef PARTY_BOOT_AURACAST
-#define PARTY_BOOT_AURACAST 1
+#define PARTY_BOOT_AURACAST 0   /* broadcast off at power-up; the Auracast button (GPIO 36) turns it on/off */
 #endif
 static volatile bool s_enabled = PARTY_BOOT_AURACAST;   /* Auracast button */
 static const char *const lstate_names[] = { "off", "scanning", "PA syncing", "waiting for BASE", "BIG syncing", "STREAMING" };
