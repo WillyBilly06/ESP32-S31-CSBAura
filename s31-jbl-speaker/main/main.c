@@ -249,6 +249,11 @@ extern volatile uint32_t btc_a2dp_sink_media_pkts, btc_a2dp_sink_media_seq_gaps;
 static volatile uint32_t g_iso_done;        /* SDUs the controller reports as sent */
 static volatile uint32_t g_iso_not_txd;     /* SDUs the controller could NOT put on air */
 static volatile uint32_t g_iso_drift;       /* SDUs flagged as drifted vs the BIG anchor */
+/* Controller-reported per-SDU timing (vendor fields, us): how long an SDU sat
+ * inside the controller between arriving (sdu_rec_time) and going on air
+ * (tx_time_stamp), plus tx vs its SDU reference time. */
+static volatile uint32_t g_q_sum, g_q_max, g_q_n, g_ref_sum, g_ref_max;
+static volatile uint32_t g_q_raw[4];
 static volatile uint32_t g_late_ticks;      /* encode ticks > 15 ms after the previous one */
 static volatile uint32_t g_max_gap_us;      /* worst gap between encode ticks */
 static volatile uint32_t g_enc_us_sum, g_enc_us_max, g_enc_n;   /* lc3_encode time, both channels */
@@ -403,6 +408,12 @@ static void stream_sent_cb(esp_ble_audio_bap_stream_t *stream, void *user_data)
             if (info->pkt[i].drift) {
                 g_iso_drift++;
             }
+            uint32_t q = info->pkt[i].tx_time_stamp - info->pkt[i].sdu_rec_time;
+            uint32_t r = info->pkt[i].tx_time_stamp - info->pkt[i].sdu_ref_time;
+            if (q < 5000000u) { g_q_sum += q; g_q_n++; if (q > g_q_max) g_q_max = q; }
+            if (r < 5000000u) { g_ref_sum += r; if (r > g_ref_max) g_ref_max = r; }
+            g_q_raw[0] = info->pkt[i].tx_time_stamp; g_q_raw[1] = info->pkt[i].sdu_rec_time;
+            g_q_raw[2] = info->pkt[i].sdu_ref_time;  g_q_raw[3] = info->pkt[i].sdu_hdl_time;
         }
     }
     snprintf(name, sizeof(name), "SRC #%d", stream_index(stream));
@@ -719,7 +730,7 @@ static esp_err_t broadcast_source_setup(void)
      * but each frame goes out twice instead of 4 times. Halves the BIG's
      * airtime (~9.6 -> ~4.8 ms per 20 ms) so the phone's A2DP link has room
      * for SBC bitpool 53. Set BIG_IRC 4 to go back to the Xtreme 5's numbers. */
-#define BIG_IRC 4   /* Xtreme 5 value; the ACL priority boost now gives A2DP its room */
+#define BIG_IRC 4   /* Xtreme 5 layout (4 copies); A2DP fits the gaps via MTU 675 = one 2-DH5 per media packet */
     preset_active.qos.rtn = 2;
     preset_active.qos.num_subevents = 2 * BIG_IRC;   /* NSE = BN x IRC */
     preset_active.qos.burst_number = 2;
@@ -1127,6 +1138,15 @@ static void stats_task(void *arg)
         btc_a2dp_sink_bitpool_max = 0;
         btc_a2dp_sink_media_pkts = 0;
         btc_a2dp_sink_media_seq_gaps = 0;
+        {
+            uint32_t n = g_q_n;
+            float inv = n ? 1.0f / (float)n : 0.0f;
+            ESP_LOGW(TAG, "ISO timing 2s: SDU wait in controller avg %lu us max %lu us | tx-ref avg %lu us max %lu us (n %lu) raw tx %lu rec %lu ref %lu hdl %lu",
+                     (unsigned long)((float)g_q_sum * inv), (unsigned long)g_q_max,
+                     (unsigned long)((float)g_ref_sum * inv), (unsigned long)g_ref_max, (unsigned long)n,
+                     (unsigned long)g_q_raw[0], (unsigned long)g_q_raw[1], (unsigned long)g_q_raw[2], (unsigned long)g_q_raw[3]);
+            g_q_sum = g_q_max = g_q_n = g_ref_sum = g_ref_max = 0;
+        }
         {
             /* 200 encodes per 2 s: avg = sum / n via the reciprocal of n */
             uint32_t n = g_enc_n, avg = n ? (uint32_t)((float)g_enc_us_sum * (1.0f / (float)n)) : 0;

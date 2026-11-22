@@ -28,4 +28,11 @@ idf_build_set_property(COMPILE_OPTIONS "-freciprocal-math" APPEND)
 # Stay BR/EDR master: refuse role switches (idf-patches/0007) so the S31's
 # controller schedules the phone's A2DP traffic around the Auracast BIG.
 idf_build_set_property(COMPILE_DEFINITIONS "BTM_NO_ROLE_SWITCH=1" APPEND)
+# No sniff mode on BR/EDR (idf-patches/0007): sniff anchors phase-lock to the
+# 20 ms BIG and get starved -> supervision timeouts ~8 s after connect.
+idf_build_set_property(COMPILE_DEFINITIONS "BTM_NO_SNIFF_MODE=1" APPEND)
+# A2DP media MTU 675 = 2-DH5 payload (679) - L2CAP header (4): at bitpool 53
+# the phone packs 5 SBC frames (~608 B) per packet, so every media packet is
+# ONE baseband exchange that fits between BIG events (1008 needed two).
+idf_build_set_property(COMPILE_DEFINITIONS "BTA_AV_MAX_A2DP_MTU=675" APPEND)
 project(s31_jbl_speaker)

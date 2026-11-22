@@ -34,8 +34,8 @@
 #define OUT_RATE        48000
 #define MS_BYTES(ms)    (OUT_RATE * 4 / 1000 * (ms))
 #define RB_BYTES        MS_BYTES(400)           /* 400 ms of 48 kHz stereo s16 */
-#define PRIME_BYTES     MS_BYTES(120)           /* start reading after 120 ms */
-#define TARGET_BYTES    MS_BYTES(150)           /* steady-state fill the drift control aims for */
+#define PRIME_BYTES     MS_BYTES(50)            /* start reading after 50 ms (low latency, S31 is master) */
+#define TARGET_BYTES    MS_BYTES(80)            /* steady-state fill the drift control aims for */
 /* Latency cap. The +-0.2 % drift control needs minutes to work off a big
  * excess (250 ms at 0.2 % = 125 s), so after a burst (phone catching up after
  * a radio stall) the reader drops the OLDEST audio once, straight back to
@@ -43,7 +43,7 @@
  * (drop-newest, whole packet, only when the ring is completely full) almost
  * never has to fire. 300 ms leaves 150 ms over target for normal jitter
  * (measured fill 137-187 ms while streaming). */
-#define HIGH_BYTES      MS_BYTES(300)
+#define HIGH_BYTES      MS_BYTES(160)
 
 static volatile uint32_t s_underruns;           /* encoder found too little phone audio */
 static volatile uint32_t s_drops;               /* phone audio dropped (buffer full) */
@@ -77,6 +77,7 @@ extern uint8_t L2CA_SetDesireRole(uint8_t new_role);
 extern uint8_t BTM_GetRole(uint8_t *remote_bd_addr, uint8_t *p_role);
 #define S31_HCI_ROLE_MASTER        0x00
 #define S31_L2CAP_ROLE_NO_SWITCH   0x40     /* disallow role switch at create-connection */
+#define S31_A2DP_T_POLL            10       /* master poll interval, slots (6.25 ms) */
 
 /* A/B test: while music streams, rotate radio profiles every 20 s and log
  * which one is active, so one listening session compares them all. */
@@ -281,6 +282,12 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *p)
             {
                 uint8_t role = 0xFF;
                 BTM_GetRole(a, &role);
+                if (role == 0) {
+                    /* As master we only hear the phone when we poll it: poll every
+                     * 10 slots (6.25 ms) instead of the default 40 so A2DP gets its
+                     * bitpool-53 throughput from the gaps between BIG events. */
+                    esp_bt_gap_set_qos(a, S31_A2DP_T_POLL);
+                }
                 ESP_LOGW(TAG, "BR/EDR role on this link: %s", role == 0 ? "MASTER (S31 schedules the phone - good)"
                                                           : role == 1 ? "SLAVE (phone schedules blind - expect overlap)"
                                                                       : "unknown");
@@ -318,6 +325,9 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *p)
             BTM_GetRole(s_peer, &role);
             ESP_LOGW(TAG, "BR/EDR role at audio %s: %s", s_streaming ? "start" : "stop",
                      role == 0 ? "MASTER" : role == 1 ? "SLAVE" : "unknown");
+            if (role == 0 && s_streaming) {
+                esp_bt_gap_set_qos(s_peer, S31_A2DP_T_POLL);
+            }
         }
         ESP_LOGW(TAG, "A2DP audio %s", s_streaming ? "STARTED -> re-broadcasting on Auracast"
                                                    : "suspended -> broadcasting silence");
@@ -369,7 +379,17 @@ static void gap_bt_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *p)
             s_acl_change_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
         }
         break;
+    case ESP_BT_GAP_QOS_CMPL_EVT:
+        ESP_LOGW(TAG, "QoS: poll interval %lu slots (status %d)", (unsigned long)p->qos_cmpl.t_poll, p->qos_cmpl.stat);
+        break;
     case ESP_BT_GAP_ACL_DISCONN_CMPL_STAT_EVT:
+        ESP_LOGW(TAG, "ACL disconnected, HCI reason 0x%02x%s", p->acl_disconn_cmpl_stat.reason,
+                 p->acl_disconn_cmpl_stat.reason == 0x08 ? " (supervision timeout)" :
+                 p->acl_disconn_cmpl_stat.reason == 0x13 ? " (remote user terminated)" :
+                 p->acl_disconn_cmpl_stat.reason == 0x16 ? " (local host terminated)" :
+                 p->acl_disconn_cmpl_stat.reason == 0x22 ? " (LMP response timeout)" :
+                 p->acl_disconn_cmpl_stat.reason == 0x23 ? " (LMP transaction collision)" :
+                 p->acl_disconn_cmpl_stat.reason == 0x21 ? " (role change not allowed)" : "");
         bt_sched_tune_streaming(false);
         s_acl_up = false;
         s_acl_change_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;

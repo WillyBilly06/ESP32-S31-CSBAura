@@ -14,3 +14,10 @@
 +#if defined(BTM_NO_ROLE_SWITCH) && BTM_NO_ROLE_SWITCH
 +    settings &= ~HCI_ENABLE_MASTER_SLAVE_SWITCH;   /* local patch: stay master */
 +#endif
+@@ (same two places, right after the role-switch masks) @@
++#if defined(BTM_NO_SNIFF_MODE) && BTM_NO_SNIFF_MODE
++    *settings &= (~HCI_ENABLE_SNIFF_MODE);       /* BTM_SetLinkPolicy */
++#endif
++#if defined(BTM_NO_SNIFF_MODE) && BTM_NO_SNIFF_MODE
++    settings &= ~HCI_ENABLE_SNIFF_MODE;          /* BTM_SetDefaultLinkPolicy */
++#endif
