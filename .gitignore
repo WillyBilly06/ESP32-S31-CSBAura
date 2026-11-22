@@ -1,0 +1,23 @@
+# ESP-IDF build output
+build/
+managed_components/
+sdkconfig.old
+sdkconfig.bak
+*.log
+
+# Third-party material kept local only (proprietary / large binaries):
+#   decompiled JBL apps and APKs, Ghidra output of JBL firmware, jadx
+apk/com.*/
+apk/src_one/
+apk/src_portable/
+apk/*.apk
+decomp/
+tools/jadx/
+
+# editor / OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+__pycache__/
