@@ -1,4 +1,4 @@
-set(srcs "main.c" "jbl_gatt.c" "a2dp_bridge.c" "jbl_assistant.c" "jbl_v5_server.c")
+set(srcs "main.c" "jbl_gatt.c" "a2dp_bridge.c" "jbl_assistant.c" "jbl_v5_server.c" "bt_sched_tune.c")
 
 if(CONFIG_BT_BLUEDROID_ENABLED)
     list(APPEND srcs "bluedroid/adv.c")
