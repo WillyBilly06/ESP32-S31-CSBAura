@@ -298,17 +298,36 @@ void a2dp_bridge_test_sweep(int16_t *pcm, int frames)
     static uint32_t na, nb;
     static float pa, fa, pb, fb;
     static uint32_t frames_in_mode;
-    if (mode < 0 || frames_in_mode >= 48000u * 12u) {
-        mode = (mode == 0) ? 1 : 0;
+    static float ptone;
+    const uint32_t mode_len = (mode >= 2) ? 48000u * 6u : 48000u * 12u;
+    if (mode < 0 || frames_in_mode >= mode_len) {
+        mode = (mode + 1) & 3;
+        ptone = 0.0f;
         frames_in_mode = 0;
         na = nb = 0;
         s_test_have = 0;
         rs_reset(&s_rs_test);
-        ESP_LOGW(TAG, "SWEEP TEST %s: 20 Hz -> 20 kHz, 10 s (no SBC%s)",
-                 mode == 0 ? "A = generated at 48 kHz, direct to LC3" : "B = generated at 44.1 kHz, through the resampler",
-                 mode == 0 ? ", no resampler" : "");
+        if (mode < 2) {
+            ESP_LOGW(TAG, "SWEEP TEST %s: 20 Hz -> 20 kHz, 10 s (no SBC%s)",
+                     mode == 0 ? "A = generated at 48 kHz, direct to LC3" : "B = generated at 44.1 kHz, through the resampler",
+                     mode == 0 ? ", no resampler" : "");
+        } else {
+            ESP_LOGW(TAG, "TONE TEST %s: steady %s for 6 s, generated at 48 kHz direct to LC3 (listen for wobble)",
+                     mode == 2 ? "C" : "D", mode == 2 ? "1 kHz" : "6 kHz");
+        }
     }
     frames_in_mode += frames;
+    if (mode >= 2) {
+        const float inc = (mode == 2 ? 1000.0f : 6000.0f) * (1.0f / 48000.0f);
+        for (int i = 0; i < frames; i++) {
+            int16_t v = (int16_t)(0.5f * sinf(6.28318530718f * ptone) * 32767.0f);
+            ptone += inc;
+            if (ptone >= 1.0f) ptone -= 1.0f;
+            pcm[2 * i] = v;
+            pcm[2 * i + 1] = v;
+        }
+        return;
+    }
     if (mode == 0) {
         for (int i = 0; i < frames; i++) {
             int16_t v = (int16_t)(sweep_sample(&pa, &fa, 48000.0f, &na) * 32767.0f);

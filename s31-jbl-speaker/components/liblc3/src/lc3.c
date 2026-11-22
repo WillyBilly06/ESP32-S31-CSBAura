@@ -303,6 +303,12 @@ static void analyze(struct lc3_encoder *encoder,
 
     side->pitch_present =
         lc3_ltpf_analyse(dt, sr_pcm, &encoder->ltpf, xt, &side->ltpf);
+#if LC3_ENCODER_NO_LTPF
+    /* Send no pitch/LTPF data at all (not just "inactive"): some decoders may
+     * run their postfilter whenever pitch data is present. Analysis still runs
+     * so the encoder's LTPF state stays as upstream expects. */
+    side->pitch_present = false;
+#endif
 
     memmove(xt - nt, xt + (ns-nt), nt * sizeof(*xt));
 
