@@ -6,6 +6,99 @@ Source blobs: `components/bt/controller/lib_esp32s31/esp32s31-bt-lib/{libbtdm_co
 Object names below: `common/N.o`, `ble/N.o` = numbered archive members, `bredr/*.c.o` = named members.
 Tags: **[C]** = confirmed in disassembly/data, **[I]** = inference.
 
+## 0. Second pass (corrections + priority model used by `main/bt_sched_tune.c`)
+
+Hardware observations it has to explain (2 BIS, ISO 20 ms, BN 2, NSE 8, IRC 4, 100 B, 2M; phone A2DP sink, S31 = BR/EDR slave):
+ACL base 2 -> NOT SENT 0, A2DP ~80 %; ACL base 8 + sequential -> A2DP perfect, NOT SENT 26 %; ACL base 8 + interleaved,
+phone connected but *paused* -> NOT SENT 25-34 % (4-8 % with no phone).
+
+### 0.1 BIS subevent priority (`ble/56.o r_sym_ble_FtKLgw2CvtskaTYKEjHw`) **[C]**
+* Called only from the BIG event builder `r_sym_ble_tXihWMtPcP61uTJBYYpS`, which inserts **one fixed-time sched item per
+  subevent per BIS** (loop counter checked against NumBIS*NSE at +0x356). Item start = `bis_idx*big[+20] + se*big[+48]`
+  (+0x112..0x126), i.e. BIS_Spacing / Sub_Interval, so packing only changes *start times*, never the priority.
+* "subevent field bits[5:1]" = `bis->word0[5:1]` = **the subevent index `se` (0..NSE-1) within that BIS's event** — not a
+  global index over all BIS. It is mirrored in `item+24[23:19]` (asserted equal at tXihWM+0x162), advanced by
+  `r_sym_ble_2OrMP2KRFw00zNEkZd0R`; `r_sym_ble_WyHxzomnmoXUwTAR0dY9` ends the event when the last BIS reaches se = NSE-1.
+  `bis->word0[6]` is a separate flag (FtKL +0x8a).
+* `k = se / BN` = payload *group* index (spec numbering: group g carries payloads 0..BN-1 in se = g*BN + p).
+  `prio = k==0 ? cfg[33] : (k < IRC ? cfg[34] : cfg[35])` -> with BN 2, NSE 8, IRC 4: se 0,1 -> 9 (first copy of both
+  payloads), se 2..7 -> 7. Same for SEQUENTIAL and INTERLEAVED. So yes, **the first copy of every payload gets cfg[33]**.
+* `bis == NULL` path (+0x2b8, taken when `big+332 & 0x10`) = BIG control subevent (channel map / terminate): `cfg[36]` (12).
+* `cfg[37..39]` (9/12/12) are only read by `ble/56.o r_sym_ble_1Lwqi..` (adaptive 4-bit prio at obj+284 stepping between
+  them) -> CIS **[I]**. `cfg[32]` (0x1F) is written by `ble/60.o` to HW reg `0x20101B88` (5-bit, meaning unknown; untouched).
+* Priority nibble: `r_sym_ble_J21QYaRyf1RwwT30YZpY` masks `& 15` and writes low+high nibble -> legal range 0..15; 15 is
+  above anything the BR/EDR side can produce (its cap is 14).
+* Getter: `uint8_t *r_sym_ble_kBC0rRwtjATsFkriXVDL(void)` returns exactly `r_sym_ble_u66q9VTswFBa3W6uzpwY` (same
+  `.LANCHOR1` = `.bss.r_sym_ble_u66q..`, checked with readelf); both global. Defaults re-applied only via
+  `jjkD..` <- `ble/26.o fFDl..` (ISO init / HCI_Reset); nothing on BIG create.
+
+### 0.2 How `not_txd_pkts` arises **[C] partly / [I]**
+`ble/29.o r_sym_ble_UqGSyDuyu6DSGTF1giOq` builds the TX-complete info: per released SDU buffer `completed += n`, and
+`not_txd += n` if `(buf->flags16 & 0xA00) != 0xA00`. Bit 9 is set by `ble/56.o r_sym_ble_wimO0rEwECrJOsxVhRaR`
+(tx of the PDU in a subevent) **[C]**. **[I]** => an SDU counts as NOT SENT only when *none* of its IRC copies went on air
+(the first copy *and* all repetitions of that payload lost arbitration). Since every subevent is an independent fixed-time
+item, losing one subevent does not cancel the others; a lost subevent is never re-placed later (no ASAP mode for BIS).
+
+### 0.3 BR/EDR ACL priority escalation (`r_olc_acl_sched_peripheral_asap.constprop.0`, `.iram1.54`) **[C]**
+```
+cap = 14;  if (acl->f54 & 2) cap = (dft[14] <= 4 || dft[0] >= dft[14]-4) ? dft[0] : dft[14]-4;   // dft[14] = 6
+prio  = dft[0] + min(cap, (txq + rxq) >> 2)            // r_olc_acl_datapath_get_traffic: bytes +79/+80 = queued pkts
+prio += min(cap, (now - last_rx_access_code + 1250us) / Tpoll)   // only with the "has deadline" arg (a3=1, always from recycle_sch)
+prio  = min(prio, cap)
+```
+`cap 14` is an immediate (`li s9,14`) in IRAM code, not data; in-list losses re-insert with `prio = min(14, prio + inc[0])`
+(`r_olc_sched_insert` +0x13c). The peripheral item is ASAP: start = "now", deadline = last_sync + Tpoll
+(`r_olc_acl_sched_recycle_sch` +0x4b0..0x52c), duration `((txpend?1:0)+tx_slot+rx_slot)*625-189 us`, and it is re-issued from
+`recycle_sch` after every exchange -> **[I]** an active-mode slave is listening (back-to-back 1-2 slot windows) essentially
+all the time, idle or streaming. inc table byte for ACL (`tbl[1]`) = 1.
+
+**Corrected explanation of the 25-34 % loss with base 8 [I, consistent with all three data sets]:**
+with base 8 the ACL listen windows (8) beat every repetition (7), so each SDU survives only through its first copy (9).
+Any escalation unit (one Tpoll without a received access code, or >= 4 queued packets) lifts the ACL to 9 (tie) or >= 10
+and it then also beats the first copies; those SDUs are lost completely. With base 2 the ACL needs >= 8 units to reach 10,
+which practically never happens -> NOT SENT 0. The old "k==0 is protected because 9 > 8" model ignored the escalation terms.
+
+### 0.4 Other LE priorities (not tunable: immediates in code) **[C]**
+adv `ble/50.o`: 1 (current set) / 5, +1 per skipped event up to 9 (`A9ld..`) or 10 (`GZEt..`); periodic adv 10; scan 1/4;
+sync 6/12; LE ACL connection 8 escalating to 14/15 (`ble/51.o`) — none used by this product while streaming **[I]**.
+
+### 0.5 Configuration implemented in `s31-jbl-speaker/main/bt_sched_tune.c`
+| profile | ACL dft[0] | BIS first `[33]` | rep `[34]` | pto `[35]` | ctrl `[36]` |
+|---|---|---|---|---|---|
+| stock | 2 | 9 | 7 | 8 | 12 |
+| idle (no A2DP audio, both modes) | 2 | 15 | 12 | 11 | 15 |
+| streaming, `BT_SCHED_MODE_A2DP_FIRST` (default) | 14 | 13 | 12 | 11 | 13 |
+| streaming, `BT_SCHED_MODE_AURACAST_FIRST` | 8 | 15 | 7 | 7 | 15 |
+
+* ACL 14 = the cap, so `prio` is constant 14 (escalation adds nothing, and `P:%d new pti` is not logged since prio == dft).
+  A real nibble 15 for the ACL would need patching the `li 14` immediates in IRAM code -> not done. 14 already beats
+  every LE item this product schedules (max 13 BIS, 10 PA/adv).
+* A2DP_FIRST expectation **[I]**: A2DP throughput >= the base-8 run (perfect at bitpool 53). The BIG only gets air the slave
+  is not listening/exchanging; every BIS subevent overlapping an ACL window is lost, the first copy included, so NOT SENT
+  will be **at least the 26-34 % seen with base 8 and probably clearly more** (the 9-vs-8 protection is gone). Whether HW
+  aborts an idle listen window early enough for a later subevent to use the rest is not visible in the blob; later
+  copies of the same payload *are* independent items and do use gaps after an ACL exchange (that is the only recovery).
+  Levers that reduce the loss in this mode: shorter ACL reservations (allow only 2/3-DH3 -> 4 instead of 6 slots per
+  exchange), fewer/shorter BIS subevents does not help (each still overlaps), keeping the boost strictly to "audio started".
+* AURACAST_FIRST expectation **[I]**: first copies (15) can never lose to the ACL (<= 14) or any adv (<= 10) -> NOT SENT
+  ~0 if escalation was the cause (test this first: if loss stays > 0, the HW does not preempt an in-progress ACL window and
+  the ACL base must go below the repetitions again). A2DP as in the base-8 run (ACL still beats repetitions 7).
+  Cost: repetitions mostly lose to the always-listening slave, so speakers effectively see ~1 copy per payload while the
+  phone link is active (on-air reliability, not counted by NOT SENT).
+* Idle profile: ACL back to stock so an idle/paused link (missed polls) cannot climb over the BIG; repetitions 12 sit above
+  PA (10) and escalated adv (<= 10).
+
+Location/verification at run time: BR/EDR table = unique match of bytes 1..35 of the stock 36-byte table in
+`[_data_start,_data_end)` with byte 0 in 1..15, then all 18 `{dft,inc}` pairs must equal `r_olc_sched_pti_dft_get/inc_get(i)`;
+write is read back through the getter (restored on mismatch). ISO block = `r_sym_ble_kBC0rRwtjATsFkriXVDL()` == the global,
+byte-accessible, fingerprint `w0=1250, w8=20000, w12=1000, w52=500000, b32=0x1F, b37..39=9/12/12`. Every call re-verifies
+and re-applies (repairs an HCI_Reset re-default).
+
+Integration: `bt_sched_tune_init()` after the last HCI_Reset (Bluedroid enabled + ISO host up), replacing
+`bt_raise_acl_priority()`; `bt_sched_tune_streaming(true)` on `ESP_A2D_AUDIO_STATE_STARTED`, `(false)` on
+SUSPEND/STOPPED and on A2DP/ACL disconnect. Mode: `-DBT_SCHED_MODE=BT_SCHED_MODE_AURACAST_FIRST` or
+`bt_sched_tune_set_mode()` at run time.
+
 ## 1. Architecture of the scheduler
 
 * **[C]** One common "multiple linked-list" scheduler: `common/19.o` = `btdm_common/components/schedule/src/multiple_link/btdm_sched.c`.
@@ -81,7 +174,10 @@ entry 4 = ACL table `04 09 0d 0d 09 0d 04 09 04 09 00`). **[I]** these are the e
   (`ble/26.o r_sym_ble_fFDl7Sbo4WkvatgaBjUv`, called from `ble_ll.c`), i.e. on HCI_Reset.
   **[I]** k==0 = first copy of each payload group (prio 9), 0<k<IRC = repetitions (7), k>=IRC = PTO pre-transmissions (8).
 
-### Consequence **[I]**
+  (Second pass: the k mapping is now **[C]**, see 0.1; the ACL formula above omitted nothing but its effect with a raised
+  base was misjudged, see 0.3.)
+
+### Consequence **[I]** (first pass, stock priorities only — see section 0 for raised ACL base)
 BIS subevents (7..9) strictly outrank a BR/EDR ACL anchor (2..4 typical), extended adv (1/5) and scan (1/4). Periodic adv (10)
 outranks everything. When a BIS subevent overlaps the ACL reservation the ACL anchor is dropped (phone's 2/3-DH5 is not
 received/acked, it retransmits) -> throughput loss proportional to the BIG airtime + one ACL reservation. The +24 high
@@ -121,7 +217,8 @@ max(acl->f68, r_olc_util_acl_slot_num(allowed_ptype, edr))` when rx traffic is p
 * No field in `esp_bt.h` controller config reaches these priorities.
 * Common timing: reserved 40 us, lead 46 us (`r_sym_bt_HGbPEa9oUCsYybIAWjE0`), not priority related.
 
-## 6. Levers to try (ordered)
+## 6. Levers to try (ordered) — first pass; superseded by section 0.5 / `bt_sched_tune.c`
+(L2 with base 8 alone loses whole SDUs: ACL escalation 8 -> 9..14 overtakes the first copy at 9.)
 
 **L1. Lower BIS retransmission priority (cheap, runtime, takes effect next BIG event).** Do it after the host stack
 is enabled (after HCI_Reset), before or after Create BIG Test:
