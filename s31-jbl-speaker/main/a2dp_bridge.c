@@ -22,7 +22,6 @@
 #include "esp_a2dp_legacy_api.h"
 
 #include "freertos/FreeRTOS.h"
-#include "freertos/ringbuf.h"
 #include "freertos/task.h"
 #include "esp_heap_caps.h"
 #include "nvs.h"
@@ -41,7 +40,6 @@
 static volatile uint32_t s_underruns;           /* encoder found too little phone audio */
 static volatile uint32_t s_drops;               /* phone audio dropped (buffer full) */
 
-static RingbufHandle_t s_rb;
 static volatile uint32_t s_src_rate = 44100;
 static volatile bool s_streaming;
 static volatile bool s_primed;
@@ -96,46 +94,26 @@ void a2dp_bridge_on_phone_name(void (*cb)(const char *name))
     s_name_cb = cb;
 }
 
-/* ---- 44.1/48 kHz -> 48 kHz resampler --------------------------------------
- * Windowed-sinc polyphase FIR: 32 taps, 256 phases with linear interpolation
- * between phases, Blackman window, cutoff 20 kHz. Linear interpolation (the
- * old resampler) leaves spectral images only ~20-25 dB down that fold back
- * into the audible band (a 10 kHz cymbal -> a false ~14 kHz tone): a harsh,
- * "low-bitrate" sound the LC3 encoder then wastes bits on. This keeps them
- * ~70 dB down. The ratio can still be nudged +-0.2 % for drift control. */
-#define RS_TAPS    32
-#define RS_HALF    (RS_TAPS / 2)
-#define RS_PHASES  256
-#define RS_HIST    4096                        /* staged input frames */
-static float s_kern[RS_PHASES + 1][RS_TAPS];
-static float s_hist[2][RS_HIST];
-static int s_hlen;                             /* valid frames in s_hist */
-static int s_rpos_i;                           /* read position (frames) in s_hist: integer part */
-static float s_rpos_f;                         /* ... and fraction 0..1 (single precision: FPU only does float) */
+/* ---- 44.1/48 kHz -> 48 kHz resampler + phone-audio ring ---------------------
+ * The DSP itself (windowed-sinc polyphase resampler, SPSC ring) is in
+ * a2dp_dsp.h so tools/rs_host_test.c can test the same code on the host.
+ *
+ * Cost (core 1, which also runs Bluedroid and the LC3 encoder): with
+ * A2D_SBC_DECODE_BATCH (idf-patches/0006) the SBC decoder calls a2d_data_cb
+ * once per media packet (~5-8 SBC frames) instead of once per SBC frame, so
+ * the drift computation and the ring publish happen ~50-70 times/s instead of
+ * ~345. The ring is a lock-free SPSC ring (no spinlock / critical section),
+ * and the FIR is single precision, fully unrolled, with no libm calls. */
+#include "a2dp_dsp.h"
+
+#define RB_FRAMES       (RB_BYTES / 4)
+#define PRIME_FRAMES    (PRIME_BYTES / 4)
+#define TARGET_FRAMES   (TARGET_BYTES / 4)
+
+static rs_state_t s_rs;                        /* touched only by the A2DP decoder task */
+static uint32_t s_rs_out[RS_OUT_MAX];          /* one FIR pass of output, internal RAM */
+static spsc_ring_t s_ring;                     /* data in PSRAM, positions here */
 static volatile bool s_rs_reset = true;
-
-static void rs_init_kernel(void)
-{
-    const double fc = 20000.0 / 44100.0;      /* cutoff as a fraction of the input rate */
-    for (int p = 0; p <= RS_PHASES; p++) {
-        double frac = (double)p / RS_PHASES;
-        double sum = 0;
-        for (int k = 0; k < RS_TAPS; k++) {
-            double t = (double)k - (RS_HALF - 1) - frac;         /* tap offset in input samples */
-            double x = 2.0 * fc * t;
-            double sinc = fabs(x) < 1e-9 ? 1.0 : sin(M_PI * x) / (M_PI * x);
-            double w = 0.42 + 0.5 * cos(M_PI * t / RS_HALF) + 0.08 * cos(2.0 * M_PI * t / RS_HALF);
-            if (fabs(t) >= RS_HALF) w = 0;
-            s_kern[p][k] = (float)(2.0 * fc * sinc * w);
-            sum += s_kern[p][k];
-        }
-        for (int k = 0; k < RS_TAPS; k++) {
-            s_kern[p][k] = (float)(s_kern[p][k] / sum);         /* unity gain at DC for every phase */
-        }
-    }
-}
-
-static uint8_t s_out_buf[4096 * 4];   /* 4096 stereo frames at 48 kHz */
 
 /* ---- audio path --------------------------------------------------------- */
 
@@ -143,90 +121,53 @@ static void a2d_data_cb(const uint8_t *data, uint32_t len)
 {
     const int16_t *in = (const int16_t *)data;
     int n = len / 4;                       /* stereo frames */
-    if (n <= 0 || s_rb == NULL) {
+    if (n <= 0 || s_ring.buf == NULL) {
         return;
     }
     s_in_pkts++;
 
-    int16_t *out = (int16_t *)s_out_buf;
-    const int out_max = sizeof(s_out_buf) / 4;
-    int o = 0;
-
     if (s_rs_reset) {
         s_rs_reset = false;
-        memset(s_hist, 0, sizeof(s_hist));
-        s_hlen = RS_TAPS;                  /* start on a short run of silence */
-        s_rpos_i = RS_HALF - 1;
-        s_rpos_f = 0.0f;
-    }
-    if (n > RS_HIST - s_hlen) {
-        n = RS_HIST - s_hlen;              /* never happens with SBC packets (< 2k frames) */
-    }
-    for (int j = 0; j < n; j++) {
-        s_hist[0][s_hlen + j] = in[2 * j];
-        s_hist[1][s_hlen + j] = in[2 * j + 1];
-    }
-    s_hlen += n;
-
-    {
-        /* Drift control: nudge the resampling ratio (max +-0.2 %) so the
-         * buffer hovers around TARGET_BYTES; the phone's clock and ours differ. */
-        float fill = (float)(RB_BYTES - xRingbufferGetCurFreeSize(s_rb));
-        float e = (fill - (float)TARGET_BYTES) / (float)TARGET_BYTES;
-        if (e > 1.0f) e = 1.0f;
-        if (e < -1.0f) e = -1.0f;
-        const float stepf = ((float)s_src_rate / (float)OUT_RATE) * (1.0f + 0.002f * e);
-        const int step_i = (int)stepf;
-        const float step_f = stepf - (float)step_i;
-        int i = s_rpos_i;
-        float fr = s_rpos_f;
-        while (i + RS_HALF < s_hlen && o < out_max) {
-            float ph = fr * RS_PHASES;
-            int p0 = (int)ph;
-            float t = ph - (float)p0;
-            const float *k0 = s_kern[p0], *k1 = s_kern[p0 + 1];
-            const float *x0 = &s_hist[0][i - (RS_HALF - 1)];
-            const float *x1 = &s_hist[1][i - (RS_HALF - 1)];
-            float a0 = 0, a1 = 0, b0 = 0, b1 = 0;   /* both phases, then interpolate the outputs */
-            for (int k = 0; k < RS_TAPS; k++) {
-                a0 += k0[k] * x0[k];
-                a1 += k0[k] * x1[k];
-                b0 += k1[k] * x0[k];
-                b1 += k1[k] * x1[k];
-            }
-            float acc0 = a0 + (b0 - a0) * t;
-            float acc1 = a1 + (b1 - a1) * t;
-            if (acc0 > 32767.f) acc0 = 32767.f; else if (acc0 < -32768.f) acc0 = -32768.f;
-            if (acc1 > 32767.f) acc1 = 32767.f; else if (acc1 < -32768.f) acc1 = -32768.f;
-            out[2 * o] = (int16_t)lrintf(acc0);
-            out[2 * o + 1] = (int16_t)lrintf(acc1);
-            o++;
-            i += step_i;
-            fr += step_f;
-            if (fr >= 1.0f) { fr -= 1.0f; i++; }
-        }
-        /* drop consumed input, keep the taps' history */
-        int keep_from = i - (RS_HALF - 1);
-        if (keep_from > 0) {
-            s_hlen -= keep_from;
-            memmove(s_hist[0], s_hist[0] + keep_from, s_hlen * sizeof(float));
-            memmove(s_hist[1], s_hist[1] + keep_from, s_hlen * sizeof(float));
-            i -= keep_from;
-        }
-        s_rpos_i = i;
-        s_rpos_f = fr;
+        rs_reset(&s_rs);
     }
 
-    /* Drop if the encoder falls behind (keeps latency bounded). */
-    if (o > 0 && xRingbufferSend(s_rb, out, o * 4, 0) != pdTRUE) {
+    /* Drift control, once per packet: nudge the resampling ratio (max
+     * +-0.2 %) so the buffer hovers around TARGET; the phone's clock and
+     * ours differ. */
+    const uint32_t src_rate = s_src_rate;
+    uint32_t space = ring_space(&s_ring);
+    uint32_t fill = RB_FRAMES - space;
+    const float e = ((float)fill - (float)TARGET_FRAMES) / (float)TARGET_FRAMES;
+    const uint64_t step = rs_step_q32(src_rate, OUT_RATE, e);
+
+    /* Drop the whole packet if the encoder has fallen behind (keeps latency
+     * bounded), as the byte ring did when a send did not fit. Bound: n input
+     * frames give at most n / step + 1 outputs (+1 after a reset). */
+    uint32_t need = (uint32_t)(((uint64_t)n << 32) / step) + 3;
+    if (need > space) {
         s_drops++;
+        return;
+    }
+
+    while (n > 0) {
+        int m = rs_room(&s_rs);
+        if (m > n) {
+            m = n;
+        }
+        rs_push(&s_rs, in, m);
+        in += 2 * m;
+        n -= m;
+        int o = rs_run(&s_rs, step, s_rs_out, RS_OUT_MAX);
+        if (o > 0) {
+            ring_write(&s_ring, s_rs_out, o);   /* fits: checked against `need` above */
+        }
     }
 }
 
 bool a2dp_bridge_read(int16_t *pcm, int frames)
 {
     size_t want = frames * 4;
-    if (s_rb == NULL || !s_streaming) {
+    if (s_ring.buf == NULL || !s_streaming) {
         s_primed = false;
         if (s_a2dp_connected) {
             memset(pcm, 0, want);          /* phone connected but paused: silence, like a real speaker */
@@ -234,37 +175,22 @@ bool a2dp_bridge_read(int16_t *pcm, int frames)
         }
         return false;                      /* no phone at all: caller plays the test tone */
     }
-    size_t buffered = RB_BYTES - xRingbufferGetCurFreeSize(s_rb);
+    uint32_t buffered = ring_fill(&s_ring);
     if (!s_primed) {
-        if (buffered < PRIME_BYTES) {
+        if (buffered < PRIME_FRAMES) {
             memset(pcm, 0, want);          /* streaming but still filling: silence */
             return true;
         }
         s_primed = true;
     }
-    if (buffered < want) {
+    if (buffered < (uint32_t)frames) {
         /* Underrun mid-song: play silence and re-prime; never fall back to the tone. */
         s_primed = false;
         s_underruns++;
         memset(pcm, 0, want);
         return true;
     }
-
-    uint8_t *dst = (uint8_t *)pcm;
-    size_t got = 0;
-    while (got < want) {
-        size_t sz = 0;
-        uint8_t *p = xRingbufferReceiveUpTo(s_rb, &sz, 0, want - got);
-        if (p == NULL) {
-            break;
-        }
-        memcpy(dst + got, p, sz);
-        vRingbufferReturnItem(s_rb, p);
-        got += sz;
-    }
-    if (got < want) {
-        memset(dst + got, 0, want - got);
-    }
+    ring_read(&s_ring, (uint32_t *)pcm, frames);
     return true;
 }
 
@@ -287,7 +213,7 @@ void a2dp_bridge_stats(uint32_t *underruns, uint32_t *drops, uint32_t *fill_ms)
 {
     *underruns = s_underruns;
     *drops = s_drops;
-    *fill_ms = s_rb ? (RB_BYTES - xRingbufferGetCurFreeSize(s_rb)) / MS_BYTES(1) : 0;
+    *fill_ms = s_ring.buf ? ring_fill(&s_ring) * 4 / MS_BYTES(1) : 0;
 }
 
 /* ---- profiles ------------------------------------------------------------ */
@@ -526,15 +452,20 @@ esp_err_t a2dp_bridge_start(const char *bredr_name)
     rs_init_kernel();
     /* Phone-audio buffer lives in PSRAM when there is one (frees internal SRAM
      * for Bluetooth and the LC3 encoder); falls back to internal RAM. */
-    s_rb = xRingbufferCreateWithCaps(RB_BYTES, RINGBUF_TYPE_BYTEBUF, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (s_rb == NULL) {
-        s_rb = xRingbufferCreate(RB_BYTES, RINGBUF_TYPE_BYTEBUF);
+    const uint32_t slots = RB_FRAMES + 1;      /* SPSC ring keeps one slot empty */
+    uint32_t *rb = heap_caps_malloc(slots * 4, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (rb == NULL) {
+        rb = heap_caps_malloc(slots * 4, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     }
-    if (s_rb == NULL) {
+    if (rb == NULL) {
         return ESP_ERR_NO_MEM;
     }
+    s_ring.slots = slots;
+    s_ring.wr = 0;
+    s_ring.rd = 0;
+    __atomic_store_n(&s_ring.buf, rb, __ATOMIC_RELEASE);   /* last: a2d_data_cb / read test buf */
     ESP_LOGW(TAG, "audio buffer %u KB in %s; free internal %u KB, PSRAM %u KB", RB_BYTES / 1024,
-             esp_ptr_external_ram(s_rb) ? "PSRAM" : "internal RAM",
+             esp_ptr_external_ram(rb) ? "PSRAM" : "internal RAM",
              (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
              (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
 
