@@ -1,4 +1,4 @@
-﻿/*
+/*
  * S31 as its own "JBL One app": make a nearby JBL speaker join the S31's
  * Auracast broadcast, with no phone involved.
  *
@@ -59,6 +59,7 @@ static const uint8_t com_c2_uuid[16]  = { 0x02, 0x00, 0x6d, 0x6f, 0x63, 0x2e, 0x
 typedef enum {
     ST_IDLE, ST_SCAN_PAUSED, ST_SCANNING, ST_STOPPING, ST_CONNECTING, ST_CONNECTED, ST_PROBING,
     ST_SEARCHING, ST_JOINING, ST_DONE,
+    ST_PARTY_OFF,          /* paused by the party role (S31 is a LISTENer, not hosting) */
 } state_t;
 
 /* 0 = only read the speaker's settings on each state change (learning mode);
@@ -74,6 +75,8 @@ typedef enum {
                                        link so any number of speakers can be brought in */
 
 static bool s_pending_join;
+/* Set by party_role while the S31 listens to another master: no scan, no joins. */
+static volatile bool s_paused;
 
 static volatile state_t s_state = ST_IDLE;
 static esp_gatt_if_t s_gattc_if = ESP_GATT_IF_NONE;
@@ -426,13 +429,18 @@ void jbl_assistant_gap_event(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_
 {
     switch (event) {
     case ESP_GAP_BLE_SET_EXT_SCAN_PARAMS_COMPLETE_EVT:
-        esp_ble_gap_start_ext_scan(0, 0);
+        /* only our own request (party_role drives the scanner while it listens) */
+        if (s_state == ST_SCANNING && !s_paused) {
+            esp_ble_gap_start_ext_scan(0, 0);
+        }
         break;
     case ESP_GAP_BLE_EXT_SCAN_START_COMPLETE_EVT:
         ESP_LOGI(TAG, "LE scan started (status %d)", param->ext_scan_start.status);
         break;
     case ESP_GAP_BLE_EXT_SCAN_STOP_COMPLETE_EVT:
-        if (s_state == ST_STOPPING) {
+        if (s_state == ST_STOPPING && s_paused) {
+            s_state = ST_IDLE;          /* paused meanwhile: don't connect */
+        } else if (s_state == ST_STOPPING) {
             s_state = ST_CONNECTING;
             esp_ble_gattc_aux_open(s_gattc_if, s_peer, s_peer_type, true);
         }
@@ -566,6 +574,7 @@ static void assistant_task(void *arg)
 {
     TickType_t state_since = xTaskGetTickCount();
     state_t last = s_state;
+    bool pause_close = false;      /* link close already requested for this pause */
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(500));
         if (s_state != last) {
@@ -573,6 +582,47 @@ static void assistant_task(void *arg)
             state_since = xTaskGetTickCount();
         }
         TickType_t age = xTaskGetTickCount() - state_since;
+        /* Party role LISTEN: the S31 is not hosting, so there is nothing to
+         * bring a speaker into, and the LE scanner belongs to the sink. */
+        if (s_paused) {
+            switch (s_state) {
+            case ST_SCANNING:
+                ESP_LOGW(TAG, "party LISTEN -> stopping the JBL speaker scan (S31 is not hosting)");
+                esp_ble_gap_stop_ext_scan();    /* queued before party_role's own scan commands */
+                s_state = ST_PARTY_OFF;
+                break;
+            case ST_IDLE:
+            case ST_SCAN_PAUSED:
+                s_state = ST_PARTY_OFF;
+                break;
+            case ST_STOPPING:
+                if (age > pdMS_TO_TICKS(3000)) {
+                    s_state = ST_IDLE;
+                }
+                break;
+            case ST_CONNECTING:
+                if (age > pdMS_TO_TICKS(15000)) {
+                    esp_ble_gattc_close(s_gattc_if, s_conn_id);
+                    s_state = ST_IDLE;
+                }
+                break;
+            case ST_CONNECTED: case ST_PROBING: case ST_SEARCHING: case ST_JOINING: case ST_DONE:
+                if (!pause_close) {
+                    ESP_LOGW(TAG, "party LISTEN -> closing the control link to speaker 0x%04x", s_cur_crc);
+                    pause_close = true;
+                    esp_ble_gattc_close(s_gattc_if, s_conn_id);
+                }
+                break;
+            default:
+                break;
+            }
+            continue;
+        }
+        pause_close = false;
+        if (s_state == ST_PARTY_OFF) {
+            ESP_LOGW(TAG, "party HOST -> JBL speaker assistant resumed");
+            s_state = a2dp_bridge_streaming() ? ST_SCAN_PAUSED : ST_IDLE;
+        }
         /* While phone music streams, stop the LE scan: each 30 ms scan window
          * blocks the phone's A2DP link, which then can't carry bitpool 53.
          * Native join doesn't need it - speakers find us by our own adverts. */
@@ -648,6 +698,17 @@ static void assistant_task(void *arg)
             break;
         }
     }
+}
+
+void jbl_assistant_set_paused(bool paused)
+{
+    s_paused = paused;
+}
+
+bool jbl_assistant_scan_idle(void)
+{
+    state_t s = s_state;
+    return s != ST_SCANNING && s != ST_STOPPING && s != ST_IDLE && s != ST_SCAN_PAUSED;
 }
 
 esp_err_t jbl_assistant_start(uint16_t own_mac_crc, const char *own_broadcast_name)

@@ -1,4 +1,4 @@
-set(srcs "main.c" "jbl_gatt.c" "a2dp_bridge.c" "jbl_assistant.c" "jbl_v5_server.c" "bt_sched_tune.c")
+set(srcs "main.c" "jbl_gatt.c" "a2dp_bridge.c" "jbl_assistant.c" "jbl_v5_server.c" "bt_sched_tune.c" "party_role.c")
 
 if(CONFIG_BT_BLUEDROID_ENABLED)
     list(APPEND srcs "bluedroid/adv.c")
@@ -8,7 +8,7 @@ endif()
 
 idf_component_register(SRCS ${srcs}
                        INCLUDE_DIRS "."
-                       REQUIRES bt nvs_flash liblc3 esp_ringbuf esp_psram esp_timer)
+                       REQUIRES bt nvs_flash liblc3 esp_ringbuf esp_psram esp_timer esp_driver_i2s)
 
 # Radio priority profile: Auracast first copies on top (15), A2DP next (8),
 # then BIS repetitions / adverts. Measured: A2DP_FIRST lost ~65% of Auracast

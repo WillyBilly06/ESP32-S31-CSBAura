@@ -22,6 +22,10 @@ bool a2dp_bridge_streaming(void);
 bool a2dp_bridge_connected(void);
 uint32_t a2dp_bridge_packets(void);
 
+/* Called (BTC task, keep it short) on every A2DP audio start / suspend / stop and
+ * on A2DP disconnect, with the new streaming state. */
+void a2dp_bridge_on_audio_state(void (*cb)(bool streaming));
+
 /* Called with the connected phone's Bluetooth name (for the JBL beacon). */
 void a2dp_bridge_on_phone_name(void (*cb)(const char *name));
 

@@ -1,4 +1,4 @@
-﻿/*
+/*
  * SPDX-FileCopyrightText: 2021-2022 Nordic Semiconductor ASA
  * SPDX-FileContributor: 2026 Espressif Systems (Shanghai) CO LTD
  *
@@ -50,6 +50,7 @@
 #include "jbl_assistant.h"
 #include "jbl_v5_server.h"
 #include "app_task.h"
+#include "party_role.h"
 
 /* 48 kHz / 10 ms stereo â€” the "High Quality" Auracast format. */
 /* 48_2_2 = high-reliability variant: same codec (48 kHz/10 ms/100 B), RTN 4 but
@@ -117,7 +118,10 @@ ESP_BLE_AUDIO_BAP_LC3_BROADCAST_PRESET_48_2_2_DEFINE(preset_active,
  * takes an LE-only path and never opens the device. */
 #define JBL_MISC_INFO          0x1080
 #define JBL_PARTY_METHOD       0xC0
-#define JBL_PARTY_INFO_HOST    0xB440
+#define JBL_PARTY_INFO_HOST    PARTY_INFO_HOST
+/* partyInfo in the beacon: Primary while hosting; Secondary "looking for a
+ * master" / "connected" while the party role listens to another JBL master. */
+static volatile uint16_t s_party_info = JBL_PARTY_INFO_HOST;
 static uint8_t jbl_beacon_payload[16];
 static uint8_t jbl_beacon_len;
 /* CRC-16/ARC of the connected phone's Bluetooth name: JBL One only treats a
@@ -155,7 +159,7 @@ static uint16_t jbl_beacon_build(void)
     p[i++] = JBL_BATTERY;
     p[i++] = JBL_MISC_INFO & 0xFF;   p[i++] = JBL_MISC_INFO >> 8;
     p[i++] = JBL_PARTY_METHOD;
-    p[i++] = JBL_PARTY_INFO_HOST & 0xFF; p[i++] = JBL_PARTY_INFO_HOST >> 8;
+    p[i++] = s_party_info & 0xFF;    p[i++] = s_party_info >> 8;
     p[i++] = 0x00;                                                    /* stereoGroupId */
     jbl_beacon_len = i;
     return crc;
@@ -648,15 +652,29 @@ static void tx_scheduler_cb(void *arg)
     }
 }
 
+/* Given by the source callbacks (iso task), taken by host_start / host_stop
+ * (party task) to wait for the BIG to really be up / down. */
+static SemaphoreHandle_t s_src_started_sem, s_src_stopped_sem;
+/* Broadcast advertising (ADV_HANDLE) is on air: pa_update_task may refresh it. */
+static volatile bool s_hosting;
+
 static void source_started_cb(esp_ble_audio_bap_broadcast_source_t *source)
 {
     ESP_LOGW(TAG, "Broadcast source started: '%s' Broadcast_ID 0x%06x (open, 48 kHz stereo)",
              LOCAL_BROADCAST_NAME, LOCAL_BROADCAST_ID);
+    party_role_on_source_started();
+    if (s_src_started_sem != NULL) {
+        xSemaphoreGive(s_src_started_sem);
+    }
 }
 
 static void source_stopped_cb(esp_ble_audio_bap_broadcast_source_t *source, uint8_t reason)
 {
     ESP_LOGI(TAG, "Broadcast source stopped, reason 0x%02x", reason);
+    party_role_on_source_stopped();
+    if (s_src_stopped_sem != NULL) {
+        xSemaphoreGive(s_src_stopped_sem);
+    }
 
     for (size_t i = 0; i < ARRAY_SIZE(streams); i++) {
         if (streams[i].data != NULL) {
@@ -907,6 +925,9 @@ static void pa_update_task(void *arg)
             slow = want_slow;
             beacon_set_interval(slow ? BEACON_STREAMING_MS : BEACON_INTERVAL_MS);
         }
+        if (!s_hosting) {
+            continue;                   /* party LISTEN: our periodic adv is off */
+        }
         s_pa_nn++;
         uint8_t len = 0;
         uint8_t *d = per_adv_data_build(&len);
@@ -917,8 +938,12 @@ static void pa_update_task(void *arg)
     }
 }
 
-static int broadcast_start(void)
+/* HOST: broadcast advertising (ext + periodic on ADV_HANDLE) and the BAP
+ * broadcast source (BIG). Called at boot and by the party role on every
+ * LISTEN -> HOST switch; the source object itself is created once. */
+static int host_start(void)
 {
+    static bool adv_added;
     esp_ble_audio_bap_broadcast_adv_info_t info = {
         .adv_handle = ADV_HANDLE,
     };
@@ -943,14 +968,27 @@ static int broadcast_start(void)
     if (err) {
         goto end;
     }
-    err = esp_ble_audio_bap_broadcast_adv_add(&info);
-    if (err) {
-        ESP_LOGE(TAG, "Failed to add adv for broadcast source, err %d", err);
-        goto end;
+    s_hosting = true;
+    if (!adv_added) {
+        /* registers ADV_HANDLE with the LE Audio host once; kept across switches */
+        err = esp_ble_audio_bap_broadcast_adv_add(&info);
+        if (err) {
+            ESP_LOGE(TAG, "Failed to add adv for broadcast source, err %d", err);
+            goto end;
+        }
+        adv_added = true;
+    }
+    if (s_src_started_sem != NULL) {
+        xSemaphoreTake(s_src_started_sem, 0);
     }
     err = esp_ble_audio_bap_broadcast_source_start(broadcast_source, ADV_HANDLE);
     if (err) {
         ESP_LOGE(TAG, "Failed to start broadcast source, err %d", err);
+        goto end;
+    }
+    if (s_src_started_sem != NULL &&
+        xSemaphoreTake(s_src_started_sem, pdMS_TO_TICKS(3000)) != pdTRUE) {
+        ESP_LOGW(TAG, "broadcast source: no 'started' callback within 3 s (BIG not created?)");
     }
 
 end:
@@ -958,6 +996,48 @@ end:
     free(per_data);
     return err;
 }
+
+/* Stop hosting: BIG terminate (waits for the source's stopped callback), then
+ * the broadcast's periodic + extended advertising. The source object stays
+ * created (configured state) for the next host_start(). */
+static int host_stop(void)
+{
+    int ret = 0;
+
+    if (s_src_stopped_sem != NULL) {
+        xSemaphoreTake(s_src_stopped_sem, 0);
+    }
+    esp_err_t err = esp_ble_audio_bap_broadcast_source_stop(broadcast_source);
+    if (err == ESP_OK) {
+        if (s_src_stopped_sem != NULL &&
+            xSemaphoreTake(s_src_stopped_sem, pdMS_TO_TICKS(3000)) != pdTRUE) {
+            ESP_LOGW(TAG, "broadcast source: no 'stopped' callback within 3 s");
+            ret = -ETIMEDOUT;
+        }
+    } else {
+        ESP_LOGI(TAG, "broadcast source stop: %s (not streaming?)", esp_err_to_name(err));
+    }
+    s_hosting = false;
+    ext_adv_stop();
+    return ret;
+}
+
+static void jbl_beacon_set_party_info(uint16_t pi)
+{
+    uint8_t adv[4 + sizeof(jbl_beacon_payload)];
+
+    s_party_info = pi;
+    uint8_t n = jbl_beacon_ad(adv);
+    if (beacon_adv_data_update(adv, n) != 0) {
+        s_beacon_dirty = true;          /* pa_update_task retries */
+    }
+}
+
+static const party_role_ops_t s_party_ops = {
+    .host_start = host_start,
+    .host_stop = host_stop,
+    .set_party_info = jbl_beacon_set_party_info,
+};
 
 /* reassembly of long (prepared) writes: cold, so PSRAM, allocated on the
  * first prepared write */
@@ -1097,6 +1177,14 @@ static void stats_task(void *arg)
     for (;;) {
         vTaskDelayUntil(&last, pdMS_TO_TICKS(2000));
 
+        if (!party_role_is_hosting()) {
+            /* party LISTEN: no broadcast of our own; show the sink side */
+            party_role_log_stats();
+            last_sent = g_frames_sent;
+            g_iso_done = g_iso_not_txd = g_iso_drift = g_late_ticks = g_max_gap_us = 0;
+            g_enc_us_sum = g_enc_us_max = g_enc_n = 0;
+            continue;
+        }
         uint32_t now = g_frames_sent;
         uint32_t ur, dr, sk, fill;
         a2dp_bridge_stats(&ur, &dr, &sk, &fill);
@@ -1188,7 +1276,11 @@ void app_main(void)
     if (esp_ble_gatts_register_callback(gatts_cb) == ESP_OK) {
         esp_ble_gatts_app_register(0x0A);
     }
-    err = esp_ble_audio_common_init(NULL);
+    /* gap_cb: ext scan reports + PA sync events for the party role's sink */
+    esp_ble_audio_init_info_t audio_info = {
+        .gap_cb = party_role_iso_gap_cb,
+    };
+    err = esp_ble_audio_common_init(&audio_info);
     if (err) {
         ESP_LOGE(TAG, "Failed to initialize audio, err %d", err);
         return;
@@ -1196,6 +1288,11 @@ void app_main(void)
     err = broadcast_source_setup();
     if (err) {
         return;
+    }
+    /* Broadcast sink side (party LISTEN): PACS sink cap, scan delegator, sink callbacks */
+    err = party_role_init();
+    if (err) {
+        ESP_LOGE(TAG, "Party role (sink side) init failed, err %d - LISTEN mode will not work", err);
     }
     err = esp_ble_audio_common_start(NULL);
     if (err) {
@@ -1234,7 +1331,9 @@ void app_main(void)
      * not be used while the cache is off, i.e. no NVS/flash calls in them. */
     app_task_cold("tx_stats", stats_task, 4096, 2);
 
-    err = broadcast_start();
+    s_src_started_sem = xSemaphoreCreateBinary();
+    s_src_stopped_sem = xSemaphoreCreateBinary();
+    err = host_start();
     if (err) {
         ESP_LOGE(TAG, "Failed to start broadcast, err %d", err);
         return;
@@ -1252,4 +1351,9 @@ void app_main(void)
 
     /* No app needed: the S31 itself tells a nearby Xtreme 5 to join us. */
     jbl_assistant_start(jbl_beacon_build(), LOCAL_BROADCAST_NAME);
+
+    /* JBL Xtreme 5 party behaviour: HOST while the phone streams, otherwise
+     * (after PARTY_HOLDOFF_MS) LISTEN to another JBL master's Auracast. */
+    a2dp_bridge_on_audio_state(party_role_on_audio_state);
+    party_role_start(&s_party_ops, jbl_beacon_build(), true);
 }

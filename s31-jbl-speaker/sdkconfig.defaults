@@ -35,6 +35,22 @@ CONFIG_BT_BAP_BROADCAST_SOURCE=y
 CONFIG_BT_BAP_BROADCAST_SRC_SUBGROUP_COUNT=1
 CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT=2
 
+# Party role LISTEN (main/party_role.c): when the phone stops streaming the S31
+# stops hosting and joins another JBL master's Auracast as a BAP broadcast sink
+# (PA sync + BASE + BIG sync of 2 BIS). The sink needs the scan delegator
+# (BASS) and a sink PAC record. Source and sink never run at the same time:
+# one BIG (host BT_ISO_MAX_BIG / controller BT_LE_ISO_BIG = 1) is enough.
+CONFIG_BT_BAP_SCAN_DELEGATOR=y
+CONFIG_BT_BAP_BROADCAST_SINK=y
+CONFIG_BT_BAP_BROADCAST_SNK_SUBGROUP_COUNT=1
+CONFIG_BT_BAP_BROADCAST_SNK_STREAM_COUNT=2
+CONFIG_BT_PAC_SNK_NOTIFIABLE=y
+CONFIG_BT_PAC_SNK_LOC_WRITEABLE=y
+CONFIG_BT_PAC_SNK_LOC_NOTIFIABLE=y
+CONFIG_BT_PACS_SUPPORTED_CONTEXT_NOTIFIABLE=y
+# GATT server services: JBL x3 + PACS + BASS + the built-in ones (8 was tight)
+CONFIG_BT_GATT_MAX_SR_PROFILES=12
+
 # PSRAM for audio buffers; small/time-critical allocations stay in internal SRAM.
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_USE_MALLOC=y

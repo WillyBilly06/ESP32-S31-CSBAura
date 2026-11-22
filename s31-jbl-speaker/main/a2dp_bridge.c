@@ -1,4 +1,4 @@
-﻿/*
+/*
  * BR/EDR side of the S31 "JBL speaker":
  *   - dual-mode controller (BLE for Auracast + Classic for phones)
  *   - discoverable as a loudspeaker, A2DP sink (SBC)
@@ -88,6 +88,12 @@ extern uint8_t BTM_GetRole(uint8_t *remote_bd_addr, uint8_t *p_role);
 /* All ACL packet types, EDR (2/3 Mbps) DH1/DH3/DH5 allowed (no "NO_x_DHy" bits). */
 #define ACL_PKT_ALL_EDR (ESP_BT_ACL_PKT_TYPES_MASK_DM1 | ESP_BT_ACL_PKT_TYPES_MASK_DH1 |                          ESP_BT_ACL_PKT_TYPES_MASK_DM3 | ESP_BT_ACL_PKT_TYPES_MASK_DH3 |                          ESP_BT_ACL_PKT_TYPES_MASK_DM5 | ESP_BT_ACL_PKT_TYPES_MASK_DH5)
 static void (*s_name_cb)(const char *name);
+static void (*s_audio_state_cb)(bool streaming);
+
+void a2dp_bridge_on_audio_state(void (*cb)(bool streaming))
+{
+    s_audio_state_cb = cb;
+}
 
 void a2dp_bridge_on_phone_name(void (*cb)(const char *name))
 {
@@ -295,6 +301,9 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *p)
             s_rs_reset = true;           /* next phone starts from a clean resampler ... */
             s_flush_req = true;          /* ... and an empty ring */
             bt_sched_tune_streaming(false);
+            if (s_audio_state_cb) {
+                s_audio_state_cb(false);     /* party role: no phone audio any more */
+            }
             esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
             if (lost) {
                 s_retry_after_loss = true;   /* reconnect_task calls the phone back */
@@ -313,6 +322,9 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *p)
         __atomic_thread_fence(__ATOMIC_RELEASE);
         s_streaming = (p->audio_stat.state == ESP_A2D_AUDIO_STATE_STARTED);
         bt_sched_tune_streaming(s_streaming);
+        if (s_audio_state_cb) {
+            s_audio_state_cb(s_streaming);   /* party role: HOST on start, LISTEN after a hold-off */
+        }
         if (s_have_peer) {
             uint8_t role = 0xFF;
             BTM_GetRole(s_peer, &role);
