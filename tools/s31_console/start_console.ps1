@@ -5,6 +5,7 @@
   .\start_console.ps1            # real board on COM5 @ 921600
   .\start_console.ps1 -Mock      # simulator, no hardware touched
   .\start_console.ps1 -Port COM7 -Baud 115200 -LogOnStart
+  .\start_console.ps1 -Project E:\ESP32-S31-CSBAura\s31-btstack-speaker   # flash another project
 #>
 param(
   [switch]$Mock,
@@ -13,7 +14,8 @@ param(
   [int]$HttpPort = 8765,
   [switch]$LogOnStart,
   [switch]$NoAutoLog,
-  [switch]$NoBrowser
+  [switch]$NoBrowser,
+  [string]$Project = ""
 )
 $py = Join-Path $env:USERPROFILE ".espressif\python_env\idf6.1_py3.12_env\Scripts\python.exe"
 if (-not (Test-Path $py)) { Write-Warning "IDF python env not found at $py - falling back to 'python'"; $py = "python" }
@@ -22,6 +24,7 @@ $argList = @($server, "--port", $Port, "--baud", $Baud, "--http-port", $HttpPort
 if ($Mock)       { $argList += "--mock" }
 if ($LogOnStart) { $argList += "--log-on-start" }
 if ($NoAutoLog)  { $argList += "--no-auto-log" }
+if ($Project)    { $argList += @("--project", $Project) }
 if (-not $NoBrowser) {
   # open the UI shortly after the server comes up
   Start-Job -ScriptBlock { param($u) Start-Sleep -Seconds 1.5; Start-Process $u } -ArgumentList "http://127.0.0.1:$HttpPort/" | Out-Null

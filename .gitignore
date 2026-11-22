@@ -29,3 +29,9 @@ __pycache__/
 tools/s31_console/__pycache__/
 tools/s31_console/mock_logs/
 s31-jbl-speaker/logs/
+
+# BTstack (personal/non-commercial license) - clone https://github.com/bluekitchen/btstack
+third_party/btstack/
+s31-btstack-speaker/build*/
+s31-btstack-speaker/build.log
+s31-btstack-speaker/logs/

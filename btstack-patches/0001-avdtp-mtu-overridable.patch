@@ -1,0 +1,14 @@
+diff --git a/src/classic/avdtp.h b/src/classic/avdtp.h
+index 994a8e7..dfe1964 100644
+--- a/src/classic/avdtp.h
++++ b/src/classic/avdtp.h
+@@ -57,7 +57,9 @@ extern "C" {
+ #endif
+ 
+ // Limit L2CAP MTU to fit largest packet for BR/EDR
++#ifndef AVDTP_L2CAP_MTU
+ #define AVDTP_L2CAP_MTU (HCI_ACL_3DH5_SIZE - L2CAP_HEADER_SIZE)
++#endif
+ 
+ #define AVDTP_MAX_NUM_SEPS 10
+ #define AVDTP_MAX_CSRC_NUM 15
