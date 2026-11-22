@@ -173,7 +173,7 @@ static const uint8_t jbl_master_mfg_ad[] = {
 /* PA, after the BASE: Manufacturer Specific Data, company 0xFDDF, TLVs
  * [02 02 03] [03 f0 11 NN] [12 11 <17-byte status, YY at +17, TG at +20>].
  * Byte-exact copy of a real Xtreme 5 party master sniffed on 2026-11-22
- * (s31-btstack-speaker S31_SNIFFER): NN +1 per update, YY and TG (00/01) vary
+ * (s31-btstack-speaker S31_SNIFFER): NN +1 per update, YY = clock (1/64 s units mod 200), TG (00/01) varies
  * with no time pattern, updates every 400-1100 ms. */
 static const uint8_t jbl_pa_mfg_ad[] = {
     0x1d, 0xff, 0xdf, 0xfd,
@@ -436,7 +436,11 @@ static void pa_refresh(void)
 #endif
     uint32_t r = esp_random();
     s_pa[s_pa_jbl_pos + JBL_PA_NN_OFFSET] = s_pa_nn;
-    s_pa[s_pa_jbl_pos + JBL_PA_YY_OFFSET] = (uint8_t)r;
+    /* YY is NOT random: the real master's YY is a clock - +~62 per second,
+     * wrapping at 200 (1/64 s units mod 200), decoded from 385 sniffed updates.
+     * Random values made party members see the master's time jump every update
+     * (their volume dived to ~5 %). */
+    s_pa[s_pa_jbl_pos + JBL_PA_YY_OFFSET] = (uint8_t)((uint64_t)esp_timer_get_time() * 64u / 1000000u % 200u);
     s_pa[s_pa_jbl_pos + JBL_PA_TG_OFFSET] = ((r >> 8) % 10) < 6 ? 1 : 0;
     gap_periodic_advertising_set_data(s_adv_handle, s_pa_len, s_pa);
 }
