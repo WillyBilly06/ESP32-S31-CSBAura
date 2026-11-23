@@ -36,6 +36,13 @@ typedef struct {
     uint16_t kbps;
 } party_assist_t;
 void party_assist_scan(bool on, uint8_t seconds);
-void party_assist_join(const uint8_t addr[6], uint8_t addr_type);
+/* code: 16-byte broadcast code for an encrypted broadcast, NULL = open */
+void party_assist_join(const uint8_t addr[6], uint8_t addr_type, const uint8_t *code);
 void party_assist_leave(void);
 void party_assist_get(party_assist_t *out);
+
+/* BT thread: JBL One "Broadcast to Others" - a standard Auracast broadcast (any
+ * Auracast receiver can join; not the JBL party), with this name and an optional
+ * 16-byte broadcast code. Turning it on turns the JBL party broadcast off. */
+void party_set_standard_broadcast(bool on, const char *name, const uint8_t *code);
+bool party_standard_broadcast_on(void);

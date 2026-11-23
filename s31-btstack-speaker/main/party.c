@@ -103,7 +103,20 @@ static struct {
     bd_addr_t addr;
     uint8_t type;
     uint32_t t0;
+    bool has_code;
+    uint8_t code[16];
 } s_as;
+
+/* standard Auracast broadcast (JBL One "Broadcast to Others") */
+static bool s_std_on;
+static char s_std_name[33];
+static bool s_std_has_code;
+static uint8_t s_std_code[16];
+
+static uint16_t party_info_hosting(void)
+{
+    return s_std_on ? JBL_PARTY_INFO_OFF : JBL_PARTY_INFO_HOST;   /* standard: not a JBL party */
+}
 static hci_con_handle_t s_pa_handle = HCI_CON_HANDLE_INVALID;
 static bool s_pa_pending, s_big_active, s_big_pending;
 static le_audio_big_sync_t s_big;
@@ -175,7 +188,11 @@ static void set_ls(lstate_t l, const char *why)
         s_ls = l;
         s_state_ms = now_ms();
     }
-    jbl_set_party_info(l == L_STREAM ? JBL_PARTY_INFO_SECONDARY : JBL_PARTY_INFO_LOOKING);
+    if (s_as.target) {
+        jbl_set_party_info(JBL_PARTY_INFO_OFF);      /* JBL One join: an ordinary Auracast receiver */
+    } else {
+        jbl_set_party_info(l == L_STREAM ? JBL_PARTY_INFO_SECONDARY : JBL_PARTY_INFO_LOOKING);
+    }
 }
 
 static bool blacklisted(const bd_addr_t a)
@@ -634,7 +651,8 @@ static void try_big_sync(void)
     if (!s_have_base || !s_have_biginfo || s_big_pending || s_big_active) {
         return;
     }
-    if (s_biginfo_enc) {
+    bool use_code = s_biginfo_enc && s_as.target && s_as.has_code;
+    if (s_biginfo_enc && !use_code) {
         ESP_LOGW(TAG, "'%s' is encrypted - skipping it", s_cand_name);
         if (s_as.target && !s_as.reported) {
             s_as.reported = true;
@@ -649,6 +667,11 @@ static void try_big_sync(void)
     s_big_params.big_handle = BIG_SYNC_HANDLE;
     s_big_params.sync_handle = s_pa_handle;
     s_big_params.big_sync_timeout_10ms = 200;
+    if (use_code) {
+        s_big_params.encryption = 1;
+        memcpy(s_big_params.broadcast_code, s_as.code, 16);
+        ESP_LOGW(TAG, "'%s' is encrypted - syncing with the code from JBL One", s_cand_name);
+    }
     s_big_params.num_bis = s_base.nbis;
     for (int i = 0; i < s_base.nbis; i++) {
         s_big_params.bis_indices[i] = s_base.bis_index[i];
@@ -813,6 +836,11 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
             s_big_pending = false;
             if (gap_subevent_big_sync_created_get_status(packet) != 0) {
                 ESP_LOGW(TAG, "BIG sync failed 0x%02x", gap_subevent_big_sync_created_get_status(packet));
+                if (s_as.target && !s_as.reported) {
+                    s_as.reported = true;
+                    s_as.target = false;
+                    jbl_v5_assist_result(1, s_as.addr, s_as.type, (s_biginfo_enc && s_as.has_code) ? 3 : 2);
+                }
                 blacklist(s_cand_addr, BLACKLIST_MS);
                 listen_reset("BIG sync failed");
                 break;
@@ -904,7 +932,14 @@ static void tick(btstack_timer_source_t *ts)
         jbl_v5_assist_result(1, s_as.addr, s_as.type, 2);
         if (party_listening()) listen_reset("join timed out");
     }
-    if (!s_enabled && s_role != R_OFF && !s_as.target) {   /* Auracast button: off */
+    if ((s_role == R_HOST || s_role == R_HOST_STOPPING) && auracast_state() == AURACAST_STATE_ON &&
+        auracast_is_standard() != s_std_on && !s_as.target) {
+        auracast_host_stop();                         /* other broadcast type wanted: restart */
+        set_role(R_OFF, s_std_on ? "switching to a standard broadcast" : "switching to the JBL party");
+    }
+    bool jbl_listen = s_role == R_LISTEN || s_role == R_LISTEN_STOPPING;
+    if (s_role != R_OFF && !s_as.target &&
+        ((!s_enabled && !s_std_on) || (s_std_on && jbl_listen))) {   /* Auracast off / standard: no JBL receive */
         if (s_role == R_LISTEN || s_role == R_LISTEN_STOPPING) {
             set_role(R_OFF, "Auracast turned off");
             listen_reset("Auracast off");
@@ -923,7 +958,17 @@ static void tick(btstack_timer_source_t *ts)
             set_ls(L_OFF, "join");
             break;
         }
+        if (s_std_on && auracast_state() == AURACAST_STATE_OFF) {     /* JBL One: Broadcast to Others */
+            auracast_set_standard(true, s_std_name, s_std_has_code ? s_std_code : NULL);
+            int rc = auracast_host_start();
+            s_idle_ms = 0;
+            jbl_assist_set_paused(true);                  /* not a JBL party: pull no speakers in */
+            jbl_set_party_info(JBL_PARTY_INFO_OFF);
+            set_role(R_HOST, rc == 0 ? "standard broadcast on" : "standard broadcast on (start error)");
+            break;
+        }
         if (s_enabled && auracast_state() == AURACAST_STATE_OFF) {
+            auracast_set_standard(false, NULL, NULL);
             int rc = auracast_host_start();               /* back on: host first */
             s_idle_ms = 0;
             jbl_assist_set_paused(false);
@@ -932,7 +977,7 @@ static void tick(btstack_timer_source_t *ts)
         }
         break;
     case R_HOST:
-        if (!playing && s_idle_ms >= PARTY_IDLE_TO_LISTEN_MS) {
+        if (!playing && s_idle_ms >= PARTY_IDLE_TO_LISTEN_MS && (!s_std_on || s_as.target)) {
             auracast_host_stop();
             set_role(R_HOST_STOPPING, "no audio for 1.5 s");
         }
@@ -958,8 +1003,8 @@ static void tick(btstack_timer_source_t *ts)
         break;
     case R_LISTEN_STOPPING:
         if (!s_big_active && !s_big_pending && !s_pa_pending) {
-            jbl_assist_set_paused(false);
-            jbl_set_party_info(JBL_PARTY_INFO_HOST);
+            jbl_assist_set_paused(s_std_on);
+            jbl_set_party_info(party_info_hosting());
             int rc = auracast_host_start();
             s_st.switches_host++;
             set_role(R_HOST, rc == 0 ? "listen torn down" : "listen torn down (host start error)");
@@ -1030,6 +1075,13 @@ bool party_auracast_enabled(void) { return s_enabled; }
 
 void party_set_auracast_enabled(bool on)
 {
+    if (on && (s_std_on || s_as.target)) {           /* back to the JBL party: standard modes end */
+        s_std_on = false;
+        s_as.target = s_as.joined = false;
+        ESP_LOGW(TAG, "JBL party back on: standard broadcast / join ended");
+        if (party_listening()) listen_reset("JBL party back on");
+        jbl_v5_on_party_changed();
+    }
     if (on != s_enabled) {
         ESP_LOGW(TAG, "Auracast %s (button)", on ? "ON" : "OFF");
         s_enabled = on;
@@ -1100,14 +1152,22 @@ void party_assist_scan(bool on, uint8_t seconds)
     jbl_v5_assist_scan_state(false);
 }
 
-void party_assist_join(const uint8_t addr[6], uint8_t addr_type)
+void party_assist_join(const uint8_t addr[6], uint8_t addr_type, const uint8_t *code)
 {
     party_assist_scan(false, 0);
+    s_as.has_code = code != NULL;
+    memset(s_as.code, 0, sizeof(s_as.code));
+    if (code) memcpy(s_as.code, code, 16);
     memcpy(s_as.addr, addr, 6);
     s_as.type = addr_type;
     s_as.target = true;
     s_as.joined = s_as.reported = false;
     s_as.t0 = now_ms();
+    if (s_enabled || s_std_on) {                      /* standard receive: JBL party off until toggled on */
+        s_enabled = false;
+        s_std_on = false;
+        jbl_v5_on_party_changed();
+    }
     ESP_LOGW(TAG, "JBL One: join broadcast %s", bd_addr_to_str(s_as.addr));
     if (party_listening()) listen_reset("JBL One: join a broadcast");
 }
@@ -1136,9 +1196,43 @@ void party_assist_get(party_assist_t *o)
     }
 }
 
+void party_set_standard_broadcast(bool on, const char *name, const uint8_t *code)
+{
+    if (name && name[0]) {
+        size_t k = strlen(name);
+        if (k > 32) k = 32;
+        memcpy(s_std_name, name, k);
+        s_std_name[k] = 0;
+    }
+    s_std_has_code = code != NULL;
+    memset(s_std_code, 0, sizeof(s_std_code));
+    if (code) memcpy(s_std_code, code, 16);
+    if (on == s_std_on) {
+        if (on && auracast_state() == AURACAST_STATE_ON) {
+            auracast_host_stop();                     /* new name / code: restart it */
+            set_role(R_OFF, "standard broadcast settings changed");
+        }
+        return;
+    }
+    s_std_on = on;
+    ESP_LOGW(TAG, "JBL One: Broadcast to Others %s%s%s%s", on ? "ON - standard Auracast '" : "OFF",
+             on ? s_std_name : "", on ? "'" : "", on && s_std_has_code ? " (encrypted)" : "");
+    if (on) {
+        s_enabled = false;                            /* JBL party broadcast + receive off until toggled on */
+        if (s_as.target) {
+            s_as.target = s_as.joined = false;        /* broadcasting, not receiving */
+            if (party_listening()) listen_reset("JBL One: Broadcast to Others");
+        }
+    }
+    tones_play(on ? "ent_aura" : "exi_aura");
+    jbl_v5_on_party_changed();
+}
+
+bool party_standard_broadcast_on(void) { return s_std_on; }
+
 uint8_t party_v5_role(void)
 {
-    if (s_role == R_OFF || !party_auracast_enabled()) return 0;
+    if (s_role == R_OFF || s_std_on || !party_auracast_enabled()) return 0;   /* standard: no JBL party */
     return party_listening() ? 1 : 2;
 }
 

@@ -194,7 +194,17 @@ static const uint8_t jbl_pa_mfg_ad[] = {
 #define JBL_PA_TG_OFFSET       20
 
 /* ---- advertising / BIG storage (BT thread) --------------------------------- */
-static uint8_t s_ext_adv[7 + 6 + 4 + 2 * (2 + 24) + sizeof(jbl_master_mfg_ad)];
+static uint8_t s_ext_adv[7 + 6 + 4 + 2 * (2 + 32) + sizeof(jbl_master_mfg_ad)];
+
+/* Standard Auracast (JBL One "Broadcast to Others"): a plain LE Audio broadcast
+ * any Auracast receiver can join - its own Broadcast ID and name, no JBL master
+ * marker, no JBL party block in the periodic data, optional broadcast code.
+ * Chosen per start; the JBL party broadcast (Auracast button) is the default. */
+#define STD_BROADCAST_ID       0x5a31c3u
+static bool s_std;
+static char s_std_name[33] = "S31 Auracast";
+static bool s_std_enc;
+static uint8_t s_std_code[16];
 static uint16_t s_ext_adv_len;
 static uint8_t s_pa[64 + sizeof(jbl_pa_mfg_ad)];
 static uint16_t s_pa_len, s_pa_jbl_pos;
@@ -365,14 +375,14 @@ static void ext_adv_build(void)
     d[i++] = BLUETOOTH_DATA_TYPE_SERVICE_DATA_16_BIT_UUID;
     little_endian_store_16(d, i, ORG_BLUETOOTH_SERVICE_BROADCAST_AUDIO_ANNOUNCEMENT_SERVICE);
     i += 2;
-    little_endian_store_24(d, i, AURA_BROADCAST_ID);
+    little_endian_store_24(d, i, s_std ? STD_BROADCAST_ID : AURA_BROADCAST_ID);
     i += 3;
 
     d[i++] = 5;                                       /* Public Broadcast Announcement */
     d[i++] = BLUETOOTH_DATA_TYPE_SERVICE_DATA_16_BIT_UUID;
     little_endian_store_16(d, i, AURA_PBA_UUID);
     i += 2;
-    d[i++] = AURA_PBA_FEATURES;
+    d[i++] = s_std ? (uint8_t)(0x04u | (s_std_enc ? 0x01u : 0x00u)) : AURA_PBA_FEATURES;
     d[i++] = 0;                                       /* no metadata */
 
     d[i++] = 3;
@@ -380,17 +390,20 @@ static void ext_adv_build(void)
     little_endian_store_16(d, i, AURA_APPEARANCE);
     i += 2;
 
-    d[i++] = AURA_NAME_LEN + 1;
+    const char *nm = s_std ? s_std_name : AURA_BROADCAST_NAME;
+    size_t nl = s_std ? strlen(s_std_name) : AURA_NAME_LEN;
+    if (nl > 32) nl = 32;
+    d[i++] = (uint8_t)(nl + 1);
     d[i++] = BLUETOOTH_DATA_TYPE_BROADCAST_NAME;
-    memcpy(d + i, AURA_BROADCAST_NAME, AURA_NAME_LEN);
-    i += AURA_NAME_LEN;
+    memcpy(d + i, nm, nl);
+    i += nl;
 
-    d[i++] = AURA_NAME_LEN + 1;                       /* as the real JBL master */
+    d[i++] = (uint8_t)(nl + 1);                       /* as the real JBL master */
     d[i++] = BLUETOOTH_DATA_TYPE_COMPLETE_LOCAL_NAME;
-    memcpy(d + i, AURA_BROADCAST_NAME, AURA_NAME_LEN);
-    i += AURA_NAME_LEN;
+    memcpy(d + i, nm, nl);
+    i += nl;
 
-    if (!AURA_GENERIC) {
+    if (!AURA_GENERIC && !s_std) {
         memcpy(d + i, jbl_master_mfg_ad, sizeof(jbl_master_mfg_ad));   /* the JBL master marker */
         i += sizeof(jbl_master_mfg_ad);
     }
@@ -422,8 +435,12 @@ static void pa_build(void)
     le_audio_base_builder_add_bis(&b, 2, sizeof(cc_bis_fr), cc_bis_fr);
     s_pa_jbl_pos = le_audio_base_builder_get_ad_data_size(&b);
 #if AURA_JBL_PA_BLOCK
-    memcpy(s_pa + s_pa_jbl_pos, jbl_pa_mfg_ad, sizeof(jbl_pa_mfg_ad));
-    s_pa_len = s_pa_jbl_pos + sizeof(jbl_pa_mfg_ad);
+    if (!s_std) {
+        memcpy(s_pa + s_pa_jbl_pos, jbl_pa_mfg_ad, sizeof(jbl_pa_mfg_ad));
+        s_pa_len = s_pa_jbl_pos + sizeof(jbl_pa_mfg_ad);
+    } else {
+        s_pa_len = s_pa_jbl_pos;                  /* standard: BASE only */
+    }
 #else
     s_pa_len = s_pa_jbl_pos;                      /* BASE only */
 #endif
@@ -436,6 +453,9 @@ static void pa_refresh(void)
 #if !AURA_JBL_PA_BLOCK
     return;
 #endif
+    if (s_std) {
+        return;                                   /* no JBL party block to tick */
+    }
     uint32_t r = esp_random();
     s_pa[s_pa_jbl_pos + JBL_PA_NN_OFFSET] = s_pa_nn;
     /* master volume: members join at it and follow it. Decoded from a sniffed
@@ -1284,6 +1304,8 @@ static void on_pa_enable_complete(uint8_t status)
         return;
     }
     s_big_params.advertising_handle = s_adv_handle;
+    s_big_params.encryption = (s_std && s_std_enc) ? 1 : 0;
+    memcpy(s_big_params.broadcast_code, s_std_code, 16);
     uint8_t st = gap_big_create_test(&s_big, &s_big_params, &s_big_test);
     if (st != ERROR_CODE_SUCCESS) {
         ESP_LOGE(TAG, "gap_big_create_test: 0x%02x", st);
@@ -1540,6 +1562,24 @@ static void exp_handler(btstack_timer_source_t *ts)
     btstack_run_loop_add_timer(ts);
 }
 #endif
+
+void auracast_set_standard(bool standard, const char *name, const uint8_t *code)
+{
+    s_std = standard;
+    if (name && name[0]) {
+        size_t k = strlen(name);
+        if (k > 32) k = 32;
+        memcpy(s_std_name, name, k);
+        s_std_name[k] = 0;
+    }
+    s_std_enc = standard && code != NULL;
+    memset(s_std_code, 0, sizeof(s_std_code));
+    if (s_std_enc) memcpy(s_std_code, code, 16);
+    ESP_LOGW(TAG, "next broadcast: %s%s%s%s", standard ? "standard Auracast '" : "JBL party",
+             standard ? s_std_name : "", standard ? "'" : "", s_std_enc ? ", encrypted" : "");
+}
+
+bool auracast_is_standard(void) { return s_std; }
 
 int auracast_host_start(void)
 {

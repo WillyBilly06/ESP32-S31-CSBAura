@@ -92,6 +92,12 @@ void *auracast_lc3_workspace_take(size_t *half);
  * every joined speaker follows it (no-op while not broadcasting). */
 void auracast_volume_changed(void);
 
+/* BT thread, before auracast_host_start(): standard = a plain Auracast broadcast
+ * (JBL One "Broadcast to Others") with this name (NULL keeps the last) and an
+ * optional 16-byte broadcast code (NULL = open); false = the JBL party broadcast. */
+void auracast_set_standard(bool standard, const char *name, const uint8_t *code);
+bool auracast_is_standard(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -1,6 +1,6 @@
 # JBL Xtreme 4 OTA Firmware — Auracast & PartyBoost Reverse-Engineering Report
 
-**Subject file:** `C:\Users\ngocv\Downloads\xtreme4_ota_all0650 (1).bin`
+**Subject file:** `xtreme4_ota_all0650 (1).bin`
 **Analyzed copy (isolated):** `...\scratchpad\fw55\fw.bin`
 **Size:** 1,590,190 bytes (0x1842AE)
 **Firmware version (from footer):** `8.0.8.13`, git `295a227`, built `2024-7-30 17:18:33`

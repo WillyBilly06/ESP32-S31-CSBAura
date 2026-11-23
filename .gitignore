@@ -35,3 +35,8 @@ s31-btstack-speaker/logs/
 
 # JBL Xtreme 5 tone extraction (proprietary firmware data, local only)
 re/local_tones/
+
+# leftovers of the ESP-IDF tree switch (old build dirs, pre-switch backups)
+*/build_newidf/
+*.old-idf.bak
+*.pre-idf-latest.bak

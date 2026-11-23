@@ -24,6 +24,7 @@
 #include "link_tune.h"
 #include "a2dp_in.h"
 #include "auracast.h"
+#include "esp_timer.h"
 #include "hci_transport_s31_vhci.h"
 
 #include <stdio.h>
@@ -44,7 +45,7 @@ static const char *TAG = "LINK";
  * BIG needs the air, and leave the BIG its share while hosting. */
 #define POLL_SLOTS_IDLE     12                    /* 7.5 ms: 133 polls/s - any phone, any packet size */
 #define POLL_SLOTS_HOSTING  24                    /* 15 ms: 67 polls/s - 43 needed + retries, BIG keeps its gap */
-#define POLL_CHECK_MS       500
+#define POLL_CHECK_MS       100
 #define LE_UPDATE_DELAY_MS  6000
 #define LE_ITVL_MIN         48                    /* 60 ms in 1.25 ms */
 #define LE_ITVL_MAX         60                    /* 75 ms */
@@ -59,9 +60,19 @@ static uint16_t s_pkt_types;
 static uint16_t s_poll_applied;
 static btstack_timer_source_t s_poll_timer;
 
+static volatile bool s_poll_boost;                /* A2DP cushion low */
+static volatile int64_t s_boost_until_us;         /* fast poll held 3 s after it refilled: no flapping */
+
+void link_tune_poll_boost(bool on)
+{
+    if (!on && s_poll_boost) s_boost_until_us = esp_timer_get_time() + 3000000;
+    s_poll_boost = on;
+}
+
 static uint16_t poll_wanted(void)
 {
-    return auracast_state() == AURACAST_STATE_OFF ? POLL_SLOTS_IDLE : POLL_SLOTS_HOSTING;
+    bool boost = s_poll_boost || esp_timer_get_time() < s_boost_until_us;
+    return (auracast_state() == AURACAST_STATE_OFF || boost) ? POLL_SLOTS_IDLE : POLL_SLOTS_HOSTING;
 }
 
 static void poll_apply(const char *why)
@@ -76,7 +87,8 @@ static void poll_apply(const char *why)
 
 static void poll_tick(btstack_timer_source_t *ts)
 {
-    poll_apply(auracast_state() == AURACAST_STATE_OFF ? "no broadcast" : "broadcasting");
+    poll_apply(auracast_state() == AURACAST_STATE_OFF ? "no broadcast"
+               : poll_wanted() == POLL_SLOTS_IDLE ? "A2DP cushion low" : "broadcasting");
     btstack_run_loop_set_timer(ts, POLL_CHECK_MS);
     btstack_run_loop_add_timer(ts);
 }

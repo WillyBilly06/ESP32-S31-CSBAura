@@ -12,6 +12,7 @@
  * media packet), SBC bitpool pinned at 53.
  */
 #include "a2dp_in.h"
+#include "link_tune.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -469,9 +470,11 @@ int a2dp_in_read(int16_t *pcm, int n)
             boosted = true;
             s_acl_boosts++;
             bt_sched_tune_apply_custom(9, 15, 12, 11, "A2DP cushion low: phone link boosted");
+            link_tune_poll_boost(true);
         } else if (boosted && (f > (float)MS_FRAMES(110) || !s_streaming)) {
             boosted = false;
             bt_sched_tune_apply_custom(2, 15, 12, 11, "A2DP cushion back: BIS copies first");
+            link_tune_poll_boost(false);
         }
     }
     if ((uint32_t)f < s_win_min) s_win_min = (uint32_t)f;
@@ -1262,6 +1265,12 @@ void a2dp_in_setup(void)
     gap_secure_connections_enable(false);
     gap_set_bondable_mode(1);
     gap_set_class_of_device(0x240414);            /* audio, loudspeaker */
+    /* Page scan: the controller default (11.25 ms every 1.28 s, standard) let a
+     * phone's reconnect miss window after window behind the 20 ms LE beacon and
+     * the assistant's LE scan. Interlaced every 320 ms catches both page trains
+     * in one window; off anyway while a phone streams (gap_connectable_control). */
+    gap_set_page_scan_activity(0x0200, 0x0012);
+    gap_set_page_scan_type(PAGE_SCAN_MODE_INTERLACED);
     gap_discoverable_control(!S31_QUIET_RADIO_TEST);
     gap_connectable_control(!S31_QUIET_RADIO_TEST);
 

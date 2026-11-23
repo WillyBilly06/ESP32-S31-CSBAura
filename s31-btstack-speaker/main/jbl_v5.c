@@ -446,6 +446,27 @@ static bool eq_info_apply(const uint8_t *v, uint16_t n)
     return true;
 }
 
+/* ---- Broadcast codes: the app sends an ASCII password; LE Audio uses it as a
+ * zero-padded 16-byte string, first character in the first HCI octet. BTstack
+ * reverses 16-byte fields when it builds the command, so store it reversed. */
+static char s_bcast_pw[17];                      /* 0x0B88, "" = open broadcast */
+static uint8_t s_bcast_code[16];                 /* BTstack order */
+
+static bool pw_is_none(const uint8_t *v, uint16_t n)
+{
+    if (n == 0) return true;
+    for (uint16_t k = 0; k < n; k++) {
+        if (v[k] != 0xFF && v[k] != 0x00) return false;
+    }
+    return true;
+}
+
+static void pw_to_code(const uint8_t *v, uint16_t n, uint8_t code[16])
+{
+    memset(code, 0, 16);
+    for (uint16_t k = 0; k < n && k < 16; k++) code[15 - k] = v[k];
+}
+
 /* ---- 0x0B80 Auracast assistant status, from party.c's join state */
 static uint16_t assist_info(uint8_t *v)
 {
@@ -519,9 +540,18 @@ static bool feat_value(uint16_t id, uint8_t *v, uint16_t *n)
      * native join does not depend on them (beacon + ext adv do that). */
     case 0x2004: v[0] = party_auracast_enabled() ? 1 : 0; *n = 1; return true; /* AuracastMode */
     case 0x0B80: *n = assist_info(v); return true;                            /* assistant status */
-    case 0x0B86: v[0] = party_auracast_enabled() ? 0x80 : 0x00; *n = 1; return true; /* BroadcasterEnable */
+    case 0x0B86: v[0] = party_standard_broadcast_on() ? 0x80 : 0x00; *n = 1; return true; /* Broadcast to Others */
     case 0x0B87: v[0] = cfg.bcast_hq; *n = 1; return true;                    /* broadcast quality */
-    case 0x0B88: memset(v, 0xFF, 16); *n = 16; return true;                   /* no broadcast code */
+    case 0x0B88:                                                              /* broadcast password */
+        if (s_bcast_pw[0]) { *n = (uint16_t)str_copy(v, s_bcast_pw, 16); }
+        else { memset(v, 0xFF, 4); *n = 4; }                                  /* none: FF FF FF FF */
+        return true;
+    case 0x0B8B:                                                              /* subgroup names {idx, 32 B} */
+        v[0] = 0;
+        memset(v + 1, 0, 32);
+        str_copy(v + 1, "Audio", 32);
+        *n = 33;
+        return true;
     case 0x0B89: memset(v, 0, 6); *n = 6; return true;
     case 0x0B8A: *n = (uint16_t)str_copy(v, cfg.bcast_name, 32); return true;
     case 0x2C00: v[0] = 0x00; *n = 1; return true;
@@ -1028,9 +1058,11 @@ static void handle_set(hci_con_handle_t con, const uint8_t *pl, uint16_t len)
     uint16_t post[12];                                /* notify these after the "00 00" reply */
     int npost = 0;
 #define POST(x) do { if (npost < (int)(sizeof(post) / sizeof(post[0]))) post[npost++] = (x); } while (0)
-    bool assist_join = false, assist_leave = false;
+    bool assist_join = false, assist_leave = false, assist_has_code = false;
     uint8_t assist_type = 0;
+    uint8_t assist_code[16];
     bd_addr_t assist_addr;
+    uint8_t std_bcast = 0;                            /* 1 on, 2 off, 3 restart with new settings */
 
     for (uint16_t i = 0; i + 4 <= len;) {
         uint16_t id = pl[i] | (pl[i + 1] << 8);
@@ -1176,14 +1208,23 @@ static void handle_set(hci_con_handle_t con, const uint8_t *pl, uint16_t len)
                 ESP_LOGW(TAG, "app AudioOperation %u -> %s", v[0], a2dp_in_media_op(v[0]) ? "sent" : "no AVRCP");
             }
             break;
-        case 0x2004:                                                          /* AuracastMode */
-        case 0x0B86:                                                          /* BroadcasterEnable */
+        case 0x2004:                                                          /* AuracastMode: JBL party */
             c = false;
             if (n) {
-                bool on = id == 0x2004 ? v[0] != 0 : (v[0] & 0x80) != 0;
-                ESP_LOGW(TAG, "app turns Auracast %s (0x%04x = 0x%02x)", on ? "ON" : "OFF", id, v[0]);
-                party_set_auracast_enabled(on);
+                ESP_LOGW(TAG, "app turns the JBL party %s (0x2004 = 0x%02x)", v[0] ? "ON" : "OFF", v[0]);
+                party_set_auracast_enabled(v[0] != 0);
+                POST(0x2004);
                 POST(0x0B86);
+            }
+            break;
+        case 0x0B86:                                                          /* Broadcast to Others: standard */
+            c = false;
+            if (n) {
+                bool on = (v[0] & 0x80) != 0;
+                ESP_LOGW(TAG, "app turns Broadcast to Others %s (standard Auracast)", on ? "ON" : "OFF");
+                std_bcast = on ? 1 : 2;
+                POST(0x0B86);
+                POST(0x2004);
             }
             break;
         case 0x0B87:                                                          /* broadcast quality, not on/off */
@@ -1192,10 +1233,24 @@ static void handle_set(hci_con_handle_t con, const uint8_t *pl, uint16_t len)
                 ESP_LOGW(TAG, "app broadcast quality: %s", cfg.bcast_hq ? "HIGH" : "standard");
             }
             break;
-        case 0x0B8A: { size_t k = n > 32 ? 32 : n; if (k) { memcpy(cfg.bcast_name, v, k); cfg.bcast_name[k] = 0; } break; }
+        case 0x0B8A: {
+            size_t k = n > 32 ? 32 : n;
+            if (k) { memcpy(cfg.bcast_name, v, k); cfg.bcast_name[k] = 0; }
+            if (party_standard_broadcast_on() && !std_bcast) std_bcast = 3;   /* restart with the new name */
+            break;
+        }
         case 0x0B88:
             c = false;
-            ESP_LOGW(TAG, "app broadcast password (%u B) - encrypted broadcasts not supported, broadcasting open", n);
+            if (pw_is_none(v, n)) {
+                s_bcast_pw[0] = 0;
+            } else {
+                uint16_t k = n > 16 ? 16 : n;
+                memcpy(s_bcast_pw, v, k);
+                s_bcast_pw[k] = 0;
+                pw_to_code(v, k, s_bcast_code);
+            }
+            ESP_LOGW(TAG, "app broadcast password: %s", s_bcast_pw[0] ? "set" : "none (open broadcast)");
+            if (party_standard_broadcast_on() && !std_bcast) std_bcast = 3;
             break;
         case 0x0B81:                                                          /* assistant scan {action, s} */
             c = false;
@@ -1204,11 +1259,15 @@ static void handle_set(hci_con_handle_t con, const uint8_t *pl, uint16_t len)
         case 0x0B85: c = false; break;                                       /* subgroup play: we play subgroup 0 */
         case 0x0B83:                                                          /* join / leave a broadcast */
             c = false;
-            if (n >= 8) {
+            if (n >= 8) {                     /* {action, addr type, addr[6], status, password...} */
                 assist_type = v[1];
                 memcpy(assist_addr, v + 2, 6);
                 if (v[0] == 0) assist_leave = true;
                 else assist_join = true;                                      /* 01 open, 02 with password */
+                if (v[0] == 2 && n > 9 && !pw_is_none(v + 9, (uint16_t)(n - 9))) {
+                    pw_to_code(v + 9, (uint16_t)(n - 9), assist_code);
+                    assist_has_code = true;
+                }
             }
             break;
         case 0x000F: c = false; reset = true; break;                          /* factory reset */
@@ -1263,7 +1322,10 @@ static void handle_set(hci_con_handle_t con, const uint8_t *pl, uint16_t len)
     }
 #undef POST
     if (assist_join) {
-        party_assist_join(assist_addr, assist_type);
+        party_assist_join(assist_addr, assist_type, assist_has_code ? assist_code : NULL);
+    }
+    if (std_bcast) {
+        party_set_standard_broadcast(std_bcast != 2, cfg.bcast_name, s_bcast_pw[0] ? s_bcast_code : NULL);
     }
     if (assist_leave) {
         party_assist_leave();
