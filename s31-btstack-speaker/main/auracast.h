@@ -66,6 +66,15 @@ int auracast_host_stop(void);
 /* Any thread: true while hosting is requested and not stopped, i.e. state
  * STARTING or ON. */
 bool auracast_hosting(void);
+/* end the BIG and create it again on the running periodic advertising: it lands at a new
+ * place in time next to the other links (receivers re-sync from the same PA). -1: not on */
+int auracast_big_replace(void);
+unsigned auracast_big_replaces(void);
+/* hold = no BIG (the advertising and PA stay, state ON): while a phone connects LE Audio a
+ * BIG on air kept its CIS from coming up. Set at the phone's LE connect, cleared once its
+ * stream is stable - the BIG is then created next to it. */
+void auracast_set_big_hold(bool hold);
+bool auracast_big_held(void);
 auracast_state_t auracast_state(void);
 
 /* BT thread: register for state transitions (NULL to unregister). */

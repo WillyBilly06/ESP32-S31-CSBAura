@@ -1291,6 +1291,28 @@ void a2dp_in_log_stats(void)
 
 /* ---- BTstack events (BT thread) --------------------------------------------- */
 static void reconnect_failed(void);
+static void reconn_abort_on_pairing(const uint8_t *addr);
+
+/* the phone's pending Classic connect request (see HCI_EVENT_CONNECTION_REQUEST) */
+static bd_addr_t s_conn_req_addr;
+static bool s_conn_req_pending;
+static int s_accept_retries;
+static btstack_timer_source_t s_accept_timer;
+
+static void accept_retry(btstack_timer_source_t *ts)
+{
+    (void)ts;
+    if (!s_conn_req_pending) return;
+    if (!hci_can_send_command_packet_now()) {
+        btstack_run_loop_set_timer(&s_accept_timer, 5);
+        btstack_run_loop_add_timer(&s_accept_timer);
+        return;
+    }
+    s_accept_retries++;
+    ESP_LOGW(TAG, "classic connect from %s: accepting again without a role switch (try %d)",
+             bd_addr_to_str(s_conn_req_addr), s_accept_retries);
+    hci_send_cmd(&hci_accept_connection_request, s_conn_req_addr, 0x01);   /* remain peripheral */
+}
 static void reconnect_succeeded(void);
 
 static void a2dp_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size)
@@ -1498,8 +1520,15 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
         hci_event_connection_request_get_bd_addr(packet, a);
         ESP_LOGW(TAG, "classic connect request from %s", bd_addr_to_str(a));
         if (bd_addr_cmp(a, s_pair_call_addr) == 0) s_pair_incoming = true;
+        bd_addr_copy(s_conn_req_addr, a);
+        s_conn_req_pending = true;
+        s_accept_retries = 0;
         break;
     }
+    case HCI_EVENT_CONNECTION_COMPLETE:
+        s_conn_req_pending = false;
+        btstack_run_loop_remove_timer(&s_accept_timer);
+        break;
     case HCI_EVENT_COMMAND_COMPLETE:
         if (hci_event_command_complete_get_command_opcode(packet) == 0x1408 && size >= 9) {   /* Read Encryption Key Size */
             ESP_LOGW(TAG, "encryption key size: status 0x%02x, con 0x%04x, %u bytes", packet[5],
@@ -1519,6 +1548,17 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
             hci_event_command_status_get_command_opcode(packet) != 0x0413) {
             ESP_LOGW(TAG, "HCI command 0x%04x refused: status 0x%02x", hci_event_command_status_get_command_opcode(packet),
                      hci_event_command_status_get_status(packet));
+            /* Accept Connection Request (as master, with a role switch) refused: right after
+             * the phone's LE pairing the controller can disallow it (0x0C) and the phone's
+             * Classic link never came up. Accept again staying peripheral; the role is
+             * switched to master once the link is up (s_role_timer). */
+            if (hci_event_command_status_get_command_opcode(packet) == 0x0409 && s_conn_req_pending &&
+                s_accept_retries < 3) {
+                btstack_run_loop_remove_timer(&s_accept_timer);
+                btstack_run_loop_set_timer_handler(&s_accept_timer, accept_retry);
+                btstack_run_loop_set_timer(&s_accept_timer, s_accept_retries == 0 ? 10 : 200);
+                btstack_run_loop_add_timer(&s_accept_timer);
+            }
         }
         if (hci_event_command_status_get_command_opcode(packet) == 0x0413) {      /* Set Connection Encryption */
             uint8_t st = hci_event_command_status_get_status(packet);
@@ -1567,9 +1607,13 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
         ESP_LOGW(TAG, "new link key, type %u", packet[2 + 6 + 16]);   /* event: bd_addr(6) key(16) type(1) */
         s_new_bond = true;                        /* a new classic bond (pairing mode ends on its connect) */
         break;
-    case HCI_EVENT_IO_CAPABILITY_REQUEST:
+    case HCI_EVENT_IO_CAPABILITY_REQUEST: {
         ESP_LOGW(TAG, "phone starts (re)pairing (IO capability request)");
+        bd_addr_t a;
+        hci_event_io_capability_request_get_bd_addr(packet, a);
+        reconn_abort_on_pairing(a);
         break;
+    }
     case GAP_EVENT_PAIRING_COMPLETE:
         ESP_LOGW(TAG, "GAP pairing complete, status 0x%02x", gap_event_pairing_complete_get_status(packet));
         break;
@@ -1880,6 +1924,20 @@ static void reconnect_cb(btstack_timer_source_t *ts)
         reconn_bad_store(true);
         return;
     }
+    /* A Secure Connections key (CTKD, from the phone's LE pairing) cannot authenticate a
+     * link WE start: with BR/EDR SC off the controller tries legacy authentication, the
+     * phone refuses it and a new pairing starts that hangs ~9 s and blocks the phone's own
+     * reconnect. Such a phone reconnects itself (LE first, then Classic) - leave it to it. */
+    {
+        link_key_t k;
+        link_key_type_t t = INVALID_LINK_KEY;
+        if (gap_get_link_key_for_bd_addr(s_last_phone, k, &t) && gap_secure_connection_for_link_key_type(t)) {
+            s_reconn_pending = false;
+            ESP_LOGW(TAG, "power-up: %s has an LE-paired (SC) key - not calling it back, it reconnects itself",
+                     bd_addr_to_str(s_last_phone));
+            return;
+        }
+    }
     s_reconn_tries++;
     s_reconn_level = (s_reconn_tries & 1) ? s_reconn_first_level : (uint8_t)(2 - s_reconn_first_level);
     /* AVDTP takes the level when it opens its channel (after its SDP query) */
@@ -1938,8 +1996,20 @@ void a2dp_in_call_after_le_pairing(const uint8_t identity[6])
     s_new_bond = true;                            /* pairing mode ends once this phone is connected */
     btstack_run_loop_remove_timer(&s_pair_call_timer);
     btstack_run_loop_set_timer_handler(&s_pair_call_timer, pair_call);
-    btstack_run_loop_set_timer(&s_pair_call_timer, 1200);   /* Samsung pages ~1 s after the keys: let it */
+    btstack_run_loop_set_timer(&s_pair_call_timer, 3000);   /* the phone pages 0-1.5 s after the keys: our own page at 1.2 s collided with it (pend list full, the phone left) - only if it never comes */
     btstack_run_loop_add_timer(&s_pair_call_timer);
+}
+
+/* our call-back fell into a new pairing (the phone refused our stored key): end that link
+ * now instead of letting it hang until the phone fails it, and stop calling back */
+static void reconn_abort_on_pairing(const uint8_t *addr)
+{
+    if (!s_reconn_pending || s_pairing) return;
+    hci_connection_t *c = hci_connection_for_bd_addr_and_type((uint8_t *)addr, BD_ADDR_TYPE_ACL);
+    ESP_LOGW(TAG, "power-up call-back: %s wants a new pairing - dropping it, the phone reconnects itself",
+             bd_addr_to_str(addr));
+    s_reconn_tries = RECONN_TRIES;
+    if (c) gap_disconnect(c->con_handle);
 }
 
 static void reconnect_failed(void)

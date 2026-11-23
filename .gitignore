@@ -7,8 +7,10 @@ sdkconfig.bak
 *.log
 logs/
 
-# BTstack (personal / non-commercial license): clone it, see README
-third_party/
+# third_party ships the patched BTstack and ESP-IDF; nothing else goes there
+third_party/*
+!third_party/btstack/
+!third_party/esp-idf/
 
 # flasher build output (ship the exe + firmware as a release zip, not in git)
 tools/flasher/dist/

@@ -1110,3 +1110,10 @@ void le_audio_log_stats(void)
              s_state_names[s_ase.state], s_cis, (unsigned long)st_rx, (unsigned long)st_lost, (unsigned long)st_bad,
              (unsigned long)st_plc, (unsigned long)st_cp_ops);
 }
+
+bool le_audio_cis_counts(uint32_t *rx, uint32_t *lost)
+{
+    *rx = st_rx;
+    *lost = st_lost;
+    return s_ase.state == ASE_STREAMING && s_cis != HCI_CON_HANDLE_INVALID;
+}

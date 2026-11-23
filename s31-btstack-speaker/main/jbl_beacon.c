@@ -6,7 +6,7 @@
  *   PDU       legacy ADV_IND (connectable + scannable) on its own extended set,
  *             SID 1, 1M, all channels, no TX power preference, scan request
  *             notifications on (new scanners are logged)
- *   address   random static c4:58:34:53:31:04
+ *   address   random static, per speaker (s31_ident_beacon_addr: from the Bluetooth address)
  *   interval  20 ms (as the Xtreme 5), 100 ms while phone music streams so the
  *             BIG and the A2DP link get the airtime
  *   adv       Service Data 0xFDDF, V5 layout (com/harman/v5protocol/discover/a.java):
@@ -14,7 +14,7 @@
  *     [2-3] field-presence mask (LE)                     0x97C0 (+ b14 with the phone name)
  *           b15 colorID, b14 srcName1Crc, b12 btMacAddressCrc, b10 battery,
  *           b9 deviceMiscInfo, b8 partyMethodInfo, b7 partyInfo, b6 stereoGroupId
- *     colorID 00 | [srcName1Crc] | btMacAddressCrc = CRC-16/ARC of OUR Classic MAC
+ *     colorID (s31_ident_color) | [srcName1Crc] | btMacAddressCrc = CRC-16/ARC of OUR Classic MAC
  *     battery 0x50 (80 %) | misc 0x9080 (connectable | LED | BR/EDR; b15 SET: iOS JBL One needs it -
  *     without it the iOS app never talks to us; the old Bluedroid build cleared it for Android)
  *     partyMethod 0xC0 (Auracast | long-lasting stereo) | partyInfo | stereoGroupId 00
@@ -277,6 +277,7 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
 
 void jbl_beacon_setup(void)
 {
+    s31_ident_beacon_addr(s_addr);                 /* per speaker, not one address for all boards */
     s_hci_reg.callback = &hci_handler;
     hci_add_event_handler(&s_hci_reg);
 }

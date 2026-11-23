@@ -276,6 +276,7 @@ typedef enum {
     PH_ON,
     PH_BIG_TERM_WAIT,   /* STOPPING: Terminate BIG sent */
     PH_ADV_OFF_WAIT,    /* STOPPING: periodic + ext adv being disabled */
+    PH_BIG_PAUSED,      /* ON for the party, but no BIG: the phone sets up its CIS (adv stays) */
 } phase_t;
 
 static phase_t s_phase;
@@ -1134,6 +1135,7 @@ static void set_phase(phase_t ph)
         s_pub_state = AURACAST_STATE_STARTING;
         break;
     case PH_ON:
+    case PH_BIG_PAUSED:
         s_pub_state = AURACAST_STATE_ON;
         break;
     default:
@@ -1162,6 +1164,11 @@ static void notify(auracast_state_t st, uint8_t status)
 }
 
 static int begin_start(void);
+static void big_create(void);
+static bool s_replacing;               /* BIG ended to be created again: keep the advertising */
+static bool s_pausing;                 /* BIG ended to stay off for a while: keep the advertising */
+static bool s_big_hold;                /* no BIG while a phone connects LE Audio (auracast_set_big_hold) */
+static unsigned s_st_replaces;
 
 static void adv_off_done(void)
 {
@@ -1312,6 +1319,18 @@ static void on_pa_enable_complete(uint8_t status)
         begin_adv_off();
         return;
     }
+    if (s_big_hold) {
+        ESP_LOGW(TAG, "advertising on, BIG held: a phone is connecting LE Audio");
+        set_phase(PH_BIG_PAUSED);
+        notify(AURACAST_STATE_ON, 0);
+        return;
+    }
+    big_create();
+}
+
+/* Create BIG Test on the running periodic advertising (start, or a re-place) */
+static void big_create(void)
+{
     s_big_params.advertising_handle = s_adv_handle;
     s_big_params.encryption = (s_std && s_std_enc) ? 1 : 0;
     memcpy(s_big_params.broadcast_code, s_std_code, 16);
@@ -1376,6 +1395,9 @@ static void on_big_created(const uint8_t *packet)
 #endif
     if (!s_want_on) {
         begin_big_terminate();
+    } else if (s_big_hold) {
+        s_pausing = true;
+        begin_big_terminate();
     }
 }
 
@@ -1388,9 +1410,50 @@ static void on_big_terminated(const uint8_t *packet)
         guard_cancel();
         s_streaming = false;
         pipeline_reset(false);
+        if (s_pausing && s_want_on && s_phase == PH_BIG_TERM_WAIT) {
+            s_pausing = false;
+            set_phase(PH_BIG_PAUSED);
+            if (!s_big_hold) big_create();        /* released meanwhile */
+            return;
+        }
+        s_pausing = false;
+        if (s_replacing && s_want_on && s_phase == PH_BIG_TERM_WAIT) {
+            s_replacing = false;
+            ESP_LOGW(TAG, "BIG re-place: old BIG ended, creating it again (advertising stays on)");
+            big_create();
+            return;
+        }
+        s_replacing = false;
         begin_adv_off();
     }
 }
+
+void auracast_set_big_hold(bool hold)
+{
+    if (hold == s_big_hold) return;
+    s_big_hold = hold;
+    if (hold && s_phase == PH_ON && s_want_on) {
+        s_pausing = true;
+        ESP_LOGW(TAG, "BIG held: a phone is connecting LE Audio (advertising stays on)");
+        begin_big_terminate();
+    } else if (!hold && s_phase == PH_BIG_PAUSED && s_want_on) {
+        ESP_LOGW(TAG, "BIG released: created next to the phone's stream");
+        big_create();
+    }
+}
+
+bool auracast_big_held(void) { return s_big_hold; }
+
+int auracast_big_replace(void)
+{
+    if (s_phase != PH_ON || !s_want_on) return -1;
+    s_replacing = true;
+    s_st_replaces++;
+    begin_big_terminate();
+    return 0;
+}
+
+unsigned auracast_big_replaces(void) { return s_st_replaces; }
 
 static void guard_handler(btstack_timer_source_t *ts)
 {
@@ -1615,7 +1678,12 @@ int auracast_host_start(void)
 int auracast_host_stop(void)
 {
     s_want_on = false;
+    s_replacing = false;
+    s_pausing = false;
     switch (s_phase) {
+    case PH_BIG_PAUSED:
+        begin_adv_off();
+        break;
     case PH_ON:
         begin_big_terminate();
         break;

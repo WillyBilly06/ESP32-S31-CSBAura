@@ -32,6 +32,8 @@ int le_audio_att_write(hci_con_handle_t con, le_audio_attr_t a, bool ccc, const 
 bool le_audio_iso_rx(const uint8_t *packet, uint16_t size);
 
 void le_audio_log_stats(void);
+/* SDUs received / lost on the phone's CIS so far; true while it streams */
+bool le_audio_cis_counts(uint32_t *rx, uint32_t *lost);
 
 /* the LE link a phone uses for LE Audio (link_tune leaves its interval alone) */
 bool le_audio_owns_link(hci_con_handle_t con);

@@ -2,9 +2,10 @@
 /*
  * s31_ident.h - what makes each flashed S31 its own Xtreme 5.
  *
- * Unique per board without any setup (all derived from the chip's factory-burned
- * Bluetooth MAC): the MAC itself (Classic + LE addresses), the beacon's macCrc, the
- * serial number and the standard Auracast Broadcast_ID. The JBL party Broadcast_ID
+ * Every board is its own speaker: Classic + LE addresses, the beacon address and macCrc,
+ * the serial number and the standard Auracast Broadcast_ID all come from the chip's
+ * factory-burned MAC (unique per chip; the ESP32-S31 controller fails BR/EDR
+ * re-authentication with any other address). The JBL party Broadcast_ID
  * (0x112233) stays shared on purpose: every Xtreme 5 uses it.
  *
  * Chosen per board when flashing (tools/flasher writes the "s31cfg" partition): the
@@ -32,6 +33,9 @@ const char *s31_ident_name(void);
 const char *s31_ident_serial(void);
 /* 24-bit standard Auracast Broadcast_ID of this board (never 0 or 0x112233) */
 uint32_t s31_ident_std_broadcast_id(void);
+/* the JBL beacon's random static address: per speaker (it used to be one fixed address
+ * on every board) */
+void s31_ident_beacon_addr(uint8_t out[6]);
 
 #ifdef __cplusplus
 }

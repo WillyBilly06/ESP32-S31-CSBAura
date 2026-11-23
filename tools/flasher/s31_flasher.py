@@ -2,14 +2,18 @@
 
 It builds s31-btstack-speaker from the project folder with the exact patched ESP-IDF this
 project uses (ESP-IDF commit idf-patches/IDF_COMMIT + idf-patches/0010), then flashes it
-with the board's color and name. It can set up that ESP-IDF and BTstack itself.
+with the board's color and name. That ESP-IDF and BTstack ship patched in the repository
+(third_party/esp-idf, third_party/btstack); the first Build + Flash installs ESP-IDF's
+tools (and a Python for them if the PC has none).
 
-Every board comes out unique on its own (serial, Broadcast_ID and Bluetooth identity come
-from the chip's factory MAC); the color and name go to the board's "s31cfg" partition.
+Every board is its own Xtreme 5: the firmware derives the Bluetooth address, beacon
+address, macCrc, serial and Broadcast_ID from the chip's factory MAC, so boards never
+collide and a board keeps its pairings across flashes. The color and name go to the
+board's "s31cfg" partition.
 
 Window:   S31Flasher.exe          (put it in the project folder, or browse to it)
 Command:  S31Flasher.exe --port COM5 --color blue [--name "Party Box"] [--erase]
-          S31Flasher.exe --setup                  (ESP-IDF + BTstack, once)
+          S31Flasher.exe --setup                  (only install ESP-IDF's tools)
           S31Flasher.exe --port COM5 --color-id 0x1A --color-only
           S31Flasher.exe --port COM5 --no-build    (flash the last build)
 
@@ -39,9 +43,12 @@ COLORS = [
 ]
 CFG_OFFSET = 0xA10000          # partitions.csv "s31cfg"
 CFG_SIZE = 0x1000
+FLASH_SIZE = 0x1000000         # 16 MB (the whole chip, for --erase)
 TONES_OFFSET = 0x810000        # partitions.csv "tones"
 NAME_MAX = 32
 PROJECT_SUBDIR = "s31-btstack-speaker"
+# Windows paths stop at 260 characters; ESP-IDF's deepest file in the repository is 175 deep
+MAX_PROJECT_PATH = 80
 IDF_URL = "https://github.com/espressif/esp-idf.git"
 BTSTACK_URL = "https://github.com/bluekitchen/btstack.git"
 WIN = os.name == "nt"
@@ -112,10 +119,32 @@ def git(args, cwd=None):
                           creationflags=subprocess.CREATE_NO_WINDOW if WIN else 0)
 
 
+def bundled_idf(project):
+    """the patched ESP-IDF that ships in the repository"""
+    return project_file(project, "third_party", "esp-idf")
+
+
+def idf_bundle_info(idf):
+    """S31_IDF.json of a shipped ESP-IDF copy (tools/release/idf_tree.py), or None"""
+    try:
+        with open(os.path.join(idf, "S31_IDF.json"), encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
 def idf_state(idf, project):
     """'ready', or what is wrong with this ESP-IDF folder"""
     if not idf or not os.path.isfile(os.path.join(idf, "tools", "idf.py")):
         return "not set up"
+    info = idf_bundle_info(idf)
+    if info is not None and not os.path.exists(os.path.join(idf, ".git")):
+        if info.get("commit") != idf_commit(project):
+            return f"wrong ESP-IDF ({str(info.get('commit'))[:10]}; this project needs {idf_commit(project)[:10]})"
+        want = [os.path.basename(p) for p in idf_patches(project)]
+        if sorted(info.get("patches") or []) != sorted(want):
+            return "ESP-IDF patches do not match this project"
+        return "ready"
     head = git(["rev-parse", "HEAD"], idf).stdout.strip()
     if head != idf_commit(project):
         return f"wrong commit ({head[:10] or '?'}; this project needs {idf_commit(project)[:10]})"
@@ -126,9 +155,12 @@ def idf_state(idf, project):
 
 
 def find_idf(project, arg=None):
-    """an ESP-IDF folder at this project's commit with its patches: --idf, the saved one,
-    IDF_PATH, the default install, then common places"""
-    cands = [arg, load_settings().get("idf_path"), os.environ.get("IDF_PATH"), default_idf_dir()]
+    """an ESP-IDF folder at this project's commit with its patches: --idf, the one in the
+    repository (third_party/esp-idf), the saved one, IDF_PATH, then common places"""
+    if arg:
+        return os.path.abspath(arg)                         # the one asked for, ready or not
+    cands = [bundled_idf(project) if project else None, load_settings().get("idf_path"),
+             os.environ.get("IDF_PATH"), default_idf_dir()]
     for pat in ("~/esp/esp-idf*", "C:/Espressif/frameworks/esp-idf*", "D:/*/esp-idf*", "C:/*/esp-idf*", "E:/*/esp-idf*"):
         cands += sorted(glob.glob(os.path.expanduser(pat)))
     first = None
@@ -188,11 +220,23 @@ def stream(cmd, log, cwd=None, env=None):
         raise RuntimeError(f"failed (exit {p.returncode})")
 
 
+PYTHON = None          # the Python ESP-IDF's scripts run with (ensure_python)
+
+
+def idf_tools_path():
+    return os.path.join(os.path.expanduser("~"), ".espressif")
+
+
 def idf_env(idf):
-    """the variables ESP-IDF's export script expects (as the dev console sets them)"""
-    return clean_env({"IDF_PATH": os.path.normpath(idf),
-                      "IDF_TOOLS_PATH": os.path.join(os.path.expanduser("~"), ".espressif"),
-                      "IDF_TARGET": "esp32s31"})
+    """the variables ESP-IDF's export script expects (as the dev console sets them), with
+    the chosen Python first on PATH (install.ps1 / export.ps1 run plain `python`)"""
+    extra = {"IDF_PATH": os.path.normpath(idf), "IDF_TOOLS_PATH": idf_tools_path(),
+             "IDF_TARGET": "esp32s31", "IDF_SKIP_CHECK_SUBMODULES": "1"}
+    env = clean_env(extra)
+    if PYTHON:
+        d = os.path.dirname(PYTHON)
+        env["PATH"] = os.pathsep.join([d, os.path.join(d, "Scripts"), env.get("PATH", "")])
+    return env
 
 
 def in_idf_env(idf, command):
@@ -213,14 +257,139 @@ def need_git(log):
         raise RuntimeError("git is not installed - get it from https://git-scm.com and try again")
 
 
-def setup_idf(project, idf, log):
-    """this project's ESP-IDF: Espressif's commit + our patch + the ESP32-S31 tools"""
+def download(url, dest, log):
+    """url to dest, with progress in the log"""
+    import urllib.request
+    req = urllib.request.Request(url, headers={"User-Agent": "S31Flasher"})
+    with urllib.request.urlopen(req, timeout=60) as r, open(dest, "wb") as f:
+        total = int(r.headers.get("Content-Length") or 0)
+        got, step = 0, 0
+        while True:
+            b = r.read(1 << 20)
+            if not b:
+                break
+            f.write(b)
+            got += len(b)
+            if total and got * 10 // total > step:
+                step = got * 10 // total
+                log(f"  {got / 1e6:.0f} of {total / 1e6:.0f} MB\n")
+
+
+# ---------------------------------------------------------------- Python for ESP-IDF's scripts
+PY_VERSION = "3.12.10"                     # what this project is built and tested with
+PY_URL = f"https://www.python.org/ftp/python/{PY_VERSION}/python-{PY_VERSION}-amd64.exe"
+
+
+def own_python_dir():
+    return os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "S31Flasher", "python")
+
+
+def python_ok(exe):
+    """a real Python 3.10..3.13 with venv (not the Microsoft Store stub)"""
+    if not exe or not os.path.isfile(exe):
+        return False
+    try:
+        r = subprocess.run([exe, "-I", "-c", "import sys, venv, ensurepip; print((3, 10) <= sys.version_info[:2] <= (3, 13))"],
+                           capture_output=True, text=True, timeout=60, env=clean_env(),
+                           creationflags=subprocess.CREATE_NO_WINDOW if WIN else 0)
+    except Exception:
+        return False
+    return r.returncode == 0 and r.stdout.strip() == "True"
+
+
+def python_from(cmd):
+    try:
+        r = subprocess.run(cmd + ["-c", "import sys; print(sys.executable)"], capture_output=True, text=True,
+                           timeout=30, env=clean_env(), creationflags=subprocess.CREATE_NO_WINDOW if WIN else 0)
+        return r.stdout.strip() if r.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def find_python():
+    """a Python ESP-IDF can use: the saved one, the flasher's own, the py launcher's, PATH's"""
+    cands = [load_settings().get("python"), os.path.join(own_python_dir(), "python.exe" if WIN else "bin/python3")]
+    if WIN and shutil.which("py"):
+        for v in ("3.12", "3.11", "3.13", "3.10"):
+            cands.append(python_from(["py", f"-{v}"]))
+    for n in ("python", "python3"):
+        w = shutil.which(n, path=clean_env().get("PATH"))
+        if w:
+            cands.append(python_from([w]))
+    for c in cands:
+        if python_ok(c):
+            return c
+    return None
+
+
+def install_python(log):
+    """python.org's Python, for this user only, into the flasher's own folder (no admin, not
+    on PATH, no file associations)"""
+    if not WIN:
+        raise RuntimeError("install Python 3.10 to 3.13 and try again")
+    tmp = os.path.join(tempfile.gettempdir(), "S31Flasher")
+    os.makedirs(tmp, exist_ok=True)
+    exe = os.path.join(tmp, os.path.basename(PY_URL))
+    log(f"No usable Python found: installing Python {PY_VERSION} from python.org for ESP-IDF's tools...\n")
+    download(PY_URL, exe, log)
+    target = own_python_dir()
+    stream([exe, "/quiet", "InstallAllUsers=0", f"TargetDir={target}", "PrependPath=0", "Include_launcher=0",
+            "InstallLauncherAllUsers=0", "Include_test=0", "Include_doc=0", "Include_tcltk=0",
+            "Shortcuts=0", "AssociateFiles=0", "Include_pip=1"], log)
+    try:
+        os.remove(exe)
+    except OSError:
+        pass
+
+
+def ensure_python(log):
+    global PYTHON
+    py = find_python()
+    if py is None:
+        install_python(log)
+        py = find_python()
+    if py is None:
+        raise RuntimeError(f"no usable Python - install Python {PY_VERSION} from python.org and try again")
+    PYTHON = py
+    s = load_settings()
+    if s.get("python") != py:
+        s["python"] = py
+        save_settings(s)
+    return py
+
+
+# ---------------------------------------------------------------- ESP-IDF's tools
+def tools_ready(idf):
+    """ESP-IDF's compiler, CMake, Ninja and Python environment are installed for idf"""
+    if not PYTHON:
+        return False
+    try:
+        r = subprocess.run([PYTHON, os.path.join(idf, "tools", "idf_tools.py"), "--idf-path", idf,
+                            "--non-interactive", "export", "--format", "key-value"],
+                           capture_output=True, text=True, timeout=120, env=idf_env(idf),
+                           creationflags=subprocess.CREATE_NO_WINDOW if WIN else 0)
+    except Exception:
+        return False
+    if r.returncode != 0:
+        return False
+    venv = next((l.split("=", 1)[1] for l in r.stdout.splitlines() if l.startswith("IDF_PYTHON_ENV_PATH=")), "")
+    return os.path.isfile(os.path.join(venv, "Scripts", "python.exe") if WIN else os.path.join(venv, "bin", "python"))
+
+
+def install_tools(idf, log):
+    log("Installing ESP-IDF's ESP32-S31 tools (compiler, CMake, Ninja, Python environment; about 1 GB, once)...\n")
+    if WIN:
+        stream(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File",
+                os.path.join(idf, "install.ps1"), "esp32s31"], log, cwd=idf, env=idf_env(idf))
+    else:
+        stream(["bash", os.path.join(idf, "install.sh"), "esp32s31"], log, cwd=idf, env=idf_env(idf))
+
+
+def git_idf(project, idf, commit, log):
+    """Espressif's commit through git, then our patches (for an ESP-IDF outside the repository)"""
     need_git(log)
-    commit = idf_commit(project)
-    if not os.path.isfile(os.path.join(idf, "tools", "idf.py")):
-        if os.path.isdir(idf) and os.listdir(idf):
-            raise RuntimeError(f"{idf} is not empty and not an ESP-IDF folder - pick another one")
-        log(f"Downloading ESP-IDF {commit[:10]} into {idf} (about 1-2 GB, takes a while)...\n")
+    if not os.path.isdir(os.path.join(idf, ".git")):
+        log(f"Downloading ESP-IDF {commit[:10]} into {idf} with git (about 1-2 GB, takes a while)...\n")
         os.makedirs(idf, exist_ok=True)
         stream(["git", "init", "-q"], log, cwd=idf)
         stream(["git", "remote", "add", "origin", IDF_URL], log, cwd=idf)
@@ -232,16 +401,38 @@ def setup_idf(project, idf, log):
             log(f"{os.path.basename(p)}: already applied\n")
         else:
             stream(["git", "apply", p], log, cwd=idf)
-    log("Installing the ESP32-S31 tools (compiler, CMake, Python environment)...\n")
-    if WIN:
-        stream(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File",
-                os.path.join(idf, "install.ps1"), "esp32s31"], log, cwd=idf, env=idf_env(idf))
-    else:
-        stream(["bash", os.path.join(idf, "install.sh"), "esp32s31"], log, cwd=idf, env=idf_env(idf))
+
+
+def ensure_ready(project, idf, log):
+    """everything a build needs: this project's ESP-IDF (normally the one in the repository),
+    BTstack, a Python, and ESP-IDF's tools; only what is missing is fetched"""
+    if WIN and len(os.path.abspath(project)) > MAX_PROJECT_PATH:
+        raise RuntimeError(f"the project folder's path is too long ({len(os.path.abspath(project))} characters; "
+                           f"ESP-IDF's files inside need it under {MAX_PROJECT_PATH}) - move the folder "
+                           "somewhere shorter, e.g. C:\\S31\\ESP32-S31-CSBAura")
+    state = idf_state(idf, project)
+    if state != "ready":
+        if os.path.normcase(os.path.abspath(idf)) == os.path.normcase(os.path.abspath(bundled_idf(project))):
+            raise RuntimeError(f"third_party/esp-idf: {state} - download the whole repository again")
+        if os.path.isfile(os.path.join(idf, "tools", "idf.py")) and not os.path.isdir(os.path.join(idf, ".git")):
+            raise RuntimeError(f"ESP-IDF at {idf}: {state} - pick another folder")
+        if not os.path.isfile(os.path.join(idf, "tools", "idf.py")) and os.path.isdir(idf) and os.listdir(idf):
+            raise RuntimeError(f"{idf} is not empty and not an ESP-IDF folder - pick another one")
+        git_idf(project, idf, idf_commit(project), log)
+        state = idf_state(idf, project)
+        if state != "ready":
+            raise RuntimeError(f"ESP-IDF at {idf}: {state}")
+    if not btstack_ready(project):
+        setup_btstack(project, log)
+    ensure_python(log)
+    if not tools_ready(idf):
+        install_tools(idf, log)
+        if not tools_ready(idf):
+            raise RuntimeError("ESP-IDF's tools did not install - see the log above")
     s = load_settings()
-    s["idf_path"] = idf
-    save_settings(s)
-    log("ESP-IDF ready.\n")
+    if s.get("idf_path") != idf:
+        s["idf_path"] = idf
+        save_settings(s)
 
 
 def setup_btstack(project, log):
@@ -265,11 +456,7 @@ def setup_btstack(project, log):
 
 
 def build(project, idf, log):
-    state = idf_state(idf, project)
-    if state != "ready":
-        raise RuntimeError(f"ESP-IDF at {idf}: {state} - run Set up first")
-    if not btstack_ready(project):
-        raise RuntimeError("BTstack is missing (third_party/btstack) - run Set up first")
+    ensure_ready(project, idf, log)
     proj = project_file(project, PROJECT_SUBDIR)
     log(f"Building {proj} with ESP-IDF {idf}...\n")
     stream(in_idf_env(idf, "idf.py --ccache build"), log, cwd=proj, env=idf_env(idf))
@@ -285,10 +472,12 @@ def crc16_arc(data):
     return crc
 
 
-def make_cfg(color_id, name):
-    """the s31cfg partition image (see s31-btstack-speaker/main/s31_ident.c)"""
+def make_cfg(color_id, name, ident=None):
+    """the s31cfg partition image, version 2 (see s31-btstack-speaker/main/s31_ident.c);
+    ident = this speaker's Bluetooth address (6 bytes), None/zeros = the chip's own MAC"""
     nb = (name or "").encode("utf-8")[:NAME_MAX]
-    body = b"S31C" + bytes([1, color_id & 0xFF, 0, len(nb)]) + nb.ljust(NAME_MAX, b"\0")
+    body = b"S31C" + bytes([2, color_id & 0xFF, 0, len(nb)]) + nb.ljust(NAME_MAX, b"\0")
+    body += bytes(ident or bytes(6))
     body += struct.pack("<H", crc16_arc(body))
     return body.ljust(CFG_SIZE, b"\xff")
 
@@ -327,10 +516,14 @@ def run_esptool(argv, log):
 
 def flash(project, port, color_id, name, erase, color_only, log):
     build_dir = project_file(project, PROJECT_SUBDIR, "build")
-    with tempfile.TemporaryDirectory() as tmp:
+    # a fixed work file, overwritten each time and never deleted: esptool can still hold it
+    # open when we return, and Windows refuses to delete an open file (WinError 32)
+    tmp = os.path.join(tempfile.gettempdir(), "S31Flasher")
+    os.makedirs(tmp, exist_ok=True)
+    if True:
         cfg = os.path.join(tmp, "s31cfg.bin")
         with open(cfg, "wb") as f:
-            f.write(make_cfg(color_id, name))
+            f.write(make_cfg(color_id, name))               # identity: the chip's own MAC
         if color_only:
             run_esptool(["--chip", "esp32s31", "--port", port, "--no-stub", "write-flash", hex(CFG_OFFSET), cfg], log)
             log(f"\nColor set to 0x{color_id:02X}. The board restarts with it.\n")
@@ -349,7 +542,7 @@ def flash(project, port, color_id, name, erase, color_only, log):
         if erase:
             ea = list(base)
             ea[ea.index("--after") + 1] = "no-reset"
-            run_esptool(ea + ["erase-flash"], log)
+            run_esptool(ea + ["erase-region", "0x0", hex(FLASH_SIZE)], log)   # the S31 ROM has no erase-flash
         wf = [a.replace("_", "-") for a in args.get("write_flash_args", [])]
         pairs = []
         for off, p in files + [(hex(CFG_OFFSET), cfg)]:
@@ -440,7 +633,7 @@ def gui(project, idf):
     c1 = card("1", "Setup")
     setup_lbl = ttk.Label(c1, textvariable=setup_var, style="Card.TLabel")
     setup_lbl.grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 0))
-    setup_btn = ttk.Button(c1, text="Set up ESP-IDF + BTstack")
+    setup_btn = ttk.Button(c1, text="Install tools")
     setup_btn.grid(row=1, column=3, sticky="e", pady=(4, 0))
     adv = ttk.Frame(c1, style="Card.TFrame")
     adv_shown = tk.BooleanVar(value=False)
@@ -469,6 +662,8 @@ def gui(project, idf):
     adv_btn = ttk.Button(c1, text="Folders...", command=toggle_adv)
     adv_btn.grid(row=1, column=2, sticky="e", padx=(0, 8), pady=(4, 0))
 
+    tools_var, tools_checking = {}, set()
+
     def refresh_status(*_):
         p, i = proj_var.get(), idf_var.get()
         if not is_project(p):
@@ -479,9 +674,30 @@ def gui(project, idf):
             return False
         ist, bt = idf_state(i, p), btstack_ready(p)
         ready = ist == "ready" and bt
-        setup_var.set(("Ready to build" if ready else "Needs setup") +
-                      f"   -   ESP-IDF: {ist}   -   BTstack: {'ready' if bt else 'missing'}")
+        where = "in the repository" if os.path.normcase(os.path.abspath(i)) == \
+            os.path.normcase(os.path.abspath(bundled_idf(p))) else i
+        tools = tools_var.get(i)
+        tools_txt = {None: "checking tools...", True: "tools installed",
+                     False: "tools get installed on the first Build + Flash"}[tools]
+        if ready:
+            setup_var.set(f"Ready to build   -   ESP-IDF {where}, BTstack ready   -   {tools_txt}")
+        else:
+            setup_var.set(f"Needs setup   -   ESP-IDF: {ist}   -   BTstack: {'ready' if bt else 'missing'}")
         setup_lbl.configure(foreground=OK if ready else BAD)
+        if ready and tools is None and i not in tools_checking:
+            tools_checking.add(i)
+
+            def check():
+                global PYTHON
+                ok = False
+                try:
+                    PYTHON = PYTHON or find_python()
+                    ok = tools_ready(i)
+                except Exception:
+                    pass
+                tools_var[i] = ok
+                root.after(0, refresh_status)
+            threading.Thread(target=check, daemon=True).start()
         return ready
 
     # 2 - board
@@ -497,7 +713,7 @@ def gui(project, idf):
         port_var.set(last_port)
     elif port_box["values"]:
         port_box.current(0)
-    ttk.Checkbutton(c2, text="New board: erase it first (forgets pairings and settings)", variable=erase_var,
+    ttk.Checkbutton(c2, text="Erase the whole board first (only for a brand-new board)", variable=erase_var,
                     style="Card.TCheckbutton").grid(row=2, column=0, columnspan=4, sticky="w", pady=(6, 0))
 
     # 3 - color swatches
@@ -636,12 +852,10 @@ def gui(project, idf):
         remember()
 
         def job():
-            if idf_state(i, p) != "ready":
-                setup_idf(p, i, log)
-            if not btstack_ready(p):
-                setup_btstack(p, log)
+            ensure_ready(p, i, log)
+            tools_var[i] = True
             log("Setup complete.\n")
-        run(job, "Setting up ESP-IDF and BTstack (the first time downloads a few GB)")
+        run(job, "Installing ESP-IDF's tools (about 1 GB, once)")
 
     def do_flash(do_build):
         port = needs_port()
@@ -656,7 +870,8 @@ def gui(project, idf):
 
         def job():
             if do_build:
-                build(p, i, log)
+                build(p, i, log)          # installs ESP-IDF's tools first if they are missing
+                tools_var[i] = True
             flash(p, port, cid, nm, er, False, log)
         run(job, f"{'Building and flashing' if do_build else 'Flashing'} ({color_var.get()})")
 
@@ -687,7 +902,7 @@ def main():
     ap.add_argument("--name", default="", help="default Bluetooth name (empty: S31 JBL Xtreme 5)")
     ap.add_argument("--project", help="project folder (default: the one this tool sits in)")
     ap.add_argument("--idf", help="ESP-IDF folder (default: found automatically, or ~/esp/esp-idf-s31)")
-    ap.add_argument("--setup", action="store_true", help="set up this project's ESP-IDF and BTstack")
+    ap.add_argument("--setup", action="store_true", help="install ESP-IDF's tools (Build does it too when needed)")
     ap.add_argument("--no-build", action="store_true", help="flash the last build without building")
     ap.add_argument("--erase", action="store_true", help="erase the whole flash first")
     ap.add_argument("--color-only", action="store_true", help="only write the color / name")
@@ -707,10 +922,7 @@ def main():
             out.flush()
 
     if a.setup:
-        if idf_state(idf, project) != "ready":
-            setup_idf(project, idf, cli_log)
-        if not btstack_ready(project):
-            setup_btstack(project, cli_log)
+        ensure_ready(project, idf, cli_log)
         cli_log(f"ESP-IDF: {idf_state(idf, project)} ({idf}) | BTstack: {'ready' if btstack_ready(project) else 'missing'}\n")
         if not a.port:
             return

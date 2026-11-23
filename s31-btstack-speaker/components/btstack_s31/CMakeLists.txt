@@ -1,14 +1,14 @@
 # BTstack host for the ESP32-S31 (controller-only build, VHCI transport).
-# BTstack itself lives in ../../third_party/btstack (git clone of
-# https://github.com/bluekitchen/btstack, kept out of this repo: its license
-# allows personal, non-commercial use). Only the parts this speaker needs are
+# BTstack itself lives in ../../third_party/btstack: BlueKitchen's BTstack at
+# btstack-patches/BTSTACK_COMMIT with btstack-patches/*.patch applied (shipped in the
+# repository; its own LICENSE allows personal, non-commercial use). Only the parts this speaker needs are
 # compiled: core, Classic (A2DP sink + AVRCP + SDP), BLE (ATT/GATT/SM),
 # LE Audio helpers (BASE builder/parser), the Bluedroid SBC codec, micro-ecc
 # and the FreeRTOS run loop. LC3 comes from our own components/liblc3.
 
 get_filename_component(BTSTACK_ROOT "${CMAKE_CURRENT_LIST_DIR}/../../../third_party/btstack" ABSOLUTE)
 if(NOT EXISTS "${BTSTACK_ROOT}/src/hci.c")
-    message(FATAL_ERROR "BTstack not found at ${BTSTACK_ROOT} - git clone https://github.com/bluekitchen/btstack third_party/btstack")
+    message(FATAL_ERROR "BTstack not found at ${BTSTACK_ROOT} - get the whole repository (third_party/btstack is part of it), or run the S31 Flasher's Set up")
 endif()
 
 set(B ${BTSTACK_ROOT})

@@ -999,6 +999,97 @@ static void listen_poll(void)
     }
 }
 
+/* The phone's LE Audio CIS next to our BIG: whether they collide depends on where the
+ * controller happened to place the BIG (one session lost 0 SDUs per 2 s, another 17 with
+ * the same settings). When the CIS loses >= 3 % of its SDUs while we host, re-place the BIG
+ * (the advertising and PA stay, receivers re-sync) - a few tries per stream. */
+/* checked every tick (100 ms) over the last 0.5 s: a bad place shows within a few CIS
+ * events, and each re-place takes ~0.2 s - slow checks let the phone give up on its stream
+ * (it rebuilt the CIS after 2 s of losses) and stretched settling to ~10 s */
+#define CIS_GUARD_WINDOW    5                /* ticks of 100 ms */
+#define CIS_GUARD_LOST      3                /* SDUs lost in the window (of ~50) */
+#define CIS_GUARD_SETTLE_MS 300              /* after the new BIG is on */
+#define CIS_GUARD_TRIES     8
+static void cis_guard(void)
+{
+    static uint32_t rx_h[CIS_GUARD_WINDOW], lost_h[CIS_GUARD_WINDOW], settle_until;
+    static int n, tries;
+    static bool waiting_on;
+    uint32_t rx, lost, now = now_ms();
+    if (!le_audio_cis_counts(&rx, &lost)) {
+        n = 0;
+        tries = 0;                                    /* a new stream gets new tries */
+        waiting_on = false;
+        return;
+    }
+    if (waiting_on) {                                 /* re-placing: wait for the new BIG */
+        if (auracast_state() != AURACAST_STATE_ON) return;
+        waiting_on = false;
+        settle_until = now + CIS_GUARD_SETTLE_MS;
+        n = 0;
+    }
+    if ((int32_t)(settle_until - now) > 0) return;
+    if (n > 0 && rx < rx_h[(n - 1) % CIS_GUARD_WINDOW]) n = 0;     /* counters were reset */
+    rx_h[n % CIS_GUARD_WINDOW] = rx;
+    lost_h[n % CIS_GUARD_WINDOW] = lost;
+    n++;
+    if (n < CIS_GUARD_WINDOW) return;
+    uint32_t dlost = lost - lost_h[n % CIS_GUARD_WINDOW];         /* oldest sample in the window */
+    if (dlost < CIS_GUARD_LOST || tries >= CIS_GUARD_TRIES) return;
+    tries++;
+    ESP_LOGW(TAG, "phone's LE Audio lost %lu SDUs in 0.5 s next to our broadcast: re-placing the BIG (try %d/%d)",
+             (unsigned long)dlost, tries, CIS_GUARD_TRIES);
+    if (auracast_big_replace() == 0) waiting_on = true;
+    n = 0;
+}
+
+/* A phone connecting LE Audio while we host: a BIG on air kept its CIS from coming up, and
+ * ending the BIG in the middle of the CIS setup broke it too. So the BIG is held from the
+ * phone's LE connect (~2 s before it configures LE Audio) until its stream has run cleanly
+ * for BIG_HOLD_STABLE_MS; then it is created next to the stream. The advertising (party
+ * listing) stays on. A link that never starts LE Audio (A2DP phone, JBL One over LE) ends the
+ * hold after BIG_HOLD_IDLE_MS. Runs every tick, in every role. true while held. */
+#define BIG_HOLD_STABLE_MS 1000
+#define BIG_HOLD_IDLE_MS   10000
+#define BIG_HOLD_MAX_MS    20000
+static bool big_hold_for_cis(void)
+{
+    static bool was_linked, done;
+    static uint32_t link_ms, clean_since, lost_seen;
+    uint32_t rx, lost, now = now_ms();
+    bool linked = le_audio_enabled() && le_audio_phone_linked();
+    bool streaming = le_audio_cis_counts(&rx, &lost);
+    if (linked && !was_linked) {
+        link_ms = now;
+        done = false;
+        clean_since = 0;
+    }
+    was_linked = linked;
+    bool hold = false;
+    if (linked && !done) {
+        if (streaming) {
+            if (clean_since == 0 || lost != lost_seen) { clean_since = now; lost_seen = lost; }
+        } else {
+            clean_since = 0;
+        }
+        bool stable = streaming && clean_since != 0 && now - clean_since >= BIG_HOLD_STABLE_MS;
+        bool idle = !streaming && !le_audio_starting() && now - link_ms > BIG_HOLD_IDLE_MS;
+        bool too_long = now - link_ms > BIG_HOLD_MAX_MS;
+        if (stable || idle || too_long) {
+            done = true;
+            if (auracast_big_held())
+                ESP_LOGW(TAG, "phone's LE Audio %s after %lu ms: broadcast stream on",
+                         stable ? "stream stable" : idle ? "not used on this link" : "still not stable",
+                         (unsigned long)(now - link_ms));
+        } else {
+            hold = true;
+        }
+    }
+    if (hold && !auracast_big_held()) ESP_LOGW(TAG, "phone connecting LE Audio: broadcast stream held until it is stable");
+    auracast_set_big_hold(hold);
+    return hold;
+}
+
 static void tick(btstack_timer_source_t *ts)
 {
     bool playing = (a2dp_in_streaming() || le_audio_starting()) && !s_as.target;   /* a JBL One join wins over the phone */
@@ -1035,6 +1126,7 @@ static void tick(btstack_timer_source_t *ts)
         jbl_assist_set_paused(true);                  /* no party: don't pull speakers in */
         jbl_set_party_info(JBL_PARTY_INFO_OFF);
     }
+    big_hold_for_cis();                               /* before any host start below */
     switch (s_role) {
     case R_OFF:
         if (s_as.target) {                                /* JBL One: join a broadcast */
@@ -1066,6 +1158,7 @@ static void tick(btstack_timer_source_t *ts)
             if (s_host_failed) ESP_LOGW(TAG, "broadcast up after a retry: output back in sync with it");
             s_host_failed = false;
             s_host_retry_gap = 2000;
+            if (!auracast_big_held()) cis_guard();
         } else if (auracast_state() == AURACAST_STATE_OFF && !s_as.target &&
                    now_ms() - s_host_retry_ms >= s_host_retry_gap) {
             /* the start failed (e.g. no ISO resources yet): play locally, try again */
