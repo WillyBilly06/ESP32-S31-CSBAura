@@ -6,3 +6,5 @@ factory,  app,  factory, 0x10000, 4M
 jblota,   data, undefined, 0x410000, 4M
 # prompt tones (tools/tones_pack.py, written from local files only)
 tones,    data, undefined, 0x810000, 2M
+# this board's color / name, written by tools/flasher (see main/s31_ident.c)
+s31cfg,   data, undefined, 0xA10000, 0x1000

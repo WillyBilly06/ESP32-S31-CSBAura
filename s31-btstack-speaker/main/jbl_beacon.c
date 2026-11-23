@@ -34,6 +34,7 @@
 #include "jbl.h"
 #include "jbl_beacon.h"
 #include "jbl_v5.h"
+#include "s31_ident.h"
 
 static const char *TAG = "JBL_BEACON";
 
@@ -98,7 +99,7 @@ static uint8_t build_adv(uint8_t *adv)
     uint16_t mask = JBL_ADV_MASK | (s_st.name_known ? JBL_MASK_SRCNAME : 0);
     p[i++] = JBL_PID & 0xFF;          p[i++] = JBL_PID >> 8;            /* 69 21 */
     p[i++] = mask & 0xFF;             p[i++] = mask >> 8;               /* c0 97 / c0 d7 */
-    p[i++] = 0x00;                                                     /* colorID */
+    p[i++] = s31_ident_color();                                        /* colorID (set when flashing) */
     if (s_st.name_known) {
         p[i++] = s_st.name_crc & 0xFF; p[i++] = s_st.name_crc >> 8;     /* srcName1Crc */
     }

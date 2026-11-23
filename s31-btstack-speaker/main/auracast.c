@@ -21,6 +21,7 @@
  * numbers advance per BIS for every SDU handed to the controller.
  */
 #include "auracast.h"
+#include "s31_ident.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -200,7 +201,7 @@ static uint8_t s_ext_adv[7 + 6 + 4 + 2 * (2 + 32) + sizeof(jbl_master_mfg_ad)];
  * any Auracast receiver can join - its own Broadcast ID and name, no JBL master
  * marker, no JBL party block in the periodic data, optional broadcast code.
  * Chosen per start; the JBL party broadcast (Auracast button) is the default. */
-#define STD_BROADCAST_ID       0x5a31c3u
+#define STD_BROADCAST_ID       s31_ident_std_broadcast_id()   /* per board: phones list broadcasts by it */
 static bool s_std;
 static char s_std_name[33] = "S31 Auracast";
 static bool s_std_enc;

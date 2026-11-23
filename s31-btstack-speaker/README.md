@@ -45,7 +45,7 @@ function is marked "any thread" in its header.
 `components/helix_aac/` is the AAC-LC decoder (RealNetworks Helix, RPSL; LC only, no SBR) with a small LATM parser.
 `components/btstack_s31/` builds the needed parts of BTstack from `../third_party/btstack` and adds
 the S31 VHCI transport (`hci_transport_s31_vhci.c`) and an NVS-backed TLV store for bonding keys
-(`btstack_tlv_esp32.c`). LC3 comes from `../s31-jbl-speaker/components/liblc3`.
+(`btstack_tlv_esp32.c`). LC3 comes from `components/liblc3` (Google liblc3).
 
 ## Compile-time switches
 

@@ -32,6 +32,7 @@
 #include "auracast.h"
 #include "jbl.h"
 #include "jbl_v5.h"
+#include "s31_ident.h"
 #include "link_tune.h"
 #include "party.h"
 #include "le_audio.h"
@@ -240,6 +241,7 @@ void app_main(void)
         nvs_flash_init();
     }
     log_heap();
+    s31_ident_init();                        /* this board's serial, color, Broadcast_ID */
     /* core 1 = Bluetooth core: the BTstack run loop sits below the controller (23) */
     xTaskCreatePinnedToCore(btstack_task, "btstack", 8192, NULL, configMAX_PRIORITIES - 5, NULL, 1);
     xTaskCreatePinnedToCore(stats_task, "stats", 4096, NULL, 2, NULL, 1);

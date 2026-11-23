@@ -1,18 +1,23 @@
 # ESP-IDF build output
 build/
+build*/
 managed_components/
 sdkconfig.old
 sdkconfig.bak
 *.log
+logs/
 
-# Third-party material kept local only (proprietary / large binaries):
-#   decompiled JBL apps and APKs, Ghidra output of JBL firmware, jadx
-apk/com.*/
-apk/src_one/
-apk/src_portable/
-apk/*.apk
-decomp/
-tools/jadx/
+# BTstack (personal / non-commercial license): clone it, see README
+third_party/
+
+# flasher build output (ship the exe + firmware as a release zip, not in git)
+tools/flasher/dist/
+tools/flasher/build_pyi/
+tools/flasher/firmware/
+*.spec
+
+# prompt tones are made from your own files
+tones.bin
 
 # editor / OS
 .vscode/
@@ -21,22 +26,3 @@ tools/jadx/
 Thumbs.db
 desktop.ini
 __pycache__/
-
-# console runtime
-tools/s31_console/__pycache__/
-tools/s31_console/mock_logs/
-s31-jbl-speaker/logs/
-
-# BTstack (personal/non-commercial license) - clone https://github.com/bluekitchen/btstack
-third_party/btstack/
-s31-btstack-speaker/build*/
-s31-btstack-speaker/build.log
-s31-btstack-speaker/logs/
-
-# JBL Xtreme 5 tone extraction (proprietary firmware data, local only)
-re/local_tones/
-
-# leftovers of the ESP-IDF tree switch (old build dirs, pre-switch backups)
-*/build_newidf/
-*.old-idf.bak
-*.pre-idf-latest.bak

@@ -47,6 +47,7 @@
 #include "jbl_gatt.h"
 #include "le_audio.h"
 #include "jbl_v5.h"
+#include "s31_ident.h"
 #include "party.h"
 #include "tones.h"
 #include "power.h"
@@ -138,7 +139,6 @@ static void eq_store_coef(const uint8_t *coef);
 
 static uint8_t s_eq[8] = { 0x80, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C };   /* 0x0E7E: JBL Signature */
 
-static const char s_serial[] = "S31X5000001";
 static bd_addr_t s_local_addr;
 
 /* ---- link ------------------------------------------------------------------ */
@@ -517,9 +517,9 @@ static bool feat_value(uint16_t id, uint8_t *v, uint16_t *n)
         v[0] = m & 0xFF; v[1] = m >> 8; *n = 2; return true;
     }
     case 0x0004: v[0] = 0x69; v[1] = 0x21; *n = 2; return true;               /* ProductID 2169 */
-    case 0x0005: v[0] = 0x00; v[1] = 0x00; *n = 2; return true;               /* ColorID */
+    case 0x0005: v[0] = 0x00; v[1] = s31_ident_color(); *n = 2; return true;  /* ColorID (set when flashing) */
     case 0x0006: *n = (uint16_t)str_copy(v, cfg.name, V5_NAME_MAX); return true;
-    case 0x0008: *n = (uint16_t)str_copy(v, s_serial, 32); return true;       /* SerialNumber */
+    case 0x0008: *n = (uint16_t)str_copy(v, s31_ident_serial(), 32); return true;   /* SerialNumber (per board) */
     case 0x000A: memcpy(v, s_local_addr, 6); *n = 6; return true;             /* DeviceMAC (BR/EDR) */
     case 0x000C: memcpy(v, cfg.fw, 3); *n = 3; return true;                   /* FirmwareVersion */
     case 0x000D: v[0] = 100; *n = 1; return true;                             /* battery: mains, 100 % */
@@ -641,6 +641,11 @@ static void cfg_load(void)
         cfg = c;
         ESP_LOGW(TAG, "settings restored: name '%s', firmware %u.%u.%u, feedback tone %s",
                  cfg.name, cfg.fw[0], cfg.fw[1], cfg.fw[2], (cfg.feedback_tone & 0x80) ? "on" : "off");
+    } else if (s31_ident_name()[0]) {
+        /* first boot after flashing: the name picked in the flasher */
+        strncpy(cfg.name, s31_ident_name(), V5_NAME_MAX);
+        cfg.name[V5_NAME_MAX] = 0;
+        ESP_LOGW(TAG, "first boot: name '%s' (set when flashing)", cfg.name);
     }
     nvs_close(h);
 }
