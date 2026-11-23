@@ -178,8 +178,12 @@ python tools/flasher/s31_flasher.py --port <PORT> --color blue --no-build
 
 ## Prompt tones
 
-No tone files are shipped. The firmware plays the Xtreme 5 prompt set from the `tones`
-partition and stays silent if it is empty.
+`tones.bin` in the repository root holds the Xtreme 5 prompt set: 22 tones for power,
+pairing, connect, Auracast, volume, battery and the digits. The S31 Flasher writes it with
+the firmware, so a flashed board has its sound effects right away. The tones are JBL's
+audio, so this repository has to stay **private** while it holds them.
+
+To use other sounds instead:
 
 1. Put your own tone files in a folder. They can be MP3, or 16 kHz s16 mono `.pcm`, named:
    `poweron`, `poweroff`, `bt_cnt`, `bt_pair`, `ent_aura`, `exi_aura`, `vol_max`,
@@ -190,7 +194,7 @@ partition and stays silent if it is empty.
    python tools/tones_pack.py <dir with tone files> tones.bin
    ```
 
-3. Put `tones.bin` into the project folder. The S31 Flasher writes it with the firmware.
+3. Replace `tones.bin` in the project folder. The S31 Flasher writes it with the firmware.
 
 ## Troubleshooting
 

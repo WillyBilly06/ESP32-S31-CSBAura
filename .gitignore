@@ -18,8 +18,8 @@ tools/flasher/build_pyi/
 tools/flasher/firmware/
 *.spec
 
-# prompt tones are made from your own files
-tones.bin
+# prompt tones: tones.bin (repo root) is the shipped set; other tone builds stay local
+build/tones.bin
 
 # editor / OS
 .vscode/

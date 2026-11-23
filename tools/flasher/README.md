@@ -98,9 +98,10 @@ JBL One reads the color from the speaker's BLE beacon. The IDs are JBL's own for
 
 ## Prompt tones
 
-No tones come with the project. If `tones.bin` is in the project folder (make it with
-[`tools/tones_pack.py`](../tones_pack.py), see the main README), it is flashed too.
-Otherwise the board keeps the tones it has.
+The repository's `tones.bin` (the Xtreme 5 prompt set) is flashed with every Build + Flash,
+so the board plays its power, pairing, connect and Auracast sounds right away. To use your
+own sounds, replace `tones.bin` with one made by [`tools/tones_pack.py`](../tones_pack.py)
+(see the main README).
 
 ## Troubleshooting
 
