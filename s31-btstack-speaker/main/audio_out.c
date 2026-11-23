@@ -15,6 +15,7 @@
 #include "a2dp_in.h"
 #include "auracast.h"
 #include "party.h"
+#include "v5_eq.h"
 
 static const char *TAG = "I2S_OUT";
 
@@ -46,6 +47,60 @@ static volatile uint32_t st_trims, st_coarse;
 #define FINE_FRAMES    48                       /* > 1 ms: drop / repeat 1 frame per 5 ms chunk */
 static volatile uint32_t st_underruns, st_primes, st_pushed, st_dropped, st_written;
 static volatile int64_t s_last_push_us;          /* producer alive? (a stop is not an underrun) */
+
+/* prompt tone, mixed in by the writer (lock-free hand-over by sequence number) */
+#define TONE_GAIN 0.7f
+static const int16_t *volatile s_tone_pcm;
+static volatile uint32_t s_tone_len, s_tone_rate, s_tone_seq;
+static volatile bool s_tone_cut;
+static volatile uint32_t st_tones;
+
+void audio_out_tone(const int16_t *pcm, uint32_t samples, uint32_t rate, bool cut)
+{
+    s_tone_pcm = NULL;                            /* writer stops reading the old one first */
+    s_tone_cut = cut;
+    s_tone_len = samples;
+    s_tone_rate = rate;
+    s_tone_pcm = pcm;
+    s_tone_seq++;
+}
+
+/* writer task: mix the prompt into one chunk at the line rate (linear interpolation) */
+static void tone_mix(int32_t *out, int frames, uint32_t line_rate)
+{
+    static uint32_t seq;
+    static const int16_t *pcm;
+    static uint32_t len;
+    static uint64_t pos, step;                    /* Q16 position / step in tone samples */
+    static float music;                           /* 0 = cut, 0.5 = ducked */
+    if (seq != s_tone_seq) {
+        seq = s_tone_seq;
+        music = s_tone_cut ? 0.0f : 0.5f;
+        pcm = s_tone_pcm;
+        len = s_tone_len;
+        step = ((uint64_t)s_tone_rate << 16) / (line_rate ? line_rate : 48000);
+        pos = 0;
+        if (pcm) st_tones++;
+    }
+    if (pcm == NULL) return;
+    for (int i = 0; i < frames; i++) {
+        uint32_t k = (uint32_t)(pos >> 16);
+        if (k + 1 >= len) {
+            pcm = NULL;                           /* done */
+            return;
+        }
+        int32_t fr = (int32_t)(pos & 0xFFFF);
+        int32_t t = pcm[k] + (((int32_t)pcm[k + 1] - pcm[k]) * fr >> 16);
+        float tv = (float)t * TONE_GAIN;
+        for (int c = 0; c < 2; c++) {
+            float v = (float)(out[2 * i + c] >> 16) * music + tv;
+            if (v > 32767.0f) v = 32767.0f;
+            if (v < -32768.0f) v = -32768.0f;
+            out[2 * i + c] = ((int32_t)v) << 16;
+        }
+        pos += step;
+    }
+}
 
 static uint32_t delay_to_frames(uint32_t ms)
 {
@@ -99,7 +154,14 @@ void audio_out_push(ao_owner_t owner, const int16_t *lr, int n)
     static int16_t vol_buf[480 * 2];
     if ((owner == AO_HOST || owner == AO_LOCAL) && n <= 480) {
         memcpy(vol_buf, lr, (size_t)n * 4);       /* phone volume: here, not on the broadcast */
+        if (owner == AO_LOCAL) {
+            v5_eq_process(vol_buf, n);            /* JBL One EQ (HOST: already in the encoder path) */
+        }
         a2dp_in_apply_volume(vol_buf, n);
+        lr = vol_buf;
+    } else if (owner == AO_LISTEN && n <= 480 && s_rate == OUT_RATE) {
+        memcpy(vol_buf, lr, (size_t)n * 4);       /* party audio: our EQ on our speaker */
+        v5_eq_process(vol_buf, n);
         lr = vol_buf;
     }
     uint32_t space = ring_space(&s_ring);
@@ -192,6 +254,7 @@ static void writer_task(void *arg)
             }
             memset(out, 0, sizeof(out));
         }
+        tone_mix(out, CHUNK, s_rate_cur);
         size_t wr = 0;
         i2s_channel_write(s_i2s, out, sizeof(out), &wr, portMAX_DELAY);   /* DMA paces this task */
         st_written += CHUNK;
@@ -262,12 +325,13 @@ void audio_out_setup(void)
 void audio_out_log_stats(void)
 {
     static const char *const names[] = { "idle", "HOST", "LOCAL", "LISTEN" };
-    ESP_LOGI(TAG, "I2S 2s: %s, %s, line %lu ms (target %lu ms + 20 DMA), sync error %ld.%ld ms | trims %lu, coarse %lu | underruns %lu, primes %lu, dropped %lu",
+    ESP_LOGI(TAG, "I2S 2s: %s, %s, line %lu ms (target %lu ms + 20 DMA), sync error %ld.%ld ms | trims %lu, coarse %lu | underruns %lu, primes %lu, dropped %lu | tones %lu",
              names[s_owner], s_primed ? "playing" : "priming/silent",
              (unsigned long)(ring_fill(&s_ring) / (s_rate_cur / 1000u)),
              (unsigned long)(s_delay_frames / (s_rate_cur / 1000u)),
              (long)(st_err_frames * 10 / (int32_t)(s_rate_cur / 1000u)) / 10,
              labs((long)(st_err_frames * 10 / (int32_t)(s_rate_cur / 1000u)) % 10),
              (unsigned long)st_trims, (unsigned long)st_coarse,
-             (unsigned long)st_underruns, (unsigned long)st_primes, (unsigned long)st_dropped);
+             (unsigned long)st_underruns, (unsigned long)st_primes, (unsigned long)st_dropped,
+             (unsigned long)st_tones);
 }

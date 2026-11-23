@@ -31,10 +31,12 @@
 #include "a2dp_in.h"
 #include "auracast.h"
 #include "jbl.h"
+#include "jbl_v5.h"
 #include "link_tune.h"
 #include "party.h"
 #include "audio_out.h"
 #include "buttons.h"
+#include "tones.h"
 #include "sniffer.h"
 
 /* 1 = JBL party / Auracast sniffer only (no A2DP, no broadcast, no JBL GATT) */
@@ -129,7 +131,9 @@ static void stats_task(void *arg)
         party_log_stats();
         audio_out_log_stats();
         /* slow beacon (100 ms) while streaming OR listening: at 20 ms it collides with the master's 20 ms BIG */
-        jbl_set_streaming(a2dp_in_streaming() || party_listening());
+        /* slow beacon (100 ms) only while a BIG needs the air: broadcasting or listening.
+         * Phone audio alone keeps 20 ms, so JBL One finds the speaker quickly. */
+        jbl_set_streaming(auracast_state() != AURACAST_STATE_OFF || party_listening());
         jbl_log_stats();
         log_heap();
     }
@@ -145,7 +149,7 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
     if (btstack_event_state_get_state(packet) == HCI_STATE_WORKING) {
         bd_addr_t a;
         gap_local_bd_addr(a);
-        ESP_LOGW(TAG, "BTstack up: '%s' at %s (BR/EDR A2DP sink, LE)", LOCAL_NAME, bd_addr_to_str(a));
+        ESP_LOGW(TAG, "BTstack up: '%s' at %s (BR/EDR A2DP sink, LE)", jbl_device_name(), bd_addr_to_str(a));
         if (S31_SNIFFER) {
             sniffer_start();
             return;
@@ -200,13 +204,15 @@ static void btstack_task(void *arg)
     s_hci_reg.callback = &hci_handler;
     hci_add_event_handler(&s_hci_reg);
 
-    gap_set_local_name(LOCAL_NAME);
+    gap_set_local_name(jbl_device_name());   /* JBL One can rename it (NVS) */
     if (S31_SNIFFER) {
         sniffer_setup();
     } else {
         link_tune_setup();
         a2dp_in_setup();
         audio_out_setup();
+        tones_setup();
+        tones_play("poweron");
         auracast_setup();
         party_setup();
         buttons_setup();

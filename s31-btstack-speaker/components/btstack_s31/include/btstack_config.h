@@ -23,7 +23,10 @@
 /* one 2-DH5 (679 B payload) per A2DP media packet: at bitpool 53 the phone packs
  * 5 SBC frames (~608 B), and each media packet is ONE baseband exchange that fits
  * between Auracast BIG events (btstack-patches/0001 makes this overridable) */
-#define AVDTP_L2CAP_MTU 1005   /* 8 SBC frames (bitpool 53) per 3-DH5; Android caps at 1005 with EDR 3M, 663 without */
+/* 1005: 8 SBC frames (bitpool 53) per 3-DH5, ~43 media packets/s. 663 (5 frames,
+ * ~69/s) starved a Galaxy S26 at a 20 ms poll; the iPhone's losses at 1005 came
+ * from the same poll limit (no room for retries), now fixed in link_tune.c. */
+#define AVDTP_L2CAP_MTU 1005
 
 /* ---- LE: JBL beacon + V5 GATT, Auracast source/sink ---------------------- */
 #define ENABLE_BLE

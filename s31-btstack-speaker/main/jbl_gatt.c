@@ -28,6 +28,7 @@
 #include "jbl_gatt.h"
 #include "jbl_gatt_db.h"
 #include "jbl_v5.h"
+#include "hci_transport_s31_vhci.h"
 
 static const char *TAG = "JBL_GATT";
 
@@ -296,6 +297,32 @@ uint16_t jbl_gatt_mtu(hci_con_handle_t con)
 
 static uint16_t att_read_cb(hci_con_handle_t con, uint16_t handle, uint16_t offset, uint8_t *buffer, uint16_t size)
 {
+    /* every readable value is served here so each read is logged (iOS JBL One diagnosis) */
+    const uint8_t *val = NULL;
+    uint16_t vlen = 0;
+    static const uint8_t appearance[2] = { 0x85, 0x08 }, zero = 0;
+    const char *what = NULL;
+    switch (handle) {
+    case ATT_CHARACTERISTIC_GAP_DEVICE_NAME_01_VALUE_HANDLE:                     /* JBL One rename */
+        val = (const uint8_t *)jbl_device_name(); vlen = (uint16_t)strlen((const char *)val); what = "Device Name"; break;
+    case ATT_CHARACTERISTIC_GAP_APPEARANCE_01_VALUE_HANDLE:
+        val = appearance; vlen = 2; what = "Appearance"; break;
+    case ATT_CHARACTERISTIC_ORG_BLUETOOTH_CHARACTERISTIC_MANUFACTURER_NAME_STRING_01_VALUE_HANDLE:
+        val = (const uint8_t *)"HARMAN"; vlen = 6; what = "Manufacturer"; break;
+    case ATT_CHARACTERISTIC_ORG_BLUETOOTH_CHARACTERISTIC_MODEL_NUMBER_STRING_01_VALUE_HANDLE:
+        val = (const uint8_t *)"JBL Xtreme 5"; vlen = 12; what = "Model Number"; break;
+    case ATT_CHARACTERISTIC_ORG_BLUETOOTH_CHARACTERISTIC_FIRMWARE_REVISION_STRING_01_VALUE_HANDLE:
+        val = (const uint8_t *)"S31-1.0"; vlen = 7; what = "Firmware Revision"; break;
+    case H_CNL_NTF: val = &zero; vlen = 1; what = "cnl.0001"; break;
+    case H_COM_NTF: val = &zero; vlen = 1; what = "com.0001"; break;
+    default: break;
+    }
+    if (val != NULL) {
+        if (offset == 0 && buffer != NULL) {
+            ESP_LOGW(TAG, ">>> peer READ %s (handle 0x%04x) on con 0x%04x", what, handle, con);
+        }
+        return att_read_callback_handle_blob(val, vlen, offset, buffer, size);
+    }
     int ci = cccd_index(handle);
     if (ci >= 0) {
         link_t *l = link_find(con);
@@ -502,6 +529,52 @@ static void sdp_setup(void)
 
 /* ---- setup ------------------------------------------------------------------ */
 
+/* ---- ATT client-role PDUs ----------------------------------------------------------
+ * We run no GATT client, so BTstack's ATT dispatcher drops every server->client PDU
+ * (indications, notifications, responses) - an indication then stays unconfirmed.
+ * The iPhone indicates its own Service Changed (handle 0x0008) the moment the
+ * GATT-over-BR/EDR channel opens; without the confirmation iOS hits the ATT
+ * transaction timeout and closes the channel exactly 30 s later (JBL One "keeps
+ * disconnecting"). So: confirm every indication, ignore the rest. */
+static uint32_t s_ind_confirmed;
+static uint16_t s_conf_cid;                      /* classic: pending confirmation */
+static hci_con_handle_t s_conf_le = HCI_CON_HANDLE_INVALID;
+static btstack_timer_source_t s_conf_timer;
+
+static void confirm_try(btstack_timer_source_t *ts)
+{
+    static const uint8_t confirm[1] = { ATT_HANDLE_VALUE_CONFIRMATION };
+    uint8_t st = ERROR_CODE_SUCCESS;
+    if (s_conf_cid) {
+        st = l2cap_send(s_conf_cid, confirm, 1);
+        if (st == ERROR_CODE_SUCCESS) s_conf_cid = 0;
+    } else if (s_conf_le != HCI_CON_HANDLE_INVALID) {
+        st = l2cap_send_connectionless(s_conf_le, L2CAP_CID_ATTRIBUTE_PROTOCOL, (uint8_t *)confirm, 1);
+        if (st == ERROR_CODE_SUCCESS) s_conf_le = HCI_CON_HANDLE_INVALID;
+    }
+    if (st != ERROR_CODE_SUCCESS && ts == NULL) {   /* busy: try again shortly */
+        btstack_run_loop_remove_timer(&s_conf_timer);
+        btstack_run_loop_set_timer_handler(&s_conf_timer, confirm_try);
+        btstack_run_loop_set_timer(&s_conf_timer, 10);
+        btstack_run_loop_add_timer(&s_conf_timer);
+    } else if (st != ERROR_CODE_SUCCESS) {
+        btstack_run_loop_set_timer(ts, 10);
+        btstack_run_loop_add_timer(ts);
+    }
+}
+
+static void att_client_pdu(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size)
+{
+    if ((packet_type != ATT_DATA_PACKET && packet_type != L2CAP_DATA_PACKET) || size < 1) return;
+    if (packet[0] != ATT_HANDLE_VALUE_INDICATION) return;
+    if (packet_type == L2CAP_DATA_PACKET) s_conf_cid = channel;    /* channel = local L2CAP cid */
+    else s_conf_le = channel;                                        /* channel = con handle */
+    s_ind_confirmed++;
+    ESP_LOGW(TAG, ">>> peer INDICATION handle 0x%04x (%u B) - confirmed (%lu so far)",
+             size >= 3 ? little_endian_read_16(packet, 1) : 0, size, (unsigned long)s_ind_confirmed);
+    confirm_try(NULL);
+}
+
 void jbl_gatt_setup(void)
 {
     for (int i = 0; i < MAX_LINKS; i++) {
@@ -522,6 +595,7 @@ void jbl_gatt_setup(void)
 
     att_server_init(profile_data, &att_read_cb, &att_write_cb);
     att_server_register_packet_handler(&att_event_handler);
+    att_dispatch_register_client(&att_client_pdu);          /* confirm the phone's indications */
     sdp_setup();
 
     ESP_LOGW(TAG, "GATT excelpoint.cnl: notify 0x%04x, write 0x%04x | excelpoint.com: notify 0x%04x, "

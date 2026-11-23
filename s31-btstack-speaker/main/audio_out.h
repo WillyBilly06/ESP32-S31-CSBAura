@@ -37,3 +37,9 @@ void audio_out_set_rate(uint32_t hz);
 
 ao_owner_t audio_out_owner(void);
 void audio_out_log_stats(void);
+
+/* Any thread: play a mono 16-bit prompt (rate 8..48 kHz) on the line at a fixed
+ * level (independent of the volume). cut = the current audio is silenced until
+ * the prompt ends; otherwise it is ducked -6 dB under it. Replaces a playing
+ * prompt; NULL stops it. The PCM must stay valid while it plays (flash-mapped). */
+void audio_out_tone(const int16_t *pcm, uint32_t samples, uint32_t rate, bool cut);

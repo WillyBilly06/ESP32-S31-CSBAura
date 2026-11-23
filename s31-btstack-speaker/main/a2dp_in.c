@@ -31,6 +31,9 @@
 #include "bt_sched_tune.h"
 #include "auracast.h"
 #include "party.h"
+#include "jbl_v5.h"
+#include "tones.h"
+#include "hci_dump.h"
 
 static const char *TAG = "A2DP";
 
@@ -66,6 +69,14 @@ static QueueHandle_t s_pkt_q;
 static volatile uint32_t s_pkts, s_pkt_drops, s_seq_gaps, s_bitpool, s_bp_min = 0xff, s_bp_max;
 static volatile uint32_t s_cfg_rate = 44100;
 static volatile bool s_reset_dsp;
+/* Stale-audio flush: 500 ms after the last media packet (pause, suspend, stop
+ * or disconnect) the packet queue and the PCM ring are emptied, so a resume
+ * never starts with audio from before the pause. */
+#define FLUSH_IDLE_MS 500
+static volatile bool s_flush_req;            /* BT -> reader: drop the whole ring */
+static volatile int64_t s_last_media_us;     /* BT: last media packet, 0 = flushed */
+static volatile uint32_t s_flushes;
+static btstack_timer_source_t s_flush_timer;
 
 /* ---- DSP state (core 0) ------------------------------------------------------ */
 static btstack_sbc_decoder_bluedroid_t s_sbc_ctx;
@@ -156,6 +167,7 @@ static void dsp_task(void *arg)
         }
         if (s_reset_dsp) {
             s_reset_dsp = false;
+            s_flush_req = false;                   /* emptied here: the reader must not drop the new stream */
             rs_reset(&s_rs);
             ring_skip(&s_ring, ring_fill(&s_ring));
             s_fill_avg = (float)MS_FRAMES(TARGET_MS);
@@ -220,6 +232,7 @@ static void media_handler(uint8_t seid, uint8_t *packet, uint16_t size)
         }
     }
     s_last_arrival = now;
+    s_last_media_us = now;
     last_rtp = rtp;
     if (have_seq && (uint16_t)(seq - last_seq) != 1) {
         s_seq_gaps++;
@@ -336,6 +349,7 @@ int a2dp_in_test_phase(void)
 
 /* AVRCP absolute volume 0..127 -> gain (cubic: about -40 dB at 22 %, 0 dB at 127) */
 static volatile uint8_t s_volume = 100;
+static volatile bool s_muted;
 static float s_gain_cur = -1.0f;
 
 static float volume_gain(uint8_t v)
@@ -348,7 +362,7 @@ static float volume_gain(uint8_t v)
  * a real JBL master, so party members keep their own volume. */
 void a2dp_in_apply_volume(int16_t *pcm, int n)
 {
-    float target = volume_gain(s_volume);
+    float target = s_muted ? 0.0f : volume_gain(s_volume);
     if (s_gain_cur < 0.0f) {
         s_gain_cur = target;
     }
@@ -407,6 +421,12 @@ int a2dp_in_read(int16_t *pcm, int n)
     test_fill(pcm, n);
     return n;
 #endif
+    if (s_flush_req) {
+        s_flush_req = false;
+        ring_skip(&s_ring, ring_fill(&s_ring));
+        s_primed = false;                          /* re-prime on the next stream */
+        s_reset_deficit = true;
+    }
     if (s_reset_deficit) {
         s_reset_deficit = false;
         s_deficit = 0;
@@ -575,6 +595,7 @@ static void volume_set(uint8_t v, const char *why)
     ESP_LOGW(TAG, "volume %u/127 (%d%%, %.1f dB) <- %s", v, v * 100 / 127,
              v ? 20.0 * log10((double)volume_gain(v)) : -999.0, why);
     volume_store();
+    jbl_v5_notify(0x2D42);                    /* JBL One slider follows */
 }
 
 /* A2DP buffer + encoder pipeline (~5 SDUs) + BIG transport (~30 ms) + the
@@ -609,14 +630,139 @@ static void delay_report_soon(uint32_t ms)
 }
 
 /* The phone normally opens AVRCP itself; if it has not after 0.4 s, we do. */
-static void avrcp_connect_cb(btstack_timer_source_t *ts)
+/* Our AVRCP connect can hang with no result event at all (seen with a REDMAGIC
+ * 11 Pro): without AVRCP the phone keeps its volume to itself. Watch it: no
+ * link 4 s after the attempt -> drop the pending one and try again (3 tries). */
+#define AVRCP_TRIES      3
+#define AVRCP_WATCH_MS   4000
+static uint16_t s_avrcp_pending_cid;
+static int s_avrcp_tries;
+/* diagnosis: raw HCI packets for 5 s around our first two attempts per boot */
+#define AVRCP_DUMP_ATTEMPTS 0               /* off: the dump floods the console and stalls the BT thread */
+#define AVRCP_DUMP_MS       5000
+static int s_avrcp_dumps;
+/* Our AVRCP channel at security level 0 on odd tries: with a phone that never
+ * encrypted the link (we accept its A2DP at level 0), a level-2 channel makes
+ * BTstack authenticate and then ask for encryption, which the controller refuses
+ * (0x12) - and BTstack waits for that encryption forever (seen in an HCI trace with
+ * the REDMAGIC 11 Pro). The level is taken when AVRCP creates its channel, after
+ * its SDP query, so it stays lowered until AVRCP reports or for 2 s. */
+static btstack_timer_source_t s_level_timer;
+static bool s_level_lowered;
+
+static void avrcp_level_restore(btstack_timer_source_t *ts)
 {
     (void)ts;
-    if (s_connected && s_avrcp_cid == 0) {
-        uint16_t cid = 0;
-        uint8_t st = avrcp_connect(s_peer, &cid);
-        ESP_LOGW(TAG, "AVRCP: phone did not connect - connecting ourselves -> 0x%02x", st);
+    if (s_level_lowered) {
+        s_level_lowered = false;
+        gap_set_security_level(LEVEL_2);
     }
+}
+
+static void avrcp_level_lower(void)
+{
+    s_level_lowered = true;
+    gap_set_security_level(LEVEL_0);
+    btstack_run_loop_remove_timer(&s_level_timer);
+    btstack_run_loop_set_timer_handler(&s_level_timer, avrcp_level_restore);
+    btstack_run_loop_set_timer(&s_level_timer, 2000);
+    btstack_run_loop_add_timer(&s_level_timer);
+}
+static btstack_timer_source_t s_dump_timer;
+
+static void dump_off(btstack_timer_source_t *ts)
+{
+    (void)ts;
+    hci_dump_enable_packet_log(false);
+    ESP_LOGW(TAG, "AVRCP diagnosis: HCI packet log OFF");
+}
+
+static void dump_window(void)
+{
+    if (s_avrcp_dumps >= AVRCP_DUMP_ATTEMPTS) return;
+    s_avrcp_dumps++;
+    ESP_LOGW(TAG, "AVRCP diagnosis: HCI packet log ON for %d ms (%d/%d)", AVRCP_DUMP_MS, s_avrcp_dumps,
+             AVRCP_DUMP_ATTEMPTS);
+    hci_dump_enable_packet_log(true);
+    btstack_run_loop_remove_timer(&s_dump_timer);
+    btstack_run_loop_set_timer_handler(&s_dump_timer, dump_off);
+    btstack_run_loop_set_timer(&s_dump_timer, AVRCP_DUMP_MS);
+    btstack_run_loop_add_timer(&s_dump_timer);
+}
+
+/* The S31 must be MASTER of the phone link (our scheduler tune assumes it). A phone
+ * that connects while our own page is still running (power-up call-back) keeps the
+ * S31 as SLAVE - the controller cannot switch then ("r_olc_acl_rsw_sched sched
+ * failed") - and audio then barely gets through. Ask again once things settle. */
+#define ROLE_TRIES 4
+static btstack_timer_source_t s_role_timer;
+static int s_role_tries;
+static hci_con_handle_t s_role_con = HCI_CON_HANDLE_INVALID;
+
+static void role_retry(btstack_timer_source_t *ts)
+{
+    if (!s_connected || s_role_con == HCI_CON_HANDLE_INVALID || gap_get_role(s_role_con) == HCI_ROLE_MASTER) {
+        return;
+    }
+    if (s_role_tries >= ROLE_TRIES) {
+        ESP_LOGE(TAG, "role: still SLAVE after %d requests - phone audio may stutter", ROLE_TRIES);
+        return;
+    }
+    s_role_tries++;
+    if (hci_can_send_command_packet_now()) {          /* our policy forbids switches: allow it on this link */
+        hci_send_cmd(&hci_write_link_policy_settings, s_role_con, 0x0001);
+    }
+    uint8_t st = gap_request_role(s_peer, HCI_ROLE_MASTER);
+    ESP_LOGW(TAG, "role: S31 is SLAVE - asking for MASTER (try %d/%d) -> 0x%02x", s_role_tries, ROLE_TRIES, st);
+    btstack_run_loop_set_timer_handler(ts, role_retry);
+    btstack_run_loop_set_timer(ts, 2000);
+    btstack_run_loop_add_timer(ts);
+}
+
+static void role_check_soon(hci_con_handle_t h)
+{
+    s_role_con = h;
+    s_role_tries = 0;
+    btstack_run_loop_remove_timer(&s_role_timer);
+    btstack_run_loop_set_timer_handler(&s_role_timer, role_retry);
+    btstack_run_loop_set_timer(&s_role_timer, 1000);
+    btstack_run_loop_add_timer(&s_role_timer);
+}
+
+static void avrcp_connect_cb(btstack_timer_source_t *ts)
+{
+    if (!s_connected || s_avrcp_cid != 0) {
+        s_avrcp_tries = 0;
+        return;
+    }
+    if (s_avrcp_pending_cid != 0) {               /* the last attempt never finished */
+        ESP_LOGW(TAG, "AVRCP: attempt %d gave no result in %d ms - dropping it, the phone gets %d ms to open it",
+                 s_avrcp_tries, AVRCP_WATCH_MS, AVRCP_WATCH_MS);
+        avrcp_disconnect(s_avrcp_pending_cid);
+        s_avrcp_pending_cid = 0;
+        /* our pending request may be what keeps the phone from opening its own */
+        btstack_run_loop_set_timer_handler(ts, avrcp_connect_cb);
+        btstack_run_loop_set_timer(ts, AVRCP_WATCH_MS);
+        btstack_run_loop_add_timer(ts);
+        return;
+    }
+    if (s_avrcp_tries >= AVRCP_TRIES) {
+        ESP_LOGE(TAG, "AVRCP: no link after %d tries - phone volume will not reach the speaker", AVRCP_TRIES);
+        s_avrcp_tries = 0;
+        return;
+    }
+    uint16_t cid = 0;
+    dump_window();
+    bool open = (s_avrcp_tries % 2) == 0;          /* tries 1, 3: no security demanded; 2: level 2 */
+    if (open) avrcp_level_lower();
+    uint8_t st = avrcp_connect(s_peer, &cid);
+    s_avrcp_tries++;
+    s_avrcp_pending_cid = st == ERROR_CODE_SUCCESS ? cid : 0;
+    ESP_LOGW(TAG, "AVRCP: phone did not connect - connecting ourselves (try %d/%d, %s) -> 0x%02x", s_avrcp_tries,
+             AVRCP_TRIES, open ? "security level 0" : "security level 2", st);
+    btstack_run_loop_set_timer_handler(ts, avrcp_connect_cb);
+    btstack_run_loop_set_timer(ts, AVRCP_WATCH_MS);
+    btstack_run_loop_add_timer(ts);
 }
 
 /* ---- buttons (posted to the BT thread) ---------------------------------------- */
@@ -644,8 +790,15 @@ static void btn_run(void *ctx)
     }
     if (b & (1u << A2DP_BTN_VOL_UP | 1u << A2DP_BTN_VOL_DOWN)) {
         int v = s_volume + ((b & (1u << A2DP_BTN_VOL_UP)) ? 8 : 0) - ((b & (1u << A2DP_BTN_VOL_DOWN)) ? 8 : 0);
+        uint8_t was = s_volume;
         volume_set((uint8_t)(v < 0 ? 0 : v > 127 ? 127 : v), "button");
         if (s_avrcp_cid) avrcp_target_volume_changed(s_avrcp_cid, s_volume);   /* phone slider follows */
+        static uint32_t last_limit_ms;
+        uint32_t now_ms = btstack_run_loop_get_time_ms();
+        if ((s_volume == 127 || s_volume == 0) && (was != s_volume || now_ms - last_limit_ms > 800)) {
+            last_limit_ms = now_ms;
+            tones_play("vol_max");                /* at the end stop, as the Xtreme 5 */
+        }
     }
     if (b & (1u << A2DP_BTN_PLAY_PAUSE)) {
         if (s_avrcp_cid == 0) {
@@ -664,7 +817,63 @@ static void btn_run(void *ctx)
         btstack_run_loop_set_timer(&s_pair_timer, 180000);
         btstack_run_loop_add_timer(&s_pair_timer);
         ESP_LOGW(TAG, "pairing mode: discoverable + connectable for 3 min");
+        tones_play("bt_pair");
     }
+}
+
+/* ---- JBL One: volume / mute / transport / track info (BT thread) ---------------- */
+static uint8_t s_play_status = 0xFE;             /* AVRCP_PLAYBACK_STATUS_*, 0xFE = not reported */
+static char s_title[64], s_artist[64];
+
+void a2dp_in_set_volume(uint8_t v, const char *why)
+{
+    volume_set(v > 127 ? 127 : v, why);
+    if (s_avrcp_cid) avrcp_target_volume_changed(s_avrcp_cid, s_volume);   /* phone slider follows */
+}
+
+void a2dp_in_set_mute(bool mute)
+{
+    if (mute == s_muted) return;
+    s_muted = mute;
+    ESP_LOGW(TAG, "speaker %s", mute ? "MUTED" : "unmuted");
+    jbl_v5_notify(0x2D41);
+}
+
+bool a2dp_in_muted(void) { return s_muted; }
+
+bool a2dp_in_media_op(uint8_t op)
+{
+    if (op == 5 || op == 6) {
+        a2dp_in_button(op == 5 ? A2DP_BTN_VOL_UP : A2DP_BTN_VOL_DOWN);
+        return true;
+    }
+    if (s_avrcp_cid == 0) return false;
+    switch (op) {
+    case 0: avrcp_controller_stop(s_avrcp_cid); break;
+    case 1: avrcp_controller_pause(s_avrcp_cid); break;
+    case 2: avrcp_controller_play(s_avrcp_cid); break;
+    case 3: avrcp_controller_backward(s_avrcp_cid); break;
+    case 4: avrcp_controller_forward(s_avrcp_cid); break;
+    default: return false;
+    }
+    return true;
+}
+
+uint8_t a2dp_in_play_status(void)
+{
+    if (s_play_status != 0xFE) return s_play_status;
+    return s_streaming ? AVRCP_PLAYBACK_STATUS_PLAYING
+                       : (s_connected ? AVRCP_PLAYBACK_STATUS_PAUSED : AVRCP_PLAYBACK_STATUS_STOPPED);
+}
+
+const char *a2dp_in_track_title(void) { return s_title; }
+const char *a2dp_in_track_artist(void) { return s_artist; }
+
+static void meta_copy(char *dst, const uint8_t *v, uint8_t n)
+{
+    if (n > 63) n = 63;
+    memcpy(dst, v, n);
+    dst[n] = 0;
 }
 
 void a2dp_in_button(a2dp_btn_t btn)
@@ -737,9 +946,15 @@ static void a2dp_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet,
         }
         hci_con_handle_t h = a2dp_subevent_signaling_connection_established_get_con_handle(packet);
         hci_role_t role = gap_get_role(h);
+        tones_play("bt_cnt");
         ESP_LOGW(TAG, "A2DP connected %s, role %s", bd_addr_to_str(s_peer),
                  role == HCI_ROLE_MASTER ? "MASTER (S31 schedules the phone)" : "SLAVE");
+        if (role != HCI_ROLE_MASTER) {
+            role_check_soon(h);
+        }
         btstack_run_loop_remove_timer(&s_avrcp_timer);
+        s_avrcp_tries = 0;
+        s_avrcp_pending_cid = 0;
         btstack_run_loop_set_timer_handler(&s_avrcp_timer, avrcp_connect_cb);
         btstack_run_loop_set_timer(&s_avrcp_timer, 400);    /* the phone holds its stream until AVRCP is up: 2 s here = 2 s reconnect delay */
         btstack_run_loop_add_timer(&s_avrcp_timer);
@@ -840,7 +1055,13 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
                  hci_event_disconnection_complete_get_reason(packet));
         break;
     case HCI_EVENT_ROLE_CHANGE:
-        ESP_LOGW(TAG, "role change: now %s", hci_event_role_change_get_role(packet) == 0 ? "MASTER" : "SLAVE");
+        ESP_LOGW(TAG, "role change: now %s (status 0x%02x)", hci_event_role_change_get_role(packet) == 0 ? "MASTER" : "SLAVE",
+                 hci_event_role_change_get_status(packet));
+        if (hci_event_role_change_get_role(packet) == 0 && s_role_con != HCI_CON_HANDLE_INVALID &&
+            hci_can_send_command_packet_now()) {
+            hci_send_cmd(&hci_write_link_policy_settings, s_role_con, 0x0000);   /* no switches again */
+            s_role_con = HCI_CON_HANDLE_INVALID;
+        }
         break;
     default:
         break;
@@ -857,10 +1078,14 @@ static void avrcp_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet
     switch (packet[2]) {
     case AVRCP_SUBEVENT_CONNECTION_ESTABLISHED: {
         uint8_t st = avrcp_subevent_connection_established_get_status(packet);
+        s_avrcp_pending_cid = 0;
+        avrcp_level_restore(NULL);
         if (st != ERROR_CODE_SUCCESS) {
             ESP_LOGW(TAG, "AVRCP connect failed 0x%02x", st);
             break;
         }
+        s_avrcp_tries = 0;
+        btstack_run_loop_remove_timer(&s_avrcp_timer);
         if (s_avrcp_cid == avrcp_subevent_connection_established_get_avrcp_cid(packet)) {
             break;                                       /* same event via the CT/TG handlers */
         }
@@ -871,14 +1096,50 @@ static void avrcp_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet
         avrcp_target_support_event(s_avrcp_cid, AVRCP_NOTIFICATION_EVENT_VOLUME_CHANGED);
         avrcp_target_volume_changed(s_avrcp_cid, s_volume);
         ESP_LOGW(TAG, "AVRCP connected (cid 0x%02x), absolute volume %u/127", s_avrcp_cid, s_volume);
+        /* play state + track changes for JBL One's player */
+        avrcp_controller_enable_notification(s_avrcp_cid, AVRCP_NOTIFICATION_EVENT_PLAYBACK_STATUS_CHANGED);
+        avrcp_controller_enable_notification(s_avrcp_cid, AVRCP_NOTIFICATION_EVENT_TRACK_CHANGED);
         break;
     }
     case AVRCP_SUBEVENT_CONNECTION_RELEASED:
         if (s_avrcp_cid != 0) ESP_LOGW(TAG, "AVRCP disconnected");
         s_avrcp_cid = 0;
+        s_play_status = 0xFE;
+        s_title[0] = s_artist[0] = 0;
+        break;
+    case AVRCP_SUBEVENT_NOTIFICATION_PLAYBACK_STATUS_CHANGED: {
+        uint8_t ps = avrcp_subevent_notification_playback_status_changed_get_play_status(packet);
+        if (ps != s_play_status) {
+            s_play_status = ps;
+            ESP_LOGI(TAG, "phone playback status %u", ps);
+            jbl_v5_notify(0x2D40);
+        }
+        break;
+    }
+    case AVRCP_SUBEVENT_NOTIFICATION_TRACK_CHANGED:
+        if (s_avrcp_cid) avrcp_controller_get_now_playing_info(s_avrcp_cid);
+        break;
+    case AVRCP_SUBEVENT_NOW_PLAYING_TITLE_INFO:
+        meta_copy(s_title, avrcp_subevent_now_playing_title_info_get_value(packet),
+                  avrcp_subevent_now_playing_title_info_get_value_len(packet));
+        break;
+    case AVRCP_SUBEVENT_NOW_PLAYING_ARTIST_INFO:
+        meta_copy(s_artist, avrcp_subevent_now_playing_artist_info_get_value(packet),
+                  avrcp_subevent_now_playing_artist_info_get_value_len(packet));
+        break;
+    case AVRCP_SUBEVENT_NOW_PLAYING_INFO_DONE:
+        ESP_LOGI(TAG, "now playing: '%s' - '%s'", s_title, s_artist);
+        jbl_v5_notify(0x2D43);
+        jbl_v5_notify(0x2D44);
         break;
     case AVRCP_SUBEVENT_NOTIFICATION_VOLUME_CHANGED:      /* target: the phone set absolute volume */
+    {
+        uint8_t was = s_volume;
         volume_set(avrcp_subevent_notification_volume_changed_get_absolute_volume(packet) & 0x7f, "phone");
+        if ((s_volume == 127 || s_volume == 0) && was != s_volume) {
+            tones_play("vol_max");                /* phone slider reached max / min */
+        }
+    }
         break;
     case AVRCP_SUBEVENT_OPERATION: {                     /* target: volume keys (no absolute volume) */
         if (avrcp_subevent_operation_get_button_pressed(packet) == 0) break;
@@ -887,8 +1148,12 @@ static void avrcp_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet
         if (op == AVRCP_OPERATION_ID_VOLUME_UP) v += 8;
         else if (op == AVRCP_OPERATION_ID_VOLUME_DOWN) v -= 8;
         else break;
+        uint8_t was = s_volume;
         volume_set((uint8_t)(v < 0 ? 0 : v > 127 ? 127 : v), "volume key");
         if (s_avrcp_cid) avrcp_target_volume_changed(s_avrcp_cid, s_volume);
+        if ((s_volume == 127 || s_volume == 0) && (was != s_volume || v > 127 || v < 0)) {
+            tones_play("vol_max");
+        }
         break;
     }
     default:
@@ -896,8 +1161,30 @@ static void avrcp_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet
     }
 }
 
+static void flush_check(btstack_timer_source_t *ts)
+{
+    int64_t last = s_last_media_us;
+    if (last != 0 && esp_timer_get_time() - last > (int64_t)FLUSH_IDLE_MS * 1000) {
+        s_last_media_us = 0;
+        uint32_t fill_ms = ring_fill(&s_ring) / (OUT_RATE / 1000);
+        xQueueReset(s_pkt_q);                      /* undecoded packets */
+        s_reset_dsp = true;                        /* SBC + resampler fresh for the next packet */
+        s_flush_req = true;                        /* the reader empties the PCM ring */
+        s_last_arrival = 0;
+        s_flushes++;
+        ESP_LOGW(TAG, "no audio for %d ms (%s): buffers cleared (%lu ms of PCM dropped)", FLUSH_IDLE_MS,
+                 !s_connected ? "disconnected" : s_streaming ? "phone stopped sending" : "stopped",
+                 (unsigned long)fill_ms);
+    }
+    btstack_run_loop_set_timer(ts, 100);
+    btstack_run_loop_add_timer(ts);
+}
+
 void a2dp_in_setup(void)
 {
+    btstack_run_loop_set_timer_handler(&s_flush_timer, &flush_check);
+    btstack_run_loop_set_timer(&s_flush_timer, 100);
+    btstack_run_loop_add_timer(&s_flush_timer);
     {   /* last volume */
         nvs_handle_t h;
         uint8_t v;

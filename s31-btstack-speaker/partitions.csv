@@ -2,3 +2,7 @@
 nvs,      data, nvs,     0x9000,  0x6000
 phy_init, data, phy,     0xf000,  0x1000
 factory,  app,  factory, 0x10000, 4M
+# JBL One OTA capture: header sector + the image the app sends (read back with esptool)
+jblota,   data, undefined, 0x410000, 4M
+# prompt tones (tools/tones_pack.py, written from local files only)
+tones,    data, undefined, 0x810000, 2M

@@ -1,4 +1,7 @@
 #pragma once
+#include <stdint.h>
+/* diagnosis: log short ACL packets (<= 72 B) both ways for ms milliseconds */
+void hci_transport_s31_acl_dump(uint32_t ms);
 #include "hci_transport.h"
 #ifdef __cplusplus
 extern "C" {

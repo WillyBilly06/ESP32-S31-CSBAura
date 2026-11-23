@@ -23,6 +23,8 @@
  */
 #include "link_tune.h"
 #include "a2dp_in.h"
+#include "auracast.h"
+#include "hci_transport_s31_vhci.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -35,9 +37,14 @@ static const char *TAG = "LINK";
 /* Tpoll 24 slots = 15 ms: room for ~67 3-DH5 exchanges/s (A2DP needs ~50).
  * Each exchange reserves 3.56 ms as master (re/controller_sched.md s7), so
  * 10 slots reserved ~57 % of the air and overlapped ~6 BIS subevents each. */
-#ifndef POLL_SLOTS
-#define POLL_SLOTS          32                    /* Tpoll = BIG interval (20 ms): exchanges settle into the BIG gap */
-#endif
+/* The phone can send one packet per poll. At 32 slots (20 ms = 50 polls/s) a phone
+ * needing 43 (8-frame packets) has no room for retries - the iPhone's 3-DH5
+ * retries then pile up into flushed packets - and one sending 5-frame packets
+ * (69/s, Galaxy S26 at a 663 B MTU) can't keep up at all. So: poll fast while no
+ * BIG needs the air, and leave the BIG its share while hosting. */
+#define POLL_SLOTS_IDLE     12                    /* 7.5 ms: 133 polls/s - any phone, any packet size */
+#define POLL_SLOTS_HOSTING  24                    /* 15 ms: 67 polls/s - 43 needed + retries, BIG keeps its gap */
+#define POLL_CHECK_MS       500
 #define LE_UPDATE_DELAY_MS  6000
 #define LE_ITVL_MIN         48                    /* 60 ms in 1.25 ms */
 #define LE_ITVL_MAX         60                    /* 75 ms */
@@ -49,6 +56,30 @@ static hci_con_handle_t s_acl = HCI_CON_HANDLE_INVALID;
 static hci_con_handle_t s_le = HCI_CON_HANDLE_INVALID;
 static btstack_timer_source_t s_le_timer;
 static uint16_t s_pkt_types;
+static uint16_t s_poll_applied;
+static btstack_timer_source_t s_poll_timer;
+
+static uint16_t poll_wanted(void)
+{
+    return auracast_state() == AURACAST_STATE_OFF ? POLL_SLOTS_IDLE : POLL_SLOTS_HOSTING;
+}
+
+static void poll_apply(const char *why)
+{
+    uint16_t want = poll_wanted();
+    if (s_acl == HCI_CON_HANDLE_INVALID || want == s_poll_applied) return;
+    gap_qos_set(s_acl, HCI_SERVICE_TYPE_GUARANTEED, 48000 /* B/s */, 0, (uint32_t)want * 625u, 0xFFFFFFFFu);
+    s_poll_applied = want;
+    ESP_LOGW(TAG, "ACL 0x%04x: poll every %u slots (%.1f ms, %u polls/s) - %s", s_acl, want, want * 0.625,
+             (unsigned)(1600u / want), why);
+}
+
+static void poll_tick(btstack_timer_source_t *ts)
+{
+    poll_apply(auracast_state() == AURACAST_STATE_OFF ? "no broadcast" : "broadcasting");
+    btstack_run_loop_set_timer(ts, POLL_CHECK_MS);
+    btstack_run_loop_add_timer(ts);
+}
 
 static const char *pkt_types_str(uint16_t t, char *buf, size_t n)
 {
@@ -104,10 +135,11 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
         s_acl = hci_event_connection_complete_get_connection_handle(packet);
         s_pkt_types = hci_usable_acl_packet_types();
         hci_send_cmd(&hci_change_connection_packet_type, s_acl, s_pkt_types);
-        gap_qos_set(s_acl, HCI_SERVICE_TYPE_GUARANTEED, 48000 /* B/s */, 0, POLL_SLOTS * 625, 0xFFFFFFFFu);
+        s_poll_applied = 0;
+        poll_apply("phone connected");
         gap_discoverable_control(0);
-        ESP_LOGW(TAG, "ACL 0x%04x: packet types 0x%04x (%s), QoS poll %u slots, inquiry scan off",
-                 s_acl, s_pkt_types, pkt_types_str(s_pkt_types, buf, sizeof(buf)), POLL_SLOTS);
+        ESP_LOGW(TAG, "ACL 0x%04x: packet types 0x%04x (%s), inquiry scan off",
+                 s_acl, s_pkt_types, pkt_types_str(s_pkt_types, buf, sizeof(buf)));
         break;
     case HCI_EVENT_READ_REMOTE_SUPPORTED_FEATURES_COMPLETE:
         if (size >= 13 && packet[2] == 0) {
@@ -136,6 +168,7 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
         hci_con_handle_t h = hci_event_disconnection_complete_get_connection_handle(packet);
         if (h == s_acl) {
             s_acl = HCI_CON_HANDLE_INVALID;
+            s_poll_applied = 0;
             gap_discoverable_control(!S31_QUIET_RADIO_TEST);
             ESP_LOGW(TAG, "ACL gone: inquiry scan back on");
         }
@@ -181,4 +214,7 @@ void link_tune_setup(void)
 {
     s_reg.callback = &hci_handler;
     hci_add_event_handler(&s_reg);
+    btstack_run_loop_set_timer_handler(&s_poll_timer, &poll_tick);
+    btstack_run_loop_set_timer(&s_poll_timer, POLL_CHECK_MS);
+    btstack_run_loop_add_timer(&s_poll_timer);
 }

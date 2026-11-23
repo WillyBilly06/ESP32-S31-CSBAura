@@ -15,8 +15,8 @@
  *           b15 colorID, b14 srcName1Crc, b12 btMacAddressCrc, b10 battery,
  *           b9 deviceMiscInfo, b8 partyMethodInfo, b7 partyInfo, b6 stereoGroupId
  *     colorID 00 | [srcName1Crc] | btMacAddressCrc = CRC-16/ARC of OUR Classic MAC
- *     battery 0x50 (80 %) | misc 0x1080 (LED | BR/EDR; connectable bit 15 CLEAR -
- *     with it set JBL One takes an LE-only path and never opens the device)
+ *     battery 0x50 (80 %) | misc 0x9080 (connectable | LED | BR/EDR; b15 SET: iOS JBL One needs it -
+ *     without it the iOS app never talks to us; the old Bluedroid build cleared it for Android)
  *     partyMethod 0xC0 (Auracast | long-lasting stereo) | partyInfo | stereoGroupId 00
  *   scan rsp  Complete Local Name "S31 JBL Xtreme 5"
  * A peer that connects stops the set (legacy connectable); it is re-armed when
@@ -33,6 +33,7 @@
 
 #include "jbl.h"
 #include "jbl_beacon.h"
+#include "jbl_v5.h"
 
 static const char *TAG = "JBL_BEACON";
 
@@ -40,7 +41,10 @@ static const char *TAG = "JBL_BEACON";
 #define JBL_ADV_MASK      0x97C0
 #define JBL_MASK_SRCNAME  (1u << 14)
 #define JBL_BATTERY       0x50
-#define JBL_MISC_INFO     0x1080
+/* misc: b15 connectable (over LE), b12 LED, b7 BR/EDR. Experiment for iOS JBL One,
+ * which can only reach a speaker over LE: b15 SET (the Android app ignores it for
+ * portables, where it uses BR/EDR GATT). 0x1080 = the old value with b15 clear. */
+#define JBL_MISC_INFO     0x9080
 #define JBL_PARTY_METHOD  0xC0
 
 #define BEACON_SID           1
@@ -84,6 +88,7 @@ static uint8_t s_rsp_len;
 static btstack_packet_callback_registration_t s_hci_reg;
 
 static uint32_t s_data_updates, s_interval_changes, s_rearms, s_peer_cons, s_scanners_seen;
+static bool s_app_connected;                       /* misc b6: JBL One link up */
 
 /* Service Data AD for the current state; returns its length (<= 31). */
 static uint8_t build_adv(uint8_t *adv)
@@ -99,7 +104,8 @@ static uint8_t build_adv(uint8_t *adv)
     }
     p[i++] = s_mac_crc & 0xFF;        p[i++] = s_mac_crc >> 8;          /* MAC CRC */
     p[i++] = JBL_BATTERY;
-    p[i++] = JBL_MISC_INFO & 0xFF;    p[i++] = JBL_MISC_INFO >> 8;
+    uint16_t misc = JBL_MISC_INFO | (s_app_connected ? 0x0040 : 0);
+    p[i++] = misc & 0xFF;             p[i++] = misc >> 8;
     p[i++] = JBL_PARTY_METHOD;
     p[i++] = s_st.party_info & 0xFF;  p[i++] = s_st.party_info >> 8;
     p[i++] = 0x00;                                                     /* stereoGroupId */
@@ -108,6 +114,27 @@ static uint8_t build_adv(uint8_t *adv)
     adv[2] = 0xDF;
     adv[3] = 0xFD;
     return (uint8_t)(4 + i);
+}
+
+/* scan rsp: Complete Local Name = the speaker name (JBL One rename, persisted) */
+static void build_rsp(void)
+{
+    const char *nm = jbl_device_name();
+    size_t nl = strlen(nm);
+    if (nl > sizeof(s_rsp) - 2) nl = sizeof(s_rsp) - 2;
+    s_rsp_len = (uint8_t)(2 + nl);
+    s_rsp[0] = (uint8_t)(nl + 1);                      /* len incl. type byte */
+    s_rsp[1] = BLUETOOTH_DATA_TYPE_COMPLETE_LOCAL_NAME;
+    memcpy(s_rsp + 2, nm, nl);
+}
+
+void jbl_beacon_name_changed(void)
+{
+    build_rsp();
+    if (s_installed) {
+        gap_extended_advertising_set_scan_response_data(s_handle, s_rsp_len, s_rsp);
+        ESP_LOGW(TAG, "beacon name now '%.*s'", s_rsp_len - 2, (const char *)s_rsp + 2);
+    }
 }
 
 static uint16_t interval_units(bool streaming)
@@ -159,6 +186,16 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
             }
             break;
         case GAP_SUBEVENT_LE_CONNECTION_COMPLETE:
+            if (gap_subevent_le_connection_complete_get_status(packet) != ERROR_CODE_SUCCESS) {
+                ESP_LOGW(TAG, ">>> LE connection attempt FAILED, status 0x%02x (adv handle %u)",
+                         gap_subevent_le_connection_complete_get_status(packet),
+                         gap_subevent_le_connection_complete_get_advertising_handle(packet));
+            } else {
+                bd_addr_t pa;
+                gap_subevent_le_connection_complete_get_peer_address(packet, pa);
+                ESP_LOGW(TAG, ">>> LE connection from %s (adv handle %u, ours %u)", bd_addr_to_str(pa),
+                         gap_subevent_le_connection_complete_get_advertising_handle(packet), s_handle);
+            }
             if (gap_subevent_le_connection_complete_get_status(packet) == ERROR_CODE_SUCCESS &&
                 gap_subevent_le_connection_complete_get_advertising_handle(packet) == s_handle) {
                 bd_addr_t a;
@@ -255,10 +292,7 @@ void jbl_beacon_start(uint16_t mac_crc, const jbl_beacon_state_t *st)
         return;
     }
     s_adv_len = build_adv(s_adv);
-    s_rsp_len = (uint8_t)(2 + sizeof(JBL_DEVICE_NAME) - 1);
-    s_rsp[0] = (uint8_t)sizeof(JBL_DEVICE_NAME);       /* len incl. type byte */
-    s_rsp[1] = BLUETOOTH_DATA_TYPE_COMPLETE_LOCAL_NAME;
-    memcpy(s_rsp + 2, JBL_DEVICE_NAME, sizeof(JBL_DEVICE_NAME) - 1);
+    build_rsp();
 
     s_params.primary_advertising_interval_min = interval_units(s_st.streaming);
     s_params.primary_advertising_interval_max = interval_units(s_st.streaming);
@@ -274,6 +308,17 @@ void jbl_beacon_start(uint16_t mac_crc, const jbl_beacon_state_t *st)
     gap_extended_advertising_set_scan_response_data(s_handle, s_rsp_len, s_rsp);
     gap_extended_advertising_start(s_handle, 0, 0);
     log_payload();
+}
+
+void jbl_beacon_set_app_connected(bool on)
+{
+    if (on == s_app_connected) return;
+    s_app_connected = on;
+    if (s_started) {
+        jbl_beacon_state_t st = s_st;
+        s_adv_len = 0;                             /* force the data update */
+        jbl_beacon_update(&st);
+    }
 }
 
 void jbl_beacon_update(const jbl_beacon_state_t *st)

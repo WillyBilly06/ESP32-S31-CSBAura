@@ -35,6 +35,12 @@ void jbl_beacon_pause(bool pause);
 
 void jbl_beacon_log_stats(void);
 
+/* BT thread: the speaker was renamed - new scan response (LE name) at once. */
+void jbl_beacon_name_changed(void);
+
+/* BT thread: JBL One control link up / down - misc b6 "JBL app connected". */
+void jbl_beacon_set_app_connected(bool on);
+
 #ifdef __cplusplus
 }
 #endif

@@ -37,6 +37,8 @@
 #include "lc3.h"
 
 #include "a2dp_in.h"
+#include "jbl_v5.h"
+#include "tones.h"
 #include "audio_out.h"
 #include "auracast.h"
 #include "jbl.h"
@@ -88,6 +90,20 @@ static bd_addr_t s_cand_addr;
 static bd_addr_type_t s_cand_type;
 static uint8_t s_cand_sid;
 static char s_cand_name[33];
+
+/* ---- JBL One assistant (Join Nearby Broadcast) ---- */
+#define ASSIST_SEEN_MAX   16
+#define ASSIST_JOIN_MS    9000             /* the app waits 6 s for the result; we keep trying a bit longer */
+static struct {
+    bool scanning, started_scan;
+    uint32_t scan_until;
+    bd_addr_t seen[ASSIST_SEEN_MAX];
+    uint8_t nseen;
+    bool target, joined, reported;
+    bd_addr_t addr;
+    uint8_t type;
+    uint32_t t0;
+} s_as;
 static hci_con_handle_t s_pa_handle = HCI_CON_HANDLE_INVALID;
 static bool s_pa_pending, s_big_active, s_big_pending;
 static le_audio_big_sync_t s_big;
@@ -148,6 +164,7 @@ static void set_role(role_t r, const char *why)
         ESP_LOGW(TAG, "role %s -> %s (%s)", role_names[s_role], role_names[r], why);
         s_role = r;
         s_role_ms = now_ms();
+        jbl_v5_on_party_changed();                /* JBL One: role, Auracast on/off */
     }
 }
 
@@ -212,6 +229,7 @@ static void pa_master_volume(const uint8_t *d, uint16_t n)
             if (v != s_master_vol) {
                 s_master_vol = v;
                 st_master_vol_updates++;
+                jbl_v5_notify(0x2D42);
                 ESP_LOGW(TAG, "master volume %d/100 -> our output %u/127 (offset %+d)", v, listen_volume(),
                          s_listen_offset);
             }
@@ -229,7 +247,22 @@ bool party_listen_volume_step(int delta)
     s_listen_offset = v - master_base();
     ESP_LOGW(TAG, "LISTEN volume %d/127 <- button (master %d/100, our offset %+d)", v, s_master_vol,
              s_listen_offset);
+    jbl_v5_notify(0x2D42);
     return true;
+}
+
+int party_listen_volume(void)
+{
+    return party_listening() ? (int)listen_volume() : -1;
+}
+
+void party_listen_volume_set(uint8_t v)
+{
+    if (!party_listening()) return;
+    s_listen_offset = (int)(v > 127 ? 127 : v) - master_base();
+    ESP_LOGW(TAG, "LISTEN volume %u/127 <- JBL One (master %d/100, our offset %+d)", listen_volume(),
+             s_master_vol, s_listen_offset);
+    jbl_v5_notify(0x2D42);
 }
 
 static void listen_gain(int16_t *lr, int fs)
@@ -603,6 +636,11 @@ static void try_big_sync(void)
     }
     if (s_biginfo_enc) {
         ESP_LOGW(TAG, "'%s' is encrypted - skipping it", s_cand_name);
+        if (s_as.target && !s_as.reported) {
+            s_as.reported = true;
+            s_as.target = false;
+            jbl_v5_assist_result(1, s_as.addr, s_as.type, 4);   /* broadcast code needed */
+        }
         blacklist(s_cand_addr, 60000);
         listen_reset("encrypted broadcast");
         return;
@@ -626,8 +664,13 @@ static void try_big_sync(void)
     set_ls(L_BIG_SYNC, "BASE + BIGInfo");
 }
 
+static void assist_report(const uint8_t *packet);
+
 static void on_ext_adv(const uint8_t *packet)
 {
+    if (s_as.scanning) {
+        assist_report(packet);
+    }
     if (s_ls != L_SCAN) {
         return;
     }
@@ -655,14 +698,19 @@ static void on_ext_adv(const uint8_t *packet)
             if (strstr(name, "JBL")) jbl_name = true;
         }
     }
-    if (!baa || !(harman || bid == JBL_BROADCAST_ID || jbl_name)) {
-        return;                                        /* not a JBL party master */
-    }
     bd_addr_t a;
     gap_event_extended_advertising_report_get_address(packet, a);
-    if (blacklisted(a)) {
+    bool target = s_as.target && bd_addr_cmp(a, s_as.addr) == 0;
+    if (s_as.target && !target) {
+        return;                                        /* the app picked another broadcast */
+    }
+    if (!baa || (!target && !(harman || bid == JBL_BROADCAST_ID || jbl_name))) {
+        return;                                        /* not a JBL party master */
+    }
+    if (!target && blacklisted(a)) {
         return;
     }
+    if (name[0] == 0) strcpy(name, "Auracast broadcast");
     bd_addr_copy(s_cand_addr, a);
     s_cand_type = (bd_addr_type_t)gap_event_extended_advertising_report_get_address_type(packet);
     s_cand_sid = gap_event_extended_advertising_report_get_advertising_sid(packet);
@@ -770,6 +818,12 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
                 break;
             }
             s_big_active = true;
+            if (s_as.target && !s_as.joined) {
+                s_as.joined = true;
+                s_as.reported = true;
+                ESP_LOGW(TAG, "JBL One: joined '%s'", s_cand_name);
+                jbl_v5_assist_result(1, s_as.addr, s_as.type, 1);
+            }
             s_num_bis = gap_subevent_big_sync_created_get_num_bis(packet);
             if (s_num_bis > MAX_BIS) s_num_bis = MAX_BIS;
             for (int i = 0; i < s_num_bis; i++) {
@@ -838,9 +892,19 @@ static void listen_poll(void)
 
 static void tick(btstack_timer_source_t *ts)
 {
-    bool playing = a2dp_in_streaming();
+    bool playing = a2dp_in_streaming() && !s_as.target;   /* a JBL One join wins over the phone */
     s_idle_ms = playing ? 0 : s_idle_ms + TICK_MS;
-    if (!s_enabled && s_role != R_OFF) {              /* Auracast button: off */
+    if (s_as.scanning && (int32_t)(s_as.scan_until - now_ms()) <= 0) {
+        party_assist_scan(false, 0);
+    }
+    if (s_as.target && !s_as.joined && !s_as.reported && now_ms() - s_as.t0 > ASSIST_JOIN_MS) {
+        s_as.reported = true;
+        s_as.target = false;
+        ESP_LOGW(TAG, "JBL One: join timed out");
+        jbl_v5_assist_result(1, s_as.addr, s_as.type, 2);
+        if (party_listening()) listen_reset("join timed out");
+    }
+    if (!s_enabled && s_role != R_OFF && !s_as.target) {   /* Auracast button: off */
         if (s_role == R_LISTEN || s_role == R_LISTEN_STOPPING) {
             set_role(R_OFF, "Auracast turned off");
             listen_reset("Auracast off");
@@ -853,6 +917,12 @@ static void tick(btstack_timer_source_t *ts)
     }
     switch (s_role) {
     case R_OFF:
+        if (s_as.target) {                                /* JBL One: join a broadcast */
+            jbl_assist_set_paused(true);
+            set_role(R_LISTEN, "JBL One: join a broadcast");
+            set_ls(L_OFF, "join");
+            break;
+        }
         if (s_enabled && auracast_state() == AURACAST_STATE_OFF) {
             int rc = auracast_host_start();               /* back on: host first */
             s_idle_ms = 0;
@@ -963,12 +1033,113 @@ void party_set_auracast_enabled(bool on)
     if (on != s_enabled) {
         ESP_LOGW(TAG, "Auracast %s (button)", on ? "ON" : "OFF");
         s_enabled = on;
+        tones_play(on ? "ent_aura" : "exi_aura");
     }
 }
 
 bool party_listening(void)
 {
     return s_role == R_LISTEN || s_role == R_LISTEN_STOPPING;
+}
+
+static void assist_report(const uint8_t *packet)
+{
+    if (gap_event_extended_advertising_report_get_periodic_advertising_interval(packet) == 0) return;
+    uint8_t len = gap_event_extended_advertising_report_get_data_length(packet);
+    const uint8_t *data = gap_event_extended_advertising_report_get_data(packet);
+    bool baa = false;
+    char name[33] = { 0 };
+    ad_context_t c;
+    for (ad_iterator_init(&c, len, data); ad_iterator_has_more(&c); ad_iterator_next(&c)) {
+        uint8_t t = ad_iterator_get_data_type(&c), n = ad_iterator_get_data_len(&c);
+        const uint8_t *d = ad_iterator_get_data(&c);
+        if (t == BLUETOOTH_DATA_TYPE_SERVICE_DATA_16_BIT_UUID && n >= 5 && little_endian_read_16(d, 0) == 0x1852) {
+            baa = true;
+        } else if (t == 0x30 || ((t == BLUETOOTH_DATA_TYPE_COMPLETE_LOCAL_NAME ||
+                                  t == BLUETOOTH_DATA_TYPE_SHORTENED_LOCAL_NAME) && name[0] == 0)) {
+            uint8_t k = n < sizeof(name) - 1 ? n : sizeof(name) - 1;
+            memcpy(name, d, k);
+            name[k] = 0;
+        }
+    }
+    if (!baa) return;
+    bd_addr_t a;
+    gap_event_extended_advertising_report_get_address(packet, a);
+    for (int i = 0; i < s_as.nseen; i++) {
+        if (bd_addr_cmp(a, s_as.seen[i]) == 0) return;   /* reported already */
+    }
+    if (s_as.nseen < ASSIST_SEEN_MAX) bd_addr_copy(s_as.seen[s_as.nseen++], a);
+    if (name[0] == 0) strcpy(name, "Auracast broadcast");
+    uint8_t type = gap_event_extended_advertising_report_get_address_type(packet);
+    ESP_LOGW(TAG, "JBL One scan: broadcast '%s' %s", name, bd_addr_to_str(a));
+    jbl_v5_assist_found(a, type, 0x40, name);             /* has standard quality */
+}
+
+void party_assist_scan(bool on, uint8_t seconds)
+{
+    if (on) {
+        s_as.nseen = 0;
+        s_as.scanning = true;
+        s_as.scan_until = now_ms() + (uint32_t)(seconds < 10 ? 10 : seconds) * 1000u;
+        if (!(s_role == R_LISTEN && s_ls == L_SCAN)) {
+            gap_set_scan_params(0 /* passive */, SCAN_ITVL, SCAN_WIN, 0);
+            gap_start_scan();
+            s_as.started_scan = true;
+        }
+        ESP_LOGW(TAG, "JBL One: scanning for broadcasts (%u s)", seconds);
+        jbl_v5_assist_scan_state(true);
+        return;
+    }
+    if (!s_as.scanning) return;
+    s_as.scanning = false;
+    if (s_as.started_scan && (s_role == R_OFF || (party_listening() && s_ls != L_SCAN))) {
+        gap_stop_scan();                                  /* nobody else needs the scanner */
+    }
+    s_as.started_scan = false;
+    ESP_LOGW(TAG, "JBL One: broadcast scan ended (%u found)", s_as.nseen);
+    jbl_v5_assist_scan_state(false);
+}
+
+void party_assist_join(const uint8_t addr[6], uint8_t addr_type)
+{
+    party_assist_scan(false, 0);
+    memcpy(s_as.addr, addr, 6);
+    s_as.type = addr_type;
+    s_as.target = true;
+    s_as.joined = s_as.reported = false;
+    s_as.t0 = now_ms();
+    ESP_LOGW(TAG, "JBL One: join broadcast %s", bd_addr_to_str(s_as.addr));
+    if (party_listening()) listen_reset("JBL One: join a broadcast");
+}
+
+void party_assist_leave(void)
+{
+    if (!s_as.target) return;
+    s_as.target = s_as.joined = false;
+    ESP_LOGW(TAG, "JBL One: left the broadcast");
+    if (party_listening()) listen_reset("JBL One: left the broadcast");
+}
+
+void party_assist_get(party_assist_t *o)
+{
+    memset(o, 0, sizeof(*o));
+    o->scanning = s_as.scanning;
+    o->joining = s_as.target && !s_as.joined;
+    o->joined = s_as.target && s_as.joined;
+    memcpy(o->addr, s_as.addr, 6);
+    o->addr_type = s_as.type;
+    if (o->joined) {
+        memcpy(o->name, s_cand_name, sizeof(o->name) - 1);
+        o->name[sizeof(o->name) - 1] = 0;
+        o->encrypted = s_biginfo_enc;
+        o->kbps = s_dcfg.dt_us ? (uint16_t)((uint32_t)s_dcfg.opf * 8000u / s_dcfg.dt_us) : 0;
+    }
+}
+
+uint8_t party_v5_role(void)
+{
+    if (s_role == R_OFF || !party_auracast_enabled()) return 0;
+    return party_listening() ? 1 : 2;
 }
 
 void party_log_stats(void)

@@ -27,6 +27,19 @@ void a2dp_in_apply_volume(int16_t *pcm, int n);
 /* Any thread: current phone (AVRCP absolute) volume, 0..127. */
 uint8_t a2dp_in_volume(void);
 
+/* BT thread (JBL One): set the phone volume 0..127, the phone slider follows. */
+void a2dp_in_set_volume(uint8_t v, const char *why);
+/* BT thread: mute the local speaker (the broadcast stays full scale). */
+void a2dp_in_set_mute(bool mute);
+bool a2dp_in_muted(void);
+/* BT thread: JBL AudioOperation 0 stop, 1 pause, 2 play, 3 previous, 4 next,
+ * 5 volume up, 6 volume down. False without an AVRCP link (0-4). */
+bool a2dp_in_media_op(uint8_t op);
+/* BT thread: AVRCP playback status (AVRCP_PLAYBACK_STATUS_*) and track info. */
+uint8_t a2dp_in_play_status(void);
+const char *a2dp_in_track_title(void);
+const char *a2dp_in_track_artist(void);
+
 /* Bench test: replace the phone audio with a 20 s cycle of
  *   0-9 s   up-sweep 50 Hz -> 18 kHz made at 48 kHz (straight to the encoder)
  *   10-19 s down-sweep 18 kHz -> 50 Hz made at 44.1 kHz and sent through the

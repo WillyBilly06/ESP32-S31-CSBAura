@@ -12,6 +12,7 @@
  */
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #include "btstack.h"
@@ -35,6 +36,23 @@ void jbl_v5_link_down(hci_con_handle_t con);
 void jbl_v5_on_write(hci_con_handle_t con, const uint8_t *data, uint16_t len);
 
 void jbl_v5_log_stats(void);
+
+/* BT thread: push the current value of one feature to the JBL One app (no-op
+ * without an app link), e.g. 0x2D42 volume, 0x2D41 mute, 0x2D40 play state. */
+void jbl_v5_notify(uint16_t id);
+/* BT thread: the party role / Auracast state changed (2004, 0B86/87, 2C02/03 ...). */
+void jbl_v5_on_party_changed(void);
+/* Any thread after NVS init: the speaker name (JBL One rename, persisted). */
+const char *jbl_device_name(void);
+/* Any thread: JBL One's feedback tone switch (0x0C40 b7) - prompt tones on. */
+bool jbl_v5_feedback_tone_on(void);
+
+/* BT thread, from party.c (Auracast assistant / Join Nearby Broadcast): a
+ * broadcast seen during the app's scan, a join/leave result (status 1 ok,
+ * 2 timeout, 3 wrong code, 4 code needed) and the scan state. */
+void jbl_v5_assist_found(const bd_addr_t addr, uint8_t addr_type, uint8_t flags, const char *name);
+void jbl_v5_assist_result(uint8_t action, const bd_addr_t addr, uint8_t addr_type, uint8_t status);
+void jbl_v5_assist_scan_state(bool scanning);
 
 #ifdef __cplusplus
 }

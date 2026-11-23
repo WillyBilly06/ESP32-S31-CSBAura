@@ -23,6 +23,11 @@ extern "C" {
 /* BTstack thread only (single writer). An all-identity set turns the EQ off. */
 void v5_eq_set_q29(const uint8_t coef[V5_EQ_COEF_BYTES]);
 
+/* Any thread: one RBJ biquad at 48 kHz as the 20 B {b0,b1,b2,-a1,-a2} Q29 the
+ * coefficient path takes. type: 0 low shelf, 1 peaking, 2 high shelf, 3 low pass,
+ * 4 high pass (JBL EqInfo band types). A ~0 dB shelf/peak is an exact identity. */
+void v5_eq_design_q29(uint8_t type, float freq_hz, float gain_db, float q, uint8_t out[20]);
+
 /* Any thread: true if the last published bank is not flat. */
 bool v5_eq_is_on(void);
 

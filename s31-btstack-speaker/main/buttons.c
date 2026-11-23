@@ -13,19 +13,24 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_timer.h"
 
 #include "a2dp_in.h"
 #include "party.h"
+#include "power.h"
 
 static const char *TAG = "BTN";
 
 typedef enum { B_AURACAST, B_VOL_UP, B_VOL_DOWN, B_PAIR, B_PLAY } btn_id_t;
-static const struct { int gpio; const char *name; bool repeat; } s_btn[] = {
-    [B_AURACAST] = { 36, "Auracast", false },
-    [B_VOL_UP]   = { 38, "volume +", true },
-    [B_VOL_DOWN] = { 40, "volume -", true },
-    [B_PAIR]     = { 42, "pairing",  false },
-    [B_PLAY]     = { 44, "play/pause", false },
+/* grace: after an accepted press the same button is ignored for this long, so a
+ * burst of taps does one thing (Auracast needs ~2 s to switch roles). Volume
+ * keeps hold-to-repeat; its grace only paces fast taps. */
+static const struct { int gpio; const char *name; bool repeat; uint16_t grace_ms; } s_btn[] = {
+    [B_AURACAST] = { 36, "Auracast",   false, 2000 },
+    [B_VOL_UP]   = { 38, "volume +",   true,  150 },
+    [B_VOL_DOWN] = { 40, "volume -",   true,  150 },
+    [B_PAIR]     = { 42, "pairing",    false, 3000 },
+    [B_PLAY]     = { 44, "play/pause", false, 700 },
 };
 #define NBTN (sizeof(s_btn) / sizeof(s_btn[0]))
 #define POLL_MS     10
@@ -35,6 +40,10 @@ static const struct { int gpio; const char *name; bool repeat; } s_btn[] = {
 
 static void press(btn_id_t b)
 {
+    if (power_is_off()) {
+        power_wake();                             /* soft off: any button turns it on */
+        return;
+    }
     switch (b) {
     case B_AURACAST: party_set_auracast_enabled(!party_auracast_enabled()); break;
     case B_VOL_UP:   a2dp_in_button(A2DP_BTN_VOL_UP); break;
@@ -50,6 +59,8 @@ static void button_task(void *arg)
     uint8_t cnt[NBTN] = { 0 };
     bool down[NBTN] = { false };
     uint32_t held[NBTN] = { 0 };
+    int64_t last_ok[NBTN] = { 0 };
+    uint32_t ignored[NBTN] = { 0 };
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(POLL_MS));
         for (unsigned i = 0; i < NBTN; i++) {
@@ -60,8 +71,16 @@ static void button_task(void *arg)
                     cnt[i] = 0;
                     held[i] = 0;
                     if (pressed) {
-                        ESP_LOGW(TAG, "%s pressed (GPIO %d)", s_btn[i].name, s_btn[i].gpio);
-                        press((btn_id_t)i);
+                        int64_t now = esp_timer_get_time();
+                        if (last_ok[i] != 0 && now - last_ok[i] < (int64_t)s_btn[i].grace_ms * 1000) {
+                            ignored[i]++;
+                            ESP_LOGW(TAG, "%s pressed again within %u ms - ignored (%lu so far)", s_btn[i].name,
+                                     s_btn[i].grace_ms, (unsigned long)ignored[i]);
+                        } else {
+                            last_ok[i] = now;
+                            ESP_LOGW(TAG, "%s pressed (GPIO %d)", s_btn[i].name, s_btn[i].gpio);
+                            press((btn_id_t)i);
+                        }
                     }
                 }
             } else {
@@ -69,7 +88,8 @@ static void button_task(void *arg)
                 if (down[i] && s_btn[i].repeat) {
                     held[i]++;
                     if (held[i] >= REPEAT_WAIT && (held[i] - REPEAT_WAIT) % REPEAT_EVERY == 0) {
-                        press((btn_id_t)i);
+                        last_ok[i] = esp_timer_get_time();
+                        press((btn_id_t)i);       /* holding: steady repeat */
                     }
                 }
             }

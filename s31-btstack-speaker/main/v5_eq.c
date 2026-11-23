@@ -88,6 +88,51 @@ void v5_eq_set_q29(const uint8_t coef[V5_EQ_COEF_BYTES])
     s_published++;
 }
 
+void v5_eq_design_q29(uint8_t type, float f, float g, float q, uint8_t out[20])
+{
+    float c[5] = { 1.0f, 0.0f, 0.0f, 0.0f, 0.0f };   /* b0 b1 b2 -a1 -a2, normalized */
+    if (f < 10.0f) f = 10.0f;
+    if (f > 23000.0f) f = 23000.0f;
+    if (q < 0.1f) q = 0.1f;
+    if (g > 15.0f) g = 15.0f;
+    if (g < -15.0f) g = -15.0f;
+    bool flat = type <= 2 && fabsf(g) < 0.05f;
+    if (!flat && type <= 4) {
+        const float w0 = 2.0f * (float)M_PI * f / 48000.0f, cw = cosf(w0), al = sinf(w0) / (2.0f * q);
+        const float A = powf(10.0f, g / 40.0f), sa = 2.0f * sqrtf(A) * al;
+        float b0, b1, b2, a0, a1, a2;
+        switch (type) {
+        case 0:  /* low shelf */
+            b0 = A * ((A + 1) - (A - 1) * cw + sa); b1 = 2 * A * ((A - 1) - (A + 1) * cw);
+            b2 = A * ((A + 1) - (A - 1) * cw - sa);
+            a0 = (A + 1) + (A - 1) * cw + sa; a1 = -2 * ((A - 1) + (A + 1) * cw); a2 = (A + 1) + (A - 1) * cw - sa;
+            break;
+        case 1:  /* peaking */
+            b0 = 1 + al * A; b1 = -2 * cw; b2 = 1 - al * A; a0 = 1 + al / A; a1 = -2 * cw; a2 = 1 - al / A;
+            break;
+        case 2:  /* high shelf */
+            b0 = A * ((A + 1) + (A - 1) * cw + sa); b1 = -2 * A * ((A - 1) + (A + 1) * cw);
+            b2 = A * ((A + 1) + (A - 1) * cw - sa);
+            a0 = (A + 1) - (A - 1) * cw + sa; a1 = 2 * ((A - 1) - (A + 1) * cw); a2 = (A + 1) - (A - 1) * cw - sa;
+            break;
+        case 3:  /* low pass */
+            b0 = (1 - cw) / 2; b1 = 1 - cw; b2 = (1 - cw) / 2; a0 = 1 + al; a1 = -2 * cw; a2 = 1 - al;
+            break;
+        default: /* high pass */
+            b0 = (1 + cw) / 2; b1 = -(1 + cw); b2 = (1 + cw) / 2; a0 = 1 + al; a1 = -2 * cw; a2 = 1 - al;
+            break;
+        }
+        c[0] = b0 / a0; c[1] = b1 / a0; c[2] = b2 / a0; c[3] = -a1 / a0; c[4] = -a2 / a0;
+    }
+    for (int i = 0; i < 5; i++) {
+        float v = c[i] * 536870912.0f;               /* Q29: |coef| < 4 */
+        if (v > 2147483000.0f) v = 2147483000.0f;
+        if (v < -2147483000.0f) v = -2147483000.0f;
+        int32_t x = (int32_t)lrintf(v);
+        memcpy(out + 4 * i, &x, 4);
+    }
+}
+
 bool v5_eq_is_on(void)
 {
     return s_pub_on;

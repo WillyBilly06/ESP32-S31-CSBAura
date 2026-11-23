@@ -91,6 +91,8 @@ static int host_recv_pkt_cb(uint8_t *data, uint16_t len)
 /* controller task: received ISO data (BIS sync) does not go through VHCI; the
  * controller hands it here (idf-patches/0010) starting at the ISO handle and
  * frees it after we return. Queue it like the VHCI packets, with the H4 type. */
+static void acl_dump(const char *dir, const uint8_t *p, int n);
+
 static void iso_rx_cb(uint8_t *data, uint16_t len)
 {
     s_rx_type[5]++;
@@ -142,6 +144,7 @@ static void deliver_packets(void *context)
             little_endian_read_16(s_rx, 4) == 0x1003 && s_rx[6] == 0) {
             s_rx[7 + 4] &= (uint8_t)~0x20;     /* byte 4 bit 5 (feature bit 37) */
         }
+        if (s_rx[0] == HCI_ACL_DATA_PACKET) acl_dump("<=", &s_rx[1], (int)len - 1);
         transport_packet_handler(s_rx[0], &s_rx[1], (uint16_t)(len - 1));
         xSemaphoreTake(s_ring_mutex, portMAX_DELAY);
     }
@@ -202,8 +205,26 @@ uint32_t hci_transport_s31_iso_tx_errors(int *last)
     return s_iso_tx_err + s_iso_alloc_fail;
 }
 
+/* diagnosis: short ACL packets (signalling, ATT - not media) both ways for a while */
+static volatile int64_t s_acl_dump_until;
+
+void hci_transport_s31_acl_dump(uint32_t ms)
+{
+    s_acl_dump_until = esp_timer_get_time() + (int64_t)ms * 1000;
+}
+
+static void acl_dump(const char *dir, const uint8_t *p, int n)
+{
+    if (n > 72 || s_acl_dump_until == 0 || esp_timer_get_time() > s_acl_dump_until) return;
+    char h[3 * 72 + 1];
+    int o = 0;
+    for (int i = 0; i < n; i++) o += snprintf(h + o, sizeof(h) - (size_t)o, "%02x ", p[i]);
+    ESP_LOGW(TAG, "ACL %s %s", dir, h);
+}
+
 static int transport_send_packet(uint8_t packet_type, uint8_t *packet, int size)
 {
+    if (packet_type == HCI_ACL_DATA_PACKET) acl_dump("=>", packet, size);
     if (packet_type == HCI_ISO_DATA_PACKET) {
         /* ISO goes straight to the controller like Espressif's own ISO host
          * (esp_ble_iso iso.c): r_ble_hci_trans_hs_iso_tx(pkt starting at the
