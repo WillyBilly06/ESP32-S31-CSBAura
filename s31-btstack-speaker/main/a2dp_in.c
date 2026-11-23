@@ -12,7 +12,6 @@
  * media packet), SBC bitpool pinned at 53.
  */
 #include "a2dp_in.h"
-#include "link_tune.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -470,11 +469,9 @@ int a2dp_in_read(int16_t *pcm, int n)
             boosted = true;
             s_acl_boosts++;
             bt_sched_tune_apply_custom(9, 15, 12, 11, "A2DP cushion low: phone link boosted");
-            link_tune_poll_boost(true);
         } else if (boosted && (f > (float)MS_FRAMES(110) || !s_streaming)) {
             boosted = false;
             bt_sched_tune_apply_custom(2, 15, 12, 11, "A2DP cushion back: BIS copies first");
-            link_tune_poll_boost(false);
         }
     }
     if ((uint32_t)f < s_win_min) s_win_min = (uint32_t)f;
@@ -571,6 +568,8 @@ int a2dp_in_read(int16_t *pcm, int n)
 
 bool a2dp_in_streaming(void) { return s_streaming; }
 bool a2dp_in_connected(void) { return s_connected; }
+static hci_con_handle_t s_a2dp_con = HCI_CON_HANDLE_INVALID;
+uint16_t a2dp_in_con_handle(void) { return s_connected ? s_a2dp_con : HCI_CON_HANDLE_INVALID; }
 
 /* ---- AVRCP / delay report (BT thread) ------------------------------------------ */
 static uint16_t s_avrcp_cid;
@@ -948,6 +947,7 @@ static void a2dp_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet,
             }
         }
         hci_con_handle_t h = a2dp_subevent_signaling_connection_established_get_con_handle(packet);
+        s_a2dp_con = h;
         hci_role_t role = gap_get_role(h);
         tones_play("bt_cnt");
         ESP_LOGW(TAG, "A2DP connected %s, role %s", bd_addr_to_str(s_peer),
@@ -1003,6 +1003,7 @@ static void a2dp_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet,
     case A2DP_SUBEVENT_SIGNALING_CONNECTION_RELEASED:
         s_streaming = false;
         s_connected = false;
+        s_a2dp_con = HCI_CON_HANDLE_INVALID;
         bt_sched_tune_streaming(false);
         gap_connectable_control(!S31_QUIET_RADIO_TEST);
         ESP_LOGW(TAG, "A2DP disconnected");

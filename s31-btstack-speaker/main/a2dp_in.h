@@ -10,6 +10,8 @@ void a2dp_in_on_hci_working(void);      /* BT thread: HCI up (reconnect to last 
 
 bool a2dp_in_streaming(void);
 bool a2dp_in_connected(void);
+/* BT thread: ACL of the phone with the A2DP link, HCI_CON_HANDLE_INVALID if none */
+uint16_t a2dp_in_con_handle(void);
 
 /* Encoder side (core 0): pop n 48 kHz stereo frames; returns frames copied,
  * the rest is zero-filled (underrun). */

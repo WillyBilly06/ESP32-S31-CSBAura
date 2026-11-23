@@ -24,7 +24,6 @@
 #include "link_tune.h"
 #include "a2dp_in.h"
 #include "auracast.h"
-#include "esp_timer.h"
 #include "hci_transport_s31_vhci.h"
 
 #include <stdio.h>
@@ -45,7 +44,9 @@ static const char *TAG = "LINK";
  * BIG needs the air, and leave the BIG its share while hosting. */
 #define POLL_SLOTS_IDLE     12                    /* 7.5 ms: 133 polls/s - any phone, any packet size */
 #define POLL_SLOTS_HOSTING  24                    /* 15 ms: 67 polls/s - 43 needed + retries, BIG keeps its gap */
-#define POLL_CHECK_MS       100
+#define POLL_SLOTS_OTHER    80                    /* 50 ms: a second phone (JBL One only, or not playing) */
+#define POLL_CHECK_MS       500
+#define MAX_ACL             3
 #define LE_UPDATE_DELAY_MS  6000
 #define LE_ITVL_MIN         48                    /* 60 ms in 1.25 ms */
 #define LE_ITVL_MAX         60                    /* 75 ms */
@@ -53,42 +54,54 @@ static const char *TAG = "LINK";
 #define LE_TIMEOUT          500                   /* 5 s in 10 ms */
 
 static btstack_packet_callback_registration_t s_reg;
-static hci_con_handle_t s_acl = HCI_CON_HANDLE_INVALID;
+/* Every BR/EDR link is tuned on its own: the phone with A2DP gets the audio poll,
+ * any other connected phone a slow best-effort one. With two phones up (one
+ * playing, the other only running JBL One) the idle iPhone had asked for an
+ * 8.75 ms poll and the controller granted it - more air than the phone that was
+ * playing, which then lost packet after packet. */
+static struct {
+    hci_con_handle_t h;
+    uint16_t applied;                             /* poll slots set, 0 = redo */
+} s_links[MAX_ACL];
+static hci_con_handle_t s_acl = HCI_CON_HANDLE_INVALID;   /* newest link */
 static hci_con_handle_t s_le = HCI_CON_HANDLE_INVALID;
 static btstack_timer_source_t s_le_timer;
 static uint16_t s_pkt_types;
-static uint16_t s_poll_applied;
 static btstack_timer_source_t s_poll_timer;
 
-static volatile bool s_poll_boost;                /* A2DP cushion low */
-static volatile int64_t s_boost_until_us;         /* fast poll held 3 s after it refilled: no flapping */
-
-void link_tune_poll_boost(bool on)
+static int link_count(void)
 {
-    if (!on && s_poll_boost) s_boost_until_us = esp_timer_get_time() + 3000000;
-    s_poll_boost = on;
+    int n = 0;
+    for (int i = 0; i < MAX_ACL; i++) n += s_links[i].h != HCI_CON_HANDLE_INVALID;
+    return n;
 }
 
-static uint16_t poll_wanted(void)
+static uint16_t poll_wanted(hci_con_handle_t h)
 {
-    bool boost = s_poll_boost || esp_timer_get_time() < s_boost_until_us;
-    return (auracast_state() == AURACAST_STATE_OFF || boost) ? POLL_SLOTS_IDLE : POLL_SLOTS_HOSTING;
+    hci_con_handle_t audio = a2dp_in_con_handle();
+    if (link_count() > 1 && audio != HCI_CON_HANDLE_INVALID && h != audio) return POLL_SLOTS_OTHER;
+    return auracast_state() == AURACAST_STATE_OFF ? POLL_SLOTS_IDLE : POLL_SLOTS_HOSTING;
 }
 
 static void poll_apply(const char *why)
 {
-    uint16_t want = poll_wanted();
-    if (s_acl == HCI_CON_HANDLE_INVALID || want == s_poll_applied) return;
-    gap_qos_set(s_acl, HCI_SERVICE_TYPE_GUARANTEED, 48000 /* B/s */, 0, (uint32_t)want * 625u, 0xFFFFFFFFu);
-    s_poll_applied = want;
-    ESP_LOGW(TAG, "ACL 0x%04x: poll every %u slots (%.1f ms, %u polls/s) - %s", s_acl, want, want * 0.625,
-             (unsigned)(1600u / want), why);
+    for (int i = 0; i < MAX_ACL; i++) {
+        hci_con_handle_t h = s_links[i].h;
+        if (h == HCI_CON_HANDLE_INVALID) continue;
+        uint16_t want = poll_wanted(h);
+        if (want == s_links[i].applied) continue;
+        bool other = want == POLL_SLOTS_OTHER;
+        gap_qos_set(h, other ? HCI_SERVICE_TYPE_BEST_EFFORT : HCI_SERVICE_TYPE_GUARANTEED,
+                    other ? 4000 : 48000 /* B/s */, 0, (uint32_t)want * 625u, 0xFFFFFFFFu);
+        s_links[i].applied = want;
+        ESP_LOGW(TAG, "ACL 0x%04x: poll every %u slots (%.1f ms, %u polls/s) - %s", h, want, want * 0.625,
+                 (unsigned)(1600u / want), other ? "second phone, not the A2DP one" : why);
+    }
 }
 
 static void poll_tick(btstack_timer_source_t *ts)
 {
-    poll_apply(auracast_state() == AURACAST_STATE_OFF ? "no broadcast"
-               : poll_wanted() == POLL_SLOTS_IDLE ? "A2DP cushion low" : "broadcasting");
+    poll_apply(auracast_state() == AURACAST_STATE_OFF ? "no broadcast" : "broadcasting");
     btstack_run_loop_set_timer(ts, POLL_CHECK_MS);
     btstack_run_loop_add_timer(ts);
 }
@@ -145,9 +158,15 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
             break;
         }
         s_acl = hci_event_connection_complete_get_connection_handle(packet);
+        for (int i = 0; i < MAX_ACL; i++) {
+            if (s_links[i].h == HCI_CON_HANDLE_INVALID || s_links[i].h == s_acl) {
+                s_links[i].h = s_acl;
+                s_links[i].applied = 0;
+                break;
+            }
+        }
         s_pkt_types = hci_usable_acl_packet_types();
         hci_send_cmd(&hci_change_connection_packet_type, s_acl, s_pkt_types);
-        s_poll_applied = 0;
         poll_apply("phone connected");
         gap_discoverable_control(0);
         ESP_LOGW(TAG, "ACL 0x%04x: packet types 0x%04x (%s), inquiry scan off",
@@ -171,18 +190,34 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
         break;
     case HCI_EVENT_QOS_SETUP_COMPLETE:
         if (size >= 21) {
+            hci_con_handle_t qh = little_endian_read_16(packet, 3);
+            uint32_t lat = little_endian_read_32(packet, 15);
             ESP_LOGW(TAG, "ACL 0x%04x QoS setup status 0x%02x: service %u, token %lu B/s, latency %lu us",
-                     little_endian_read_16(packet, 3), packet[2], packet[6],
-                     (unsigned long)little_endian_read_32(packet, 7), (unsigned long)little_endian_read_32(packet, 15));
+                     qh, packet[2], packet[6], (unsigned long)little_endian_read_32(packet, 7), (unsigned long)lat);
+            for (int i = 0; i < MAX_ACL; i++) {
+                if (s_links[i].h == qh && s_links[i].applied == POLL_SLOTS_OTHER &&
+                    lat < (uint32_t)POLL_SLOTS_OTHER * 625u) {
+                    s_links[i].applied = 0;           /* the idle phone asked for a fast poll: slow again next tick */
+                }
+            }
         }
         break;
     case HCI_EVENT_DISCONNECTION_COMPLETE: {
         hci_con_handle_t h = hci_event_disconnection_complete_get_connection_handle(packet);
-        if (h == s_acl) {
-            s_acl = HCI_CON_HANDLE_INVALID;
-            s_poll_applied = 0;
-            gap_discoverable_control(!S31_QUIET_RADIO_TEST);
-            ESP_LOGW(TAG, "ACL gone: inquiry scan back on");
+        bool was_acl = false;
+        for (int i = 0; i < MAX_ACL; i++) {
+            if (s_links[i].h == h) {
+                s_links[i].h = HCI_CON_HANDLE_INVALID;
+                was_acl = true;
+            }
+        }
+        if (was_acl) {
+            for (int i = 0; i < MAX_ACL; i++) s_links[i].applied = 0;   /* the other phone may be the audio one now */
+            if (link_count() == 0) {
+                s_acl = HCI_CON_HANDLE_INVALID;
+                gap_discoverable_control(!S31_QUIET_RADIO_TEST);
+                ESP_LOGW(TAG, "ACL gone: inquiry scan back on");
+            }
         }
         if (h == s_le) {
             s_le = HCI_CON_HANDLE_INVALID;
@@ -224,6 +259,7 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
 
 void link_tune_setup(void)
 {
+    for (int i = 0; i < MAX_ACL; i++) s_links[i].h = HCI_CON_HANDLE_INVALID;
     s_reg.callback = &hci_handler;
     hci_add_event_handler(&s_reg);
     btstack_run_loop_set_timer_handler(&s_poll_timer, &poll_tick);
