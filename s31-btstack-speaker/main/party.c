@@ -203,8 +203,12 @@ static uint32_t s_host_retry_ms, s_host_retry_gap = 2000;   /* backs off 2 s .. 
 
 bool party_host_failed(void) { return s_host_failed; }
 
+static volatile bool s_host_held;
+bool party_host_held(void) { return s_host_held; }
+
 static void set_role(role_t r, const char *why)
 {
+    s_host_held = false;
     if (r != s_role) {
         s_host_failed = false;
         s_host_retry_ms = now_ms();
@@ -1077,6 +1081,10 @@ static void tick(btstack_timer_source_t *ts)
         } else if (!playing && s_idle_ms >= PARTY_IDLE_TO_LISTEN_MS && !s_std_on) {
             auracast_host_stop();
             set_role(R_HOST_STOPPING, "no audio for 1.5 s");
+        } else if (a2dp_in_pairing() && !s_std_on) {
+            /* pairing: the phone pairs and connects first, the party comes back after */
+            auracast_host_stop();
+            set_role(R_HOST_STOPPING, "pairing mode - broadcast held until the phone is connected");
         }
         break;
     case R_HOST_STOPPING:
@@ -1094,13 +1102,14 @@ static void tick(btstack_timer_source_t *ts)
         /* an LE Audio phone is linked: our party scan (high duty) starves its link - the
          * CIS request then came 3 s late or failed and the phone dropped LE Audio. Hold
          * the scan for as long as it is linked; the phone has priority. */
-        if ((le_audio_setting_up() || a2dp_in_settling()) && !s_as.target && s_ls == L_SCAN) {
+        if ((le_audio_setting_up() || a2dp_in_settling() || a2dp_in_pairing()) && !s_as.target && s_ls == L_SCAN) {
             /* only while the phone sets LE Audio / A2DP up: linked and idle, we must still
              * find (and play) a JBL party master */
             if (!s_scan_held) {
                 gap_stop_scan();
                 s_scan_held = true;
-                ESP_LOGW(TAG, "phone setting up %s: party scan paused", a2dp_in_settling() ? "A2DP" : "LE Audio");
+                ESP_LOGW(TAG, "%s: party scan paused", a2dp_in_pairing() ? "pairing mode" :
+                         a2dp_in_settling() ? "phone setting up A2DP" : "phone setting up LE Audio");
             }
             s_scan_hold_until = now_ms() + 1000;
         }
@@ -1112,18 +1121,20 @@ static void tick(btstack_timer_source_t *ts)
         }
         break;
     case R_LISTEN_STOPPING:
-        if ((le_audio_starting() || a2dp_in_settling()) && now_ms() - s_role_ms < 8000) {
+        if (a2dp_in_pairing() || ((le_audio_starting() || a2dp_in_settling()) && now_ms() - s_role_ms < 8000)) {
+            s_host_held = true;                   /* the phone plays locally meanwhile */
             /* the phone is configuring / creating its CIS: a BIG created now (30 ms
              * block next to the phone's 30 ms LE link) kept the CIS from coming up and
              * the LE link timed out (0x08) - host once the stream is up */
             static uint32_t logged_ms;
             if (s_role_ms != logged_ms) {
                 logged_ms = s_role_ms;
-                ESP_LOGW(TAG, "host: waiting for the phone's %s stream to settle before the broadcast",
-                         a2dp_in_settling() ? "A2DP" : "LE Audio");
+                ESP_LOGW(TAG, "host held: %s (playing locally meanwhile)", a2dp_in_pairing() ? "pairing mode" :
+                         a2dp_in_settling() ? "the phone's A2DP stream settling" : "the phone's LE Audio stream settling");
             }
             break;
         }
+        s_host_held = false;
         if (!s_big_active && !s_big_pending && !s_pa_pending) {
             jbl_assist_set_paused(s_std_on);
             jbl_set_party_info(party_info_hosting());

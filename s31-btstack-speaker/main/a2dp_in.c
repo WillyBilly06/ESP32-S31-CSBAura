@@ -1049,6 +1049,8 @@ static btstack_timer_source_t s_pair_call_timer;
 static bd_addr_t s_pair_call_addr;
 static uint8_t s_pair_call_tries;
 static bool s_pair_call_active;                  /* our A2DP connect after an LE pairing is in flight */
+static btstack_timer_source_t s_drop_all_timer;
+static void drop_all_phone_links(btstack_timer_source_t *ts);
 static bool s_pair_incoming;                     /* the phone's own classic connect reached us */
 
 bool a2dp_in_pairing(void) { return s_pairing; }
@@ -1141,6 +1143,12 @@ static void btn_run(void *ctx)
         }
     }
     if (b & (1u << A2DP_BTN_PAIRING)) {
+        /* as the Xtreme 5: pairing (button, or LE Audio switched in JBL One) starts clean -
+         * every phone link goes, the phone pairs / connects again from scratch */
+        btstack_run_loop_remove_timer(&s_drop_all_timer);
+        btstack_run_loop_set_timer_handler(&s_drop_all_timer, drop_all_phone_links);
+        btstack_run_loop_set_timer(&s_drop_all_timer, 400);  /* the app's reply + the tone first */
+        btstack_run_loop_add_timer(&s_drop_all_timer);
         s_pairing = true;
         a2dp_in_refresh_discoverable();
         gap_connectable_control(1);
@@ -2005,4 +2013,27 @@ void a2dp_in_on_hci_working(void)
     btstack_run_loop_set_timer_handler(&s_reconn_timer, reconnect_cb);
     btstack_run_loop_set_timer(&s_reconn_timer, 300);
     btstack_run_loop_add_timer(&s_reconn_timer);
+}
+
+/* pairing mode: close every phone link (Classic, and LE links where we are the
+ * peripheral); our own central links to JBL speakers stay */
+static void drop_all_phone_links(btstack_timer_source_t *ts)
+{
+    (void)ts;
+    s_reconn_pending = false;                       /* no power-up call-back now */
+    btstack_run_loop_remove_timer(&s_reconn_timer);
+    s_pair_call_active = false;
+    btstack_run_loop_remove_timer(&s_pair_call_timer);
+    btstack_linked_list_iterator_t it;
+    hci_connections_get_iterator(&it);
+    int n = 0;
+    while (btstack_linked_list_iterator_has_next(&it)) {
+        hci_connection_t *c = (hci_connection_t *)btstack_linked_list_iterator_next(&it);
+        hci_con_handle_t h = c->con_handle;
+        gap_connection_type_t t = gap_get_connection_type(h);
+        if (t == GAP_CONNECTION_LE && gap_get_role(h) != HCI_ROLE_SLAVE) continue;   /* ours (JBL speakers) */
+        if (t != GAP_CONNECTION_ACL && t != GAP_CONNECTION_LE) continue;
+        if (gap_disconnect(h) == ERROR_CODE_SUCCESS) n++;
+    }
+    ESP_LOGW(TAG, "pairing mode: dropped %d phone link(s) - phones pair / connect again", n);
 }

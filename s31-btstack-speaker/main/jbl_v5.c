@@ -1161,9 +1161,9 @@ static void handle_set(hci_con_handle_t con, const uint8_t *pl, uint16_t len)
                 ESP_LOGW(TAG, "app LE Audio %s", on ? "ON" : "OFF");
                 le_audio_set_enabled(on);
                 POST(0x0BA0);
-                if (on && !was) {
-                    /* as the Xtreme 5: LE Audio switched on -> pairing mode, so the phone
-                     * can pair again and pick up the LE Audio bond (CTKD) */
+                if (on != was) {
+                    /* as the Xtreme 5: LE Audio switched on or off -> pairing mode, so the
+                     * phone can pair again with the new bond set (CTKD on, Classic only off) */
                     a2dp_in_button(A2DP_BTN_PAIRING);
                 }
             }

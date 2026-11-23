@@ -278,7 +278,7 @@ static void local_feed_task(void *arg)
     for (;;) {
         bool want = a2dp_in_streaming() && auracast_state() == AURACAST_STATE_OFF &&
                     (s_owner == AO_NONE || s_owner == AO_LOCAL) &&
-                    (!party_auracast_enabled() || party_host_failed()) &&
+                    (!party_auracast_enabled() || party_host_failed() || party_host_held()) &&
                     !party_assist_active();       /* a joined broadcast wins over the phone */
         if (!want) {
             if (s_owner == AO_LOCAL) {
