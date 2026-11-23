@@ -19,6 +19,8 @@
 
 #include "btstack.h"
 #include "classic/btstack_sbc.h"
+#include "aac_decoder.h"
+#include "latm_parser.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -41,7 +43,12 @@ static const char *TAG = "A2DP";
 #define PKT_MAX         (AVDTP_L2CAP_MTU + 16)
 #define PKT_Q_LEN       24                    /* ~550 ms of 8-frame packets */
 #define RING_MS         500                   /* max S31-added delay: beyond it the OLDEST audio is dropped */
-#define TARGET_MS       130                    /* average PCM fill (= added latency); the fill swings below it by the read bursts + delivery gaps */
+/* Average PCM fill (= added latency). While the S31 broadcasts, phones deliver in
+ * bursts (~75 ms peak to peak against the encoder's 30 ms reads), with 60-77 ms
+ * late packets and stretches ~3 % below realtime on top: 130 ms ran dry a few
+ * times a minute, and every underrun costs a re-prime (silence) + a splice.
+ * The delay report tells the phone (video lip sync). */
+#define TARGET_MS       180
 #define PRIME_MS        TARGET_MS             /* start output at the target fill: no start-up underruns / integrator wind-up */
 #define MS_FRAMES(ms)   ((OUT_RATE / 1000) * (ms))
 
@@ -50,6 +57,14 @@ static const char *TAG = "A2DP";
  * fall back to its adaptive low bitpools. */
 static uint8_t s_sbc_caps[] = { 0xFF, 0xFF, 53, 53 };
 static uint8_t s_sbc_cfg[4];
+/* AAC-LC (A2DP 1.4 layout): MPEG-2 + MPEG-4 AAC LC (no HE-AAC: no SBR in the
+ * decoder), 44.1 + 48 kHz, 1 or 2 channels, VBR, up to 320 kbit/s. iPhones and
+ * most Android phones prefer it over SBC. */
+static uint8_t s_aac_caps[6] = { 0xC0, 0x01, 0x8C, 0x84, 0xE2, 0x00 };
+static uint8_t s_aac_cfg[6];
+static uint8_t s_sbc_seid, s_aac_seid;
+enum { CODEC_SBC = 0, CODEC_AAC = 1 };
+static volatile uint8_t s_codec = CODEC_SBC;           /* configured by the phone */
 static uint8_t s_sdp_a2dp[150];
 static uint8_t s_sdp_avrcp_ct[200];
 static uint8_t s_sdp_avrcp_tg[200];
@@ -118,7 +133,7 @@ static bool s_reprime;                       /* reader: ran dry, silence until t
 static int64_t s_last_read_us;               /* reader: a pause > 50 ms (start, BIG coming up) -> align */
 static uint32_t s_ceiling_hits;
 static volatile uint32_t s_aligns, s_ceilings, s_acl_boosts;
-#define CEILING_MS 150                       /* 1 s average above this: splice to the target */
+#define CEILING_MS (TARGET_MS + 20)          /* 1 s average above this: splice to the target */
 static volatile bool s_primed;
 static uint32_t s_out_tmp[RS_OUT_MAX];
 
@@ -157,6 +172,59 @@ static void on_pcm(int16_t *data, int num_frames, int num_channels, int sample_r
     }
 }
 
+/* ---- AAC (core 0, DSP task) ----------------------------------------------------- */
+static aac_decoder_t s_aac;
+static latm_parser_t s_latm;
+static bool s_aac_ready, s_aac_cfg_done;
+static uint8_t s_aac_raw[2048];
+static int16_t s_aac_pcm[2 * 1024];
+static int16_t s_aac_st[2 * 1024];
+static volatile uint32_t s_aac_frames, s_aac_errs;
+
+static void aac_reset(void)
+{
+    latm_parser_reset(&s_latm);
+    latm_parser_init(&s_latm);
+    s_aac_cfg_done = false;
+    s_aac_ready = aac_decoder_init(&s_aac) == AAC_OK;
+    if (!s_aac_ready) ESP_LOGE(TAG, "AAC decoder init failed");
+}
+
+/* RTP header, then one LATM AudioMuxElement (StreamMuxConfig in band) */
+static void aac_decode_packet(const uint8_t *d, int len)
+{
+    if (!s_aac_ready || len < 13) return;
+    int pos = 12 + 4 * (d[0] & 0x0f);
+    if (pos >= len) return;
+    size_t raw = 0;
+    latm_error_t le = latm_parse_frame(&s_latm, d + pos, (size_t)(len - pos), s_aac_raw, sizeof(s_aac_raw), &raw, NULL);
+    if (le != LATM_OK || raw == 0) {
+        if (le != LATM_ERR_NOT_ENOUGH_DATA) s_aac_errs++;
+        return;
+    }
+    const latm_audio_config_t *ac = latm_get_audio_config(&s_latm);
+    if (!s_aac_cfg_done) {
+        if (ac == NULL || !ac->config_valid) return;
+        aac_decoder_configure(&s_aac, (int)ac->sample_rate, ac->channel_config);
+        s_aac_cfg_done = true;
+        ESP_LOGW(TAG, "AAC stream: object type %u, %lu Hz, %u ch", ac->object_type,
+                 (unsigned long)ac->sample_rate, ac->channel_config);
+    }
+    int n = 0;
+    if (aac_decoder_decode(&s_aac, s_aac_raw, (int)raw, s_aac_pcm, &n) != AAC_OK || n <= 0) {
+        s_aac_errs++;
+        return;
+    }
+    s_aac_frames++;
+    if (n > 1024) n = 1024;
+    int16_t *pcm = s_aac_pcm;
+    if (ac->channel_config == 1) {                     /* mono: both sides */
+        for (int i = 0; i < n; i++) s_aac_st[2 * i] = s_aac_st[2 * i + 1] = s_aac_pcm[i];
+        pcm = s_aac_st;
+    }
+    on_pcm(pcm, n, 2, (int)ac->sample_rate, NULL);
+}
+
 static void dsp_task(void *arg)
 {
     (void)arg;
@@ -175,6 +243,11 @@ static void dsp_task(void *arg)
             s_primed = false;
             s_reset_deficit = true;
             s_sbc->configure(&s_sbc_ctx, SBC_MODE_STANDARD, on_pcm, NULL);
+            if (s_codec == CODEC_AAC) aac_reset();
+        }
+        if (s_codec == CODEC_AAC) {
+            aac_decode_packet(p.data, p.len);
+            continue;
         }
         /* RTP header (12 + 4*CC) then the 1-byte SBC media payload header */
         if (p.len < 13) {
@@ -240,7 +313,7 @@ static void media_handler(uint8_t seid, uint8_t *packet, uint16_t size)
     last_seq = seq;
     have_seq = true;
     s_pkts++;
-    s_frames += packet[12] & 0x0F;          /* SBC media payload header: frame count */
+    s_frames += s_codec == CODEC_SBC ? (packet[12] & 0x0F) : 1;   /* SBC payload header: frame count; AAC: 1 per packet */
     if (size > s_pkt_max) {
         s_pkt_max = size;
     }
@@ -465,11 +538,11 @@ int a2dp_in_read(int16_t *pcm, int n)
          * link's controller priority (base 2 -> 9: with missed-poll escalation it
          * beats the BIS repetitions (12) after ~30 ms instead of ~100 ms) */
         static bool boosted;
-        if (!boosted && f < (float)MS_FRAMES(70) && s_streaming) {
+        if (!boosted && f < (float)MS_FRAMES(TARGET_MS - 60) && s_streaming) {
             boosted = true;
             s_acl_boosts++;
             bt_sched_tune_apply_custom(9, 15, 12, 11, "A2DP cushion low: phone link boosted");
-        } else if (boosted && (f > (float)MS_FRAMES(110) || !s_streaming)) {
+        } else if (boosted && (f > (float)MS_FRAMES(TARGET_MS - 20) || !s_streaming)) {
             boosted = false;
             bt_sched_tune_apply_custom(2, 15, 12, 11, "A2DP cushion back: BIS copies first");
         }
@@ -485,7 +558,7 @@ int a2dp_in_read(int16_t *pcm, int n)
         s_track_reads = 0;
         s_track_acc = 0;
         s_track_n = 0;
-        /* hard ceiling: 2 samples (1 s) averaging above 150 ms is not a burst */
+        /* hard ceiling: 2 samples (1 s) averaging above the ceiling is not a burst */
         if (avg > (float)MS_FRAMES(CEILING_MS)) {
             if (++s_ceiling_hits >= 2 && catch_up(pcm, n, true)) {
                 s_ceiling_hits = 0;
@@ -892,9 +965,9 @@ void a2dp_in_log_stats(void)
     static uint32_t last_pkts, last_frames;
     uint32_t pk = s_pkts, fr = s_frames;
     uint32_t dp = pk - last_pkts;
-    ESP_LOGW(TAG, "A2DP 2s: %s, media pkts %lu (+%lu, %lu.%lu SBC frames/pkt, max %u B), q drops %lu, seq gaps %lu | bitpool %lu (min %lu max %lu) | "
+    ESP_LOGW(TAG, "A2DP 2s: %s %s, media pkts %lu (+%lu, %lu.%lu frames/pkt, max %u B), q drops %lu, seq gaps %lu | bitpool %lu (min %lu max %lu) | "
              "PCM %lu ms (avg %lu, min %lu, max %lu), aligns %lu, ceilings %lu, ACL boosts %lu, underruns %lu, oldest dropped %lu, clock corr %ld ppm | catch-ups %lu (%lu ms skipped, %lu expired) | volume %u/127%s | gaps max %lu ms, >60 %lu >100 %lu >200 %lu",
-             s_streaming ? "STREAMING" : s_connected ? "connected" : "no phone",
+             s_streaming ? "STREAMING" : s_connected ? "connected" : "no phone", s_codec == CODEC_AAC ? "AAC" : "SBC",
              (unsigned long)pk, (unsigned long)dp,
              (unsigned long)(dp ? (fr - last_frames) / dp : 0), (unsigned long)(dp ? ((fr - last_frames) * 10 / dp) % 10 : 0),
              (unsigned)s_pkt_max, (unsigned long)s_pkt_drops,
@@ -921,6 +994,9 @@ void a2dp_in_log_stats(void)
 }
 
 /* ---- BTstack events (BT thread) --------------------------------------------- */
+static void reconnect_failed(void);
+static void reconnect_succeeded(void);
+
 static void a2dp_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size)
 {
     (void)channel;
@@ -934,8 +1010,10 @@ static void a2dp_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet,
         a2dp_subevent_signaling_connection_established_get_bd_addr(packet, s_peer);
         if (st != ERROR_CODE_SUCCESS) {
             ESP_LOGW(TAG, "A2DP connect to %s failed, status 0x%02x", bd_addr_to_str(s_peer), st);
+            reconnect_failed();
             break;
         }
+        reconnect_succeeded();
         s_a2dp_cid = a2dp_subevent_signaling_connection_established_get_a2dp_cid(packet);
         s_connected = true;
         {   /* remember the phone: called back at power-up */
@@ -963,8 +1041,47 @@ static void a2dp_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet,
         btstack_run_loop_add_timer(&s_avrcp_timer);
         break;
     }
+    case A2DP_SUBEVENT_SIGNALING_MEDIA_CODEC_MPEG_AAC_CAPABILITY: {
+        /* We opened the stream (power-up call-back): BTstack would pick SBC on its
+         * own - choose AAC-LC when the phone has it. Bitmaps as BTstack reports them:
+         * object type b6 MPEG-2 LC, b5 MPEG-4 LC; rate 0x010 44.1 kHz, 0x008 48 kHz;
+         * channels 0x4 two, 0x8 one. */
+        uint8_t ot = a2dp_subevent_signaling_media_codec_mpeg_aac_capability_get_object_type_bitmap(packet);
+        uint16_t sf = a2dp_subevent_signaling_media_codec_mpeg_aac_capability_get_sampling_frequency_bitmap(packet);
+        uint8_t ch = a2dp_subevent_signaling_media_codec_mpeg_aac_capability_get_channels_bitmap(packet);
+        if (s_aac_seid == 0 || !(ot & 0x60) || !(sf & 0x018)) break;
+        avdtp_configuration_mpeg_aac_t c;
+        memset(&c, 0, sizeof(c));
+        c.object_type = (ot & 0x40) ? AVDTP_AAC_MPEG2_LC : AVDTP_AAC_MPEG4_LC;
+        c.sampling_frequency = (sf & 0x010) ? 44100 : 48000;
+        c.channels = (ch & 0x4) ? 2 : 1;
+        uint32_t br = a2dp_subevent_signaling_media_codec_mpeg_aac_capability_get_bit_rate(packet);
+        c.bit_rate = (br == 0 || br > 320000) ? 320000 : br;
+        c.vbr = a2dp_subevent_signaling_media_codec_mpeg_aac_capability_get_vbr(packet);
+        c.drc = false;
+        uint8_t st = a2dp_sink_set_config_mpeg_aac(a2dp_subevent_signaling_media_codec_mpeg_aac_capability_get_a2dp_cid(packet),
+                                                   s_aac_seid,
+                                                   a2dp_subevent_signaling_media_codec_mpeg_aac_capability_get_remote_seid(packet), &c);
+        ESP_LOGW(TAG, "phone offers AAC: choosing it (%lu Hz, %u ch) -> 0x%02x", (unsigned long)c.sampling_frequency, c.channels, st);
+        break;
+    }
+    case A2DP_SUBEVENT_SIGNALING_MEDIA_CODEC_MPEG_AAC_CONFIGURATION: {
+        uint32_t sr = a2dp_subevent_signaling_media_codec_mpeg_aac_configuration_get_sampling_frequency(packet);
+        s_codec = CODEC_AAC;
+        s_local_seid = a2dp_subevent_signaling_media_codec_mpeg_aac_configuration_get_local_seid(packet);
+        s_cfg_rate = sr;
+        s_reset_dsp = true;
+        ESP_LOGW(TAG, "AAC configured: object type %u, %lu Hz, %u ch, %lu bit/s%s",
+                 a2dp_subevent_signaling_media_codec_mpeg_aac_configuration_get_object_type(packet), (unsigned long)sr,
+                 a2dp_subevent_signaling_media_codec_mpeg_aac_configuration_get_num_channels(packet),
+                 (unsigned long)a2dp_subevent_signaling_media_codec_mpeg_aac_configuration_get_bit_rate(packet),
+                 a2dp_subevent_signaling_media_codec_mpeg_aac_configuration_get_vbr(packet) ? " VBR" : "");
+        break;
+    }
     case A2DP_SUBEVENT_SIGNALING_MEDIA_CODEC_SBC_CONFIGURATION: {
         uint16_t sr = a2dp_subevent_signaling_media_codec_sbc_configuration_get_sampling_frequency(packet);
+        s_codec = CODEC_SBC;
+        s_local_seid = a2dp_subevent_signaling_media_codec_sbc_configuration_get_local_seid(packet);
         s_cfg_rate = sr;
         ESP_LOGW(TAG, "SBC configured: %u Hz, %u ch, block %u, subbands %u, bitpool %u-%u", sr,
                  a2dp_subevent_signaling_media_codec_sbc_configuration_get_num_channels(packet),
@@ -1013,6 +1130,30 @@ static void a2dp_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet,
     }
 }
 
+/* Encryption on our own outgoing link: after authenticating, BTstack sends HCI Set
+ * Connection Encryption once and does not handle the controller refusing it (seen:
+ * 0x12) - the link then waits forever and the phone hangs up (REDMAGIC 11 Pro
+ * call-back). Refusals are retried here a few times. */
+#define ENC_RETRIES     6
+#define ENC_RETRY_MS    150
+static hci_con_handle_t s_enc_con = HCI_CON_HANDLE_INVALID;
+static int s_enc_tries;
+static btstack_timer_source_t s_enc_timer;
+
+static void enc_retry(btstack_timer_source_t *ts)
+{
+    (void)ts;
+    if (s_enc_con == HCI_CON_HANDLE_INVALID) return;
+    if (!hci_can_send_command_packet_now()) {
+        btstack_run_loop_set_timer(&s_enc_timer, 20);
+        btstack_run_loop_add_timer(&s_enc_timer);
+        return;
+    }
+    s_enc_tries++;
+    ESP_LOGW(TAG, "encryption: asking again on con 0x%04x (try %d/%d)", s_enc_con, s_enc_tries, ENC_RETRIES);
+    hci_send_cmd(&hci_set_connection_encryption, s_enc_con, 1);
+}
+
 static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size)
 {
     (void)channel;
@@ -1021,6 +1162,37 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
         return;
     }
     switch (hci_event_packet_get_type(packet)) {
+    case HCI_EVENT_COMMAND_COMPLETE:
+        if (hci_event_command_complete_get_command_opcode(packet) == 0x1408 && size >= 9) {   /* Read Encryption Key Size */
+            ESP_LOGW(TAG, "encryption key size: status 0x%02x, con 0x%04x, %u bytes", packet[5],
+                     little_endian_read_16(packet, 6), packet[8]);
+        }
+        break;
+    case HCI_EVENT_ENCRYPTION_CHANGE_V2:
+        ESP_LOGW(TAG, "encryption change v2: status 0x%02x, con 0x%04x, enabled %u, key size %u", packet[2],
+                 little_endian_read_16(packet, 3), packet[5], size > 6 ? packet[6] : 0);
+        if (little_endian_read_16(packet, 3) == s_enc_con) {
+            s_enc_con = HCI_CON_HANDLE_INVALID;
+            btstack_run_loop_remove_timer(&s_enc_timer);
+        }
+        break;
+    case HCI_EVENT_COMMAND_STATUS:
+        if (hci_event_command_status_get_status(packet) != ERROR_CODE_SUCCESS &&
+            hci_event_command_status_get_command_opcode(packet) != 0x0413) {
+            ESP_LOGW(TAG, "HCI command 0x%04x refused: status 0x%02x", hci_event_command_status_get_command_opcode(packet),
+                     hci_event_command_status_get_status(packet));
+        }
+        if (hci_event_command_status_get_command_opcode(packet) == 0x0413) {      /* Set Connection Encryption */
+            uint8_t st = hci_event_command_status_get_status(packet);
+            ESP_LOGW(TAG, "encryption request: controller status 0x%02x", st);
+            if (st != ERROR_CODE_SUCCESS && s_enc_con != HCI_CON_HANDLE_INVALID && s_enc_tries < ENC_RETRIES) {
+                btstack_run_loop_remove_timer(&s_enc_timer);
+                btstack_run_loop_set_timer_handler(&s_enc_timer, enc_retry);
+                btstack_run_loop_set_timer(&s_enc_timer, ENC_RETRY_MS);
+                btstack_run_loop_add_timer(&s_enc_timer);
+            }
+        }
+        break;
     case HCI_EVENT_PIN_CODE_REQUEST: {
         bd_addr_t a;
         hci_event_pin_code_request_get_bd_addr(packet, a);
@@ -1033,9 +1205,17 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
                  hci_event_simple_pairing_complete_get_status(packet));
         break;
     case HCI_EVENT_AUTHENTICATION_COMPLETE:
+        if (hci_event_authentication_complete_get_status(packet) == 0) {
+            s_enc_con = hci_event_authentication_complete_get_connection_handle(packet);   /* BTstack asks for encryption next */
+            s_enc_tries = 0;
+        }
         ESP_LOGW(TAG, "authentication status 0x%02x", hci_event_authentication_complete_get_status(packet));
         break;
     case HCI_EVENT_ENCRYPTION_CHANGE:
+        if (hci_event_encryption_change_get_connection_handle(packet) == s_enc_con) {
+            s_enc_con = HCI_CON_HANDLE_INVALID;
+            btstack_run_loop_remove_timer(&s_enc_timer);
+        }
         /* enabled: 1 = E0, 2 = AES-CCM (Secure Connections) */
         ESP_LOGW(TAG, "encryption change: status 0x%02x, con 0x%04x, enabled %u",
                  hci_event_encryption_change_get_status(packet),
@@ -1055,6 +1235,10 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
         ESP_LOGW(TAG, "GAP pairing complete, status 0x%02x", gap_event_pairing_complete_get_status(packet));
         break;
     case HCI_EVENT_DISCONNECTION_COMPLETE:
+        if (hci_event_disconnection_complete_get_connection_handle(packet) == s_enc_con) {
+            s_enc_con = HCI_CON_HANDLE_INVALID;
+            btstack_run_loop_remove_timer(&s_enc_timer);
+        }
         ESP_LOGW(TAG, "ACL disconnected, reason 0x%02x",
                  hci_event_disconnection_complete_get_reason(packet));
         break;
@@ -1207,7 +1391,7 @@ void a2dp_in_setup(void)
     s_sbc = btstack_sbc_decoder_bluedroid_init_instance(&s_sbc_ctx);
     s_sbc->configure(&s_sbc_ctx, SBC_MODE_STANDARD, on_pcm, NULL);
     /* core 0 = DSP core, below the LC3 encoder (21) */
-    xTaskCreatePinnedToCore(dsp_task, "sbc_dsp", 4096,   /* measured peak ~0.8 KB */ NULL, configMAX_PRIORITIES - 6, NULL, 0);
+    xTaskCreatePinnedToCore(dsp_task, "sbc_dsp", 6144,   /* SBC ~0.8 KB peak; Helix AAC uses more */ NULL, configMAX_PRIORITIES - 6, NULL, 0);
 
     /* Bluetooth side */
     l2cap_init();
@@ -1232,11 +1416,20 @@ void a2dp_in_setup(void)
     avrcp_register_packet_handler(&avrcp_handler);
     avrcp_controller_register_packet_handler(&avrcp_handler);
     avrcp_target_register_packet_handler(&avrcp_handler);
+    avdtp_stream_endpoint_t *aep = a2dp_sink_create_stream_endpoint(AVDTP_AUDIO, AVDTP_CODEC_MPEG_2_4_AAC,
+                                                                   s_aac_caps, sizeof(s_aac_caps),
+                                                                   s_aac_cfg, sizeof(s_aac_cfg));
     avdtp_stream_endpoint_t *ep = a2dp_sink_create_stream_endpoint(AVDTP_AUDIO, AVDTP_CODEC_SBC,
                                                                   s_sbc_caps, sizeof(s_sbc_caps),
                                                                   s_sbc_cfg, sizeof(s_sbc_cfg));
-    s_local_seid = avdtp_local_seid(ep);
-    avdtp_sink_register_delay_reporting_category(s_local_seid);   /* tell the phone our latency (video lip sync) */
+    s_sbc_seid = avdtp_local_seid(ep);
+    s_local_seid = s_sbc_seid;
+    avdtp_sink_register_delay_reporting_category(s_sbc_seid);   /* tell the phone our latency (video lip sync) */
+    if (aep != NULL) {
+        s_aac_seid = avdtp_local_seid(aep);
+        avdtp_sink_register_delay_reporting_category(s_aac_seid);
+    }
+    ESP_LOGW(TAG, "A2DP sink endpoints: AAC-LC seid %u, SBC seid %u", s_aac_seid, s_sbc_seid);
 
     a2dp_sink_create_sdp_record(s_sdp_a2dp, sdp_create_service_record_handle(),
                                 AVDTP_SINK_FEATURE_MASK_SPEAKER, NULL, NULL);
@@ -1282,22 +1475,105 @@ void a2dp_in_setup(void)
 /* Power-up: call the last phone back (like a real speaker), twice at most. */
 static btstack_timer_source_t s_reconn_timer;
 static int s_reconn_tries;
+/* Power-up call-back security. At level 2 BTstack authenticates our outgoing
+ * link and then asks for encryption; with the REDMAGIC 11 Pro that never
+ * completes (no encryption event), the phone hangs up after ~4 s (0x13) and
+ * every call-back failed. At level 0 the phone authenticates and encrypts the
+ * link itself, as when it connects to us - most phones. Tries alternate between
+ * the two, starting with the one that worked last time for this phone (NVS).
+ * Known exception: the REDMAGIC 11 Pro - our encryption request is accepted
+ * (status 0) but no encryption change ever comes, at either level; it reconnects
+ * itself when picked in its Bluetooth list. */
+#define RECONN_TRIES        2           /* one per security level */
+static uint8_t s_reconn_first_level = 2;          /* 0 or 2 (level 0 alone: the REDMAGIC waits for us) */
+static uint8_t s_reconn_level;                    /* level of the try in flight */
+static bool s_reconn_pending;
+static btstack_timer_source_t s_reconn_level_timer;
+/* While the S31 pages out it cannot be paged: a phone connecting meanwhile fails.
+ * A phone whose call-back failed every try is remembered and not called back on
+ * the next boot (it reconnects itself in ~0.3 s); one success clears it. */
+static bd_addr_t s_last_phone;                    /* tentative: defined again below */
+static bd_addr_t s_reconn_bad;
+static bool s_reconn_bad_valid;
+
+static void reconn_bad_store(bool bad)
+{
+    nvs_handle_t h;
+    if (nvs_open("s31", NVS_READWRITE, &h) != ESP_OK) return;
+    if (bad) nvs_set_blob(h, "cb_bad", s_last_phone, 6);
+    else nvs_erase_key(h, "cb_bad");
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+static void reconn_level_restore(btstack_timer_source_t *ts)
+{
+    (void)ts;
+    gap_set_security_level(LEVEL_2);              /* our other outgoing channels */
+}
 static bd_addr_t s_last_phone;
 
 static void reconnect_cb(btstack_timer_source_t *ts)
 {
     (void)ts;
-    if (s_connected || s_reconn_tries >= 2) {
+    if (s_connected) {
+        s_reconn_pending = false;
+        return;
+    }
+    if (s_reconn_tries >= RECONN_TRIES) {
+        s_reconn_pending = false;
+        ESP_LOGW(TAG, "power-up call-back failed %d times: next boot leaves %s to reconnect itself",
+                 RECONN_TRIES, bd_addr_to_str(s_last_phone));
+        reconn_bad_store(true);
         return;
     }
     s_reconn_tries++;
-    ESP_LOGW(TAG, "power-up: calling back last phone %s (try %d/2)", bd_addr_to_str(s_last_phone), s_reconn_tries);
+    s_reconn_level = (s_reconn_tries & 1) ? s_reconn_first_level : (uint8_t)(2 - s_reconn_first_level);
+    /* AVDTP takes the level when it opens its channel (after its SDP query) */
+    gap_set_security_level(s_reconn_level == 0 ? LEVEL_0 : LEVEL_2);
+    btstack_run_loop_remove_timer(&s_reconn_level_timer);
+    btstack_run_loop_set_timer_handler(&s_reconn_level_timer, reconn_level_restore);
+    btstack_run_loop_set_timer(&s_reconn_level_timer, 8000);   /* paging alone can take 3 s */
+    btstack_run_loop_add_timer(&s_reconn_level_timer);
+    s_reconn_pending = true;
+    ESP_LOGW(TAG, "power-up: calling back last phone %s (try %d/%d, security level %u)", bd_addr_to_str(s_last_phone),
+             s_reconn_tries, RECONN_TRIES, s_reconn_level);
     uint8_t st = a2dp_sink_establish_stream(s_last_phone, &s_a2dp_cid);
     if (st != ERROR_CODE_SUCCESS) {
         ESP_LOGW(TAG, "a2dp_sink_establish_stream: 0x%02x", st);
     }
-    btstack_run_loop_set_timer(&s_reconn_timer, 10000);
+    btstack_run_loop_set_timer(&s_reconn_timer, 12000);   /* fallback: a failure moves on at once */
     btstack_run_loop_add_timer(&s_reconn_timer);
+}
+
+static void reconnect_failed(void)
+{
+    if (!s_reconn_pending) return;
+    s_reconn_pending = false;
+    btstack_run_loop_remove_timer(&s_reconn_timer);
+    btstack_run_loop_set_timer(&s_reconn_timer, 500);     /* next try (other security level) */
+    btstack_run_loop_add_timer(&s_reconn_timer);
+}
+
+static void reconnect_succeeded(void)
+{
+    if (!s_reconn_pending) return;
+    s_reconn_pending = false;
+    btstack_run_loop_remove_timer(&s_reconn_timer);
+    if (s_reconn_level != s_reconn_first_level) {
+        nvs_handle_t h;
+        if (nvs_open("s31", NVS_READWRITE, &h) == ESP_OK) {
+            nvs_set_u8(h, "cb_level", s_reconn_level);
+            nvs_commit(h);
+            nvs_close(h);
+        }
+        s_reconn_first_level = s_reconn_level;
+    }
+    ESP_LOGW(TAG, "power-up call-back worked at security level %u (try %d)", s_reconn_level, s_reconn_tries);
+    if (s_reconn_bad_valid) {
+        s_reconn_bad_valid = false;
+        reconn_bad_store(false);
+    }
 }
 
 void a2dp_in_on_hci_working(void)
@@ -1312,8 +1588,17 @@ void a2dp_in_on_hci_working(void)
         return;
     }
     esp_err_t err = nvs_get_blob(h, "last_phone", s_last_phone, &n);
+    uint8_t lvl;
+    if (nvs_get_u8(h, "cb_level", &lvl) == ESP_OK && (lvl == 0 || lvl == 2)) s_reconn_first_level = lvl;
+    size_t bn = 6;
+    s_reconn_bad_valid = nvs_get_blob(h, "cb_bad", s_reconn_bad, &bn) == ESP_OK && bn == 6;
     nvs_close(h);
     if (err != ESP_OK || n != 6) {
+        return;
+    }
+    if (s_reconn_bad_valid && bd_addr_cmp(s_reconn_bad, s_last_phone) == 0) {
+        ESP_LOGW(TAG, "power-up: not calling back %s (its call-back failed last time) - connectable, it reconnects itself",
+                 bd_addr_to_str(s_last_phone));
         return;
     }
     btstack_run_loop_set_timer_handler(&s_reconn_timer, reconnect_cb);

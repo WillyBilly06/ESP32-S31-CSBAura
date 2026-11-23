@@ -15,7 +15,7 @@ controller). Everything else in the repository is earlier bring-up work, tools, 
 
 | Feature | What it does | Source |
 |---|---|---|
-| A2DP sink | SBC from the phone, decoded on core 0, resampled 44.1 -> 48 kHz with clock recovery into a small PSRAM ring (constant, low added latency); AVRCP volume, play/pause, track info; reconnects to the last phone | `a2dp_in.c` |
+| A2DP sink | SBC or AAC-LC (Helix decoder) from the phone, decoded on core 0, resampled 44.1 -> 48 kHz with clock recovery into a small PSRAM ring (constant, low added latency); AVRCP volume, play/pause, track info; reconnects to the last phone | `a2dp_in.c` |
 | Auracast broadcast (JBL party host) | BAP broadcast source with the extended/periodic advertising and BIG layout of a real Xtreme 5 master, so Xtreme 5 speakers join natively with their Auracast button, no app or phone needed | `auracast.c`, `jbl_beacon.c` |
 | Party LISTEN | When the phone is idle, the S31 syncs to another JBL party master's broadcast, decodes it (LC3, with PLC) and plays it in sync with the master | `party.c` |
 | Local I2S output | 48 kHz 32-bit stereo I2S to a DAC/amp; plays the broadcast in sync with the receivers, phone audio when Auracast is off, or the LISTEN stream | `audio_out.c` |

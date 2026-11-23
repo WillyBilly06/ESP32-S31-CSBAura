@@ -1260,11 +1260,18 @@ static int begin_start(void)
         if (gap_extended_advertising_setup(&s_adv_set, &s_ext_params, &s_adv_handle) != ERROR_CODE_SUCCESS) {
             return -EIO;
         }
-        gap_extended_advertising_set_adv_data(s_adv_handle, s_ext_adv_len, s_ext_adv);
         gap_periodic_advertising_set_params(s_adv_handle, &s_pa_params);
         s_adv_created = true;
         ESP_LOGI(TAG, "advertising set handle %u (SID %u)", s_adv_handle, AURA_ADV_SID);
     }
+    /* JBL party or standard broadcast: rebuild both every start (they were built
+     * once at setup, so a standard broadcast went on air as the JBL party) */
+    ext_adv_build();
+    pa_build();
+    gap_extended_advertising_set_adv_data(s_adv_handle, s_ext_adv_len, s_ext_adv);
+    gap_periodic_advertising_set_data(s_adv_handle, s_pa_len, s_pa);
+    log_hex("EXT ADV", s_ext_adv, s_ext_adv_len);
+    log_hex(s_std ? "PA (BASE)" : "PA (BASE + JBL)", s_pa, s_pa_len);
     s_fail_status = 0;
     r_ble_ll_isoal_tx_comp_cb_set((void *)ctl_tx_comp_cb);
     pa_refresh();
@@ -1347,8 +1354,9 @@ static void on_big_created(const uint8_t *packet)
         ESP_LOGW(TAG, "BIS 0x%04x TX power +20 dBm: %s (reads back level %d)", s_bis[i], esp_err_to_name(e),
                  esp_ble_tx_power_get_enhanced(ESP_BLE_ENHANCED_PWR_TYPE_CONN, s_bis[i]));
     }
-    ESP_LOGW(TAG, "broadcast ON: '%s' Broadcast_ID 0x%06x, BIS 0x%04x/0x%04x, ISO interval %u us",
-             AURA_BROADCAST_NAME, (unsigned)AURA_BROADCAST_ID, s_bis[0], s_bis[1],
+    ESP_LOGW(TAG, "broadcast ON (%s): '%s' Broadcast_ID 0x%06x, BIS 0x%04x/0x%04x, ISO interval %u us",
+             s_std ? "standard Auracast" : "JBL party", s_std ? s_std_name : AURA_BROADCAST_NAME,
+             (unsigned)(s_std ? STD_BROADCAST_ID : AURA_BROADCAST_ID), s_bis[0], s_bis[1],
              gap_subevent_big_created_get_iso_interval_1250us(packet) * 1250u);
     s_lead_ms = -1.0f;
     st_local_ms = AURA_PIPELINE * 10u + AURA_PD_US / 1000u + LOCAL_SYNC_TRIM_MS;

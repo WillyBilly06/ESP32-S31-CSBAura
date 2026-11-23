@@ -24,7 +24,7 @@ function is marked "any thread" in its header.
 | File | Role |
 |---|---|
 | `main.c` | Start-up order, core layout, stats task |
-| `a2dp_in.c` | A2DP sink + AVRCP: media queue, SBC decode, 44.1 -> 48 kHz windowed-sinc resampler with PI clock recovery, PSRAM PCM ring with a small constant target fill, delay reporting, buttons' volume / play-pause / pairing, last-phone reconnect |
+| `a2dp_in.c` | A2DP sink + AVRCP: media queue, SBC or AAC-LC decode, 44.1 -> 48 kHz windowed-sinc resampler with PI clock recovery, PSRAM PCM ring with a small constant target fill, delay reporting, buttons' volume / play-pause / pairing, last-phone reconnect |
 | `a2dp_dsp.h` | Resampler and ring code (also used by the host tests in `tools/`) |
 | `auracast.c` | BAP broadcast source: JBL-master extended + periodic advertising, BASE, BIG via HCI LE Create BIG Test, ISO-clocked LC3 encode pipeline with silence fill on underrun; at run time also a standard broadcast (`auracast_set_standard()`: own Broadcast ID and name, no JBL blocks, optional broadcast code) |
 | `party.c` | Party roles HOST / LISTEN: scan for a JBL master, PA sync, BASE + BIGInfo, BIG sync, LC3 decode with PLC, playback delayed by the master's presentation delay; JBL One Auracast Assistant ("Join Nearby Broadcast" with an optional password, "Broadcast to Others" as a standard broadcast), which keeps the JBL party off |
@@ -42,6 +42,7 @@ function is marked "any thread" in its header.
 | `power.c` | Soft power off (no power switch on the board); any button restarts |
 | `sniffer.c` | Party/Auracast sniffer, only in the `S31_SNIFFER` build |
 
+`components/helix_aac/` is the AAC-LC decoder (RealNetworks Helix, RPSL; LC only, no SBR) with a small LATM parser.
 `components/btstack_s31/` builds the needed parts of BTstack from `../third_party/btstack` and adds
 the S31 VHCI transport (`hci_transport_s31_vhci.c`) and an NVS-backed TLV store for bonding keys
 (`btstack_tlv_esp32.c`). LC3 comes from `../s31-jbl-speaker/components/liblc3`.

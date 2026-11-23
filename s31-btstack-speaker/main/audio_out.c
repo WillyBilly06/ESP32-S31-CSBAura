@@ -269,7 +269,8 @@ static void local_feed_task(void *arg)
     static int16_t pcm[480 * 2];
     for (;;) {
         bool want = a2dp_in_streaming() && auracast_state() == AURACAST_STATE_OFF &&
-                    (s_owner == AO_NONE || s_owner == AO_LOCAL) && !party_auracast_enabled();
+                    (s_owner == AO_NONE || s_owner == AO_LOCAL) && !party_auracast_enabled() &&
+                    !party_assist_active();       /* a joined broadcast wins over the phone */
         if (!want) {
             if (s_owner == AO_LOCAL) {
                 audio_out_end(AO_LOCAL);

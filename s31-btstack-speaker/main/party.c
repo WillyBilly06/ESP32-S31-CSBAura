@@ -50,6 +50,14 @@ static const char *TAG = "PARTY";
 #define TICK_MS                 100
 #define SCAN_ITVL               240      /* 150 ms */
 #define SCAN_WIN                48       /* 30 ms: longer windows starved BR/EDR paging (Bluedroid build) */
+/* A phone's standard broadcast is found by catching ADV_EXT_IND and then its
+ * AUX_ADV_IND: at 20 % duty that took 8-13 s (or the join timed out). JBL One
+ * join: the phone's A2DP is not played, so scan hard; app broadcast list: the
+ * phone's music still plays, so a middle duty. */
+#define JOIN_SCAN_ITVL          160      /* 100 ms */
+#define JOIN_SCAN_WIN           112      /* 70 ms: 70 % */
+#define LIST_SCAN_ITVL          160      /* 100 ms */
+#define LIST_SCAN_WIN           64       /* 40 ms: 40 % */
 #define PA_SYNC_TIMEOUT_10MS    200      /* 2 s supervision */
 #define T_PA_SYNC_MS            5000
 #define T_BASE_MS               5000
@@ -63,6 +71,11 @@ static const char *TAG = "PARTY";
 #define HARMAN_COMPANY_ID       0x0057u
 
 #define LISTEN_RX_LAG_MS        5        /* ISO RX arrives ~ at the SDU reference; decode is ~1 ms */
+/* Minimum playback delay above one ISO interval. A phone's standard broadcast
+ * (Galaxy S26: 30 ms interval, 3 x 10 ms frames per event, presentation delay
+ * 40 ms) delivers its SDUs in 30 ms bursts at the end of each event; a 35 ms
+ * line then ran dry ~33 times a second. */
+#define LISTEN_BURST_MARGIN_MS  30
 
 #define MAX_BIS                 2
 #define MAX_FS                  480      /* 10 ms @ 48 kHz */
@@ -93,7 +106,7 @@ static char s_cand_name[33];
 
 /* ---- JBL One assistant (Join Nearby Broadcast) ---- */
 #define ASSIST_SEEN_MAX   16
-#define ASSIST_JOIN_MS    9000             /* the app waits 6 s for the result; we keep trying a bit longer */
+#define ASSIST_JOIN_MS    15000            /* from the tap: stopping our own broadcast + PA/BIG sync */
 static struct {
     bool scanning, started_scan;
     uint32_t scan_until;
@@ -105,7 +118,20 @@ static struct {
     uint32_t t0;
     bool has_code;
     uint8_t code[16];
+    bool was_joined;                  /* played at least once: a later loss = left */
 } s_as;
+
+/* A JBL One join ends without the app asking (Auracast button, Broadcast to
+ * Others, broadcaster gone): tell the app it is disconnected, or it keeps
+ * showing the broadcast as connected. */
+static void assist_end(const char *why)
+{
+    if (!s_as.target) return;
+    s_as.target = s_as.joined = s_as.was_joined = false;
+    s_as.reported = true;
+    ESP_LOGW(TAG, "JBL One: left the broadcast (%s)", why);
+    jbl_v5_assist_result(0, s_as.addr, s_as.type, 1);
+}
 
 /* standard Auracast broadcast (JBL One "Broadcast to Others") */
 static bool s_std_on;
@@ -425,6 +451,8 @@ static void decode_task(void *arg)
     }
 }
 
+static uint32_t s_iso_itvl_us;            /* BIG being synced: ISO interval */
+
 static bool audio_start(void)
 {
     xSemaphoreTake(s_dec_lock, portMAX_DELAY);
@@ -459,6 +487,12 @@ static bool audio_start(void)
     if (ok) {
         uint32_t d = s_dcfg.pd_us / 1000u;
         d = d > LISTEN_RX_LAG_MS + 20 ? d - LISTEN_RX_LAG_MS : 20;
+        uint32_t dmin = s_iso_itvl_us / 1000u + LISTEN_BURST_MARGIN_MS;
+        if (d < dmin) {
+            ESP_LOGW(TAG, "presentation delay %lu ms is short for a %lu us ISO interval: playing %lu ms late",
+                     (unsigned long)(s_dcfg.pd_us / 1000u), (unsigned long)s_iso_itvl_us, (unsigned long)(dmin - d));
+            d = dmin;
+        }
         audio_out_set_rate(s_dcfg.sr_hz);
         audio_out_begin(AO_LISTEN, d);
     }
@@ -612,7 +646,13 @@ static void scan_start(void)
         return;
     }
     s_scan_held = false;
-    gap_set_scan_params(0 /* passive */, SCAN_ITVL, SCAN_WIN, 0);
+    if (s_as.target) {
+        gap_set_scan_params(0 /* passive */, JOIN_SCAN_ITVL, JOIN_SCAN_WIN, 0);
+    } else if (s_as.scanning) {
+        gap_set_scan_params(0 /* passive */, LIST_SCAN_ITVL, LIST_SCAN_WIN, 0);
+    } else {
+        gap_set_scan_params(0 /* passive */, SCAN_ITVL, SCAN_WIN, 0);
+    }
     gap_start_scan();
 }
 
@@ -640,6 +680,11 @@ static void listen_reset(const char *why)
     if (s_role == R_LISTEN) {
         scan_start();
         set_ls(L_SCAN, why);
+    } else if (s_as.scanning) {
+        gap_set_scan_params(0 /* passive */, LIST_SCAN_ITVL, LIST_SCAN_WIN, 0);   /* JBL One is scanning: keep it */
+        gap_start_scan();
+        s_as.started_scan = true;
+        set_ls(L_OFF, why);
     } else {
         gap_stop_scan();
         set_ls(L_OFF, why);
@@ -747,6 +792,12 @@ static void on_ext_adv(const uint8_t *packet)
         return;
     }
     s_pa_pending = true;
+    if (s_as.target) {
+        /* JBL One join: the controller still has to catch an AUX_ADV_IND with
+         * SyncInfo, then the train - full-time scanning for it (took ~4 s at 70 %);
+         * the phone's audio is not played meanwhile */
+        gap_set_scan_params(0 /* passive */, JOIN_SCAN_ITVL, JOIN_SCAN_ITVL, 0);
+    }
     ESP_LOGW(TAG, "JBL party master found: '%s' %s (rssi %d) -> syncing", name, bd_addr_to_str(a),
              (int8_t)gap_event_extended_advertising_report_get_rssi(packet));
     set_ls(L_PA_SYNC, "master found");
@@ -818,11 +869,23 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
         case HCI_SUBEVENT_LE_PERIODIC_ADVERTISING_SYNC_LOST:
             if (hci_subevent_le_periodic_advertising_sync_lost_get_sync_handle(packet) == s_pa_handle) {
                 s_pa_handle = HCI_CON_HANDLE_INVALID;
+                if (s_as.target && s_as.joined) {
+                    s_as.joined = false;
+                    s_as.reported = false;
+                    s_as.t0 = now_ms();
+                    jbl_v5_notify(0x0B80);
+                }
                 listen_reset("PA sync lost (master stopped?)");
             }
             break;
         case HCI_SUBEVENT_LE_BIG_SYNC_LOST:
             s_big_active = false;
+            if (s_as.target && s_as.joined) {
+                s_as.joined = false;                  /* retry this broadcast for ASSIST_JOIN_MS */
+                s_as.reported = false;
+                s_as.t0 = now_ms();
+                jbl_v5_notify(0x0B80);                /* app: re-joining */
+            }
             listen_reset("BIG sync lost");
             break;
         default:
@@ -847,10 +910,11 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
             }
             s_big_active = true;
             if (s_as.target && !s_as.joined) {
-                s_as.joined = true;
+                bool again = s_as.was_joined;
+                s_as.joined = s_as.was_joined = true;
                 s_as.reported = true;
-                ESP_LOGW(TAG, "JBL One: joined '%s'", s_cand_name);
-                jbl_v5_assist_result(1, s_as.addr, s_as.type, 1);
+                ESP_LOGW(TAG, "JBL One: %s '%s'", again ? "back on" : "joined", s_cand_name);
+                jbl_v5_assist_result(1, s_as.addr, s_as.type, 1);   /* joined (again): the app shows it */
             }
             s_num_bis = gap_subevent_big_sync_created_get_num_bis(packet);
             if (s_num_bis > MAX_BIS) s_num_bis = MAX_BIS;
@@ -861,6 +925,7 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
                 listen_reset("no longer listening");
                 break;
             }
+            s_iso_itvl_us = gap_subevent_big_sync_created_get_iso_interval_1250us(packet) * 1250u;
             if (!audio_start()) {
                 listen_reset("audio path failed");
                 break;
@@ -926,10 +991,14 @@ static void tick(btstack_timer_source_t *ts)
         party_assist_scan(false, 0);
     }
     if (s_as.target && !s_as.joined && !s_as.reported && now_ms() - s_as.t0 > ASSIST_JOIN_MS) {
-        s_as.reported = true;
-        s_as.target = false;
-        ESP_LOGW(TAG, "JBL One: join timed out");
-        jbl_v5_assist_result(1, s_as.addr, s_as.type, 2);
+        if (s_as.was_joined) {
+            assist_end("broadcast gone");
+        } else {
+            s_as.reported = true;
+            s_as.target = false;
+            ESP_LOGW(TAG, "JBL One: join timed out");
+            jbl_v5_assist_result(1, s_as.addr, s_as.type, 2);
+        }
         if (party_listening()) listen_reset("join timed out");
     }
     if ((s_role == R_HOST || s_role == R_HOST_STOPPING) && auracast_state() == AURACAST_STATE_ON &&
@@ -977,7 +1046,10 @@ static void tick(btstack_timer_source_t *ts)
         }
         break;
     case R_HOST:
-        if (!playing && s_idle_ms >= PARTY_IDLE_TO_LISTEN_MS && (!s_std_on || s_as.target)) {
+        if (s_as.target) {
+            auracast_host_stop();                         /* JBL One join: our broadcast ends now */
+            set_role(R_HOST_STOPPING, "JBL One: join a broadcast");
+        } else if (!playing && s_idle_ms >= PARTY_IDLE_TO_LISTEN_MS && !s_std_on) {
             auracast_host_stop();
             set_role(R_HOST_STOPPING, "no audio for 1.5 s");
         }
@@ -1077,7 +1149,7 @@ void party_set_auracast_enabled(bool on)
 {
     if (on && (s_std_on || s_as.target)) {           /* back to the JBL party: standard modes end */
         s_std_on = false;
-        s_as.target = s_as.joined = false;
+        assist_end("JBL party turned on");
         ESP_LOGW(TAG, "JBL party back on: standard broadcast / join ended");
         if (party_listening()) listen_reset("JBL party back on");
         jbl_v5_on_party_changed();
@@ -1088,6 +1160,8 @@ void party_set_auracast_enabled(bool on)
         tones_play(on ? "ent_aura" : "exi_aura");
     }
 }
+
+bool party_assist_active(void) { return s_as.target; }
 
 bool party_listening(void)
 {
@@ -1129,12 +1203,18 @@ static void assist_report(const uint8_t *packet)
 
 void party_assist_scan(bool on, uint8_t seconds)
 {
+    if (on && s_enabled) {
+        s_enabled = false;                            /* standard Auracast: JBL party off until toggled on */
+        ESP_LOGW(TAG, "JBL One Assistant: JBL party broadcast / receive OFF");
+        tones_play("exi_aura");
+        jbl_v5_on_party_changed();
+    }
     if (on) {
         s_as.nseen = 0;
         s_as.scanning = true;
         s_as.scan_until = now_ms() + (uint32_t)(seconds < 10 ? 10 : seconds) * 1000u;
         if (!(s_role == R_LISTEN && s_ls == L_SCAN)) {
-            gap_set_scan_params(0 /* passive */, SCAN_ITVL, SCAN_WIN, 0);
+            gap_set_scan_params(0 /* passive */, LIST_SCAN_ITVL, LIST_SCAN_WIN, 0);
             gap_start_scan();
             s_as.started_scan = true;
         }
@@ -1161,21 +1241,23 @@ void party_assist_join(const uint8_t addr[6], uint8_t addr_type, const uint8_t *
     memcpy(s_as.addr, addr, 6);
     s_as.type = addr_type;
     s_as.target = true;
-    s_as.joined = s_as.reported = false;
+    s_as.joined = s_as.reported = s_as.was_joined = false;
     s_as.t0 = now_ms();
     if (s_enabled || s_std_on) {                      /* standard receive: JBL party off until toggled on */
         s_enabled = false;
         s_std_on = false;
+        tones_play("exi_aura");
         jbl_v5_on_party_changed();
     }
     ESP_LOGW(TAG, "JBL One: join broadcast %s", bd_addr_to_str(s_as.addr));
+    jbl_v5_notify(0x0B80);                            /* app: joining */
     if (party_listening()) listen_reset("JBL One: join a broadcast");
 }
 
 void party_assist_leave(void)
 {
     if (!s_as.target) return;
-    s_as.target = s_as.joined = false;
+    s_as.target = s_as.joined = s_as.was_joined = false;
     ESP_LOGW(TAG, "JBL One: left the broadcast");
     if (party_listening()) listen_reset("JBL One: left the broadcast");
 }
@@ -1218,13 +1300,15 @@ void party_set_standard_broadcast(bool on, const char *name, const uint8_t *code
     ESP_LOGW(TAG, "JBL One: Broadcast to Others %s%s%s%s", on ? "ON - standard Auracast '" : "OFF",
              on ? s_std_name : "", on ? "'" : "", on && s_std_has_code ? " (encrypted)" : "");
     if (on) {
-        s_enabled = false;                            /* JBL party broadcast + receive off until toggled on */
+        if (s_enabled) {
+            s_enabled = false;                        /* JBL party broadcast + receive off until toggled on */
+            tones_play("exi_aura");                   /* the JBL party went off; the generic broadcast has no tone */
+        }
         if (s_as.target) {
-            s_as.target = s_as.joined = false;        /* broadcasting, not receiving */
+            assist_end("Broadcast to Others");        /* broadcasting, not receiving */
             if (party_listening()) listen_reset("JBL One: Broadcast to Others");
         }
     }
-    tones_play(on ? "ent_aura" : "exi_aura");
     jbl_v5_on_party_changed();
 }
 
