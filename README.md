@@ -178,23 +178,46 @@ python tools/flasher/s31_flasher.py --port <PORT> --color blue --no-build
 
 ## Prompt tones
 
-`tones.bin` in the repository root holds the Xtreme 5 prompt set: 22 tones for power,
-pairing, connect, Auracast, volume, battery and the digits. The S31 Flasher writes it with
-the firmware, so a flashed board has its sound effects right away. The tones are JBL's
-audio, so this repository has to stay **private** while it holds them.
+`tones.bin` in the repository root holds the Xtreme 5 prompt set, and the S31 Flasher writes
+it with the firmware. The tones are JBL's audio, so this repository has to stay **private**
+while it holds them.
 
-To use other sounds instead:
+### Your own sounds
 
-1. Put your own tone files in a folder. They can be MP3, or 16 kHz s16 mono `.pcm`, named:
-   `poweron`, `poweroff`, `bt_cnt`, `bt_pair`, `ent_aura`, `exi_aura`, `vol_max`,
-   `indicate`, `c_err`, `batlow`, `mic_con`, `usound`, `0` ... `9`.
-2. Pack them (needs `ffmpeg`):
+1. Make a folder and put sound files in it, **named after the prompt they replace**. WAV,
+   MP3, FLAC, OGG, M4A/AAC or raw `.pcm` all work, at any sample rate, mono or stereo;
+   they're converted to 24 kHz mono.
+
+   | File name | Plays when |
+   |---|---|
+   | `poweron` | the speaker starts |
+   | `poweroff` | the speaker powers off |
+   | `bt_pair` | pairing mode starts (button, or LE Audio switched in JBL One) |
+   | `bt_cnt` | a phone has connected |
+   | `ent_aura` / `exi_aura` | Auracast is turned on / off |
+   | `vol_max` | the volume hits its maximum or minimum |
+   | `indicate` | JBL One identifies the speaker, or a stereo pair is set up |
+   | `c_err` | JBL One's firmware update is refused |
+   | `batlow`, `mic_con`, `usound`, `0` ... `9` | packed, not played by the firmware yet |
+
+2. Pack them. This needs [ffmpeg](https://ffmpeg.org) on the PATH:
 
    ```bash
-   python tools/tones_pack.py <dir with tone files> tones.bin
+   # replace only the tones in the folder, keep all the others:
+   python tools/tones_pack.py my_tones tones.bin --base tones.bin
+
+   # or a completely new set (prompts without a file stay silent):
+   python tools/tones_pack.py my_tones tones.bin
    ```
 
-3. Replace `tones.bin` in the project folder. The S31 Flasher writes it with the firmware.
+   It prints every tone and its length. The whole set must fit in 2 MB, about 43 s of
+   sound.
+
+3. **Build + Flash** (or **More → Flash the last build**) with the S31 Flasher. It writes
+   the new `tones.bin` from the project folder.
+
+Keep prompts short (under 1–2 s, except `bt_pair`). The firmware lowers the music while a
+tone plays.
 
 ## Troubleshooting
 
