@@ -253,6 +253,7 @@ static le_audio_big_params_t s_big_params = {
  * plays cleanly): ISO interval 30 ms, BN 3, IRC 2, PTO 1 -> NSE 9, PDU 120,
  * 2M. ~32 % airtime (the 120 B / 20 ms / IRC 4 layout took enough that the
  * phone's A2DP link starved). The old Xtreme 5 layout was 16/8/100/2/4/0. */
+static le_audio_big_test_params_t s_big_run;      /* what Create BIG Test gets this time */
 static const le_audio_big_test_params_t s_big_test = {
     /* 20 ms / BN 2 / NSE 8 / IRC 4 / 100 B = the real Xtreme 5 master. Measured
      * beside the phone's A2DP (controller Tpoll fixed 10 ms): this layout 0 underruns
@@ -1313,7 +1314,18 @@ static void on_pa_enable_complete(uint8_t status)
     s_big_params.advertising_handle = s_adv_handle;
     s_big_params.encryption = (s_std && s_std_enc) ? 1 : 0;
     memcpy(s_big_params.broadcast_code, s_std_code, 16);
-    uint8_t st = gap_big_create_test(&s_big, &s_big_params, &s_big_test);
+    s_big_run = s_big_test;
+    if (a2dp_in_ext_active() && s_std) {   /* JBL party: the Xtreme 5 does not join IRC 2 */
+        /* the phone's LE Audio CIS (its own timing) has to fit next to the BIG: with
+         * 4 copies the BIG block is 14.3 ms of every 30 and the two kept colliding
+         * (7-18 % of the phone's SDUs lost, BIG events skipped, local sync off).
+         * 2 copies = the S26 Ultra's own broadcast, which the Xtreme 5 plays cleanly. */
+        s_big_run.irc = 2;
+        s_big_run.nse = AURA_BN * 2;
+        ESP_LOGW(TAG, "input is LE Audio (standard broadcast): BIG with IRC 2 (NSE %u) to leave room for the CIS",
+                 s_big_run.nse);
+    }
+    uint8_t st = gap_big_create_test(&s_big, &s_big_params, &s_big_run);
     if (st != ERROR_CODE_SUCCESS) {
         ESP_LOGE(TAG, "gap_big_create_test: 0x%02x", st);
         s_fail_status = st;

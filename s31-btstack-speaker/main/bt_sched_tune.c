@@ -34,6 +34,19 @@ extern uint8_t *r_sym_ble_u66q9VTswFBa3W6uzpwY __attribute__((weak));        /* 
 extern uint8_t *sym_ble_Ta1qTQXQA7wXSdDHIIz2 __attribute__((weak));
 extern uint8_t _data_start[], _data_end[];
 
+/* CIS (the phone's LE Audio stream into the S31) priority, cfg[37..39], stock 9/12/12
+ * (adaptive between them). Hosting a party, the BIS repetitions (12) and pre-
+ * transmissions (11) won the overlaps and ~15 % of the phone's SDUs never arrived
+ * (PLC on the speaker and on the broadcast). 14: above the repetitions, below the
+ * BIS first copies (15) - the CIS has its own retransmissions. */
+#ifndef BT_SCHED_CIS
+#define BT_SCHED_CIS 14
+#endif
+/* LE Audio input feeding the broadcast: CIS 15, BIS first copies 13 */
+#define BT_SCHED_CIS_LE_IN   15
+#define BT_SCHED_FIRST_LE_IN 13
+static bool s_le_input;
+
 /* ---- profiles ------------------------------------------------------------ */
 typedef struct {
     uint8_t acl;      /* BR/EDR ACL base priority (pti table dft[0]) */
@@ -163,7 +176,8 @@ static uint8_t *iso_cfg_find(void)
     /* Fingerprint of the stock defaults (r_sym_ble_19UgKHutGrGyTis8atJz) around the
      * priority bytes, which themselves only need to be valid nibbles. */
     bool ok = w0 == 1250 && w8 == 20000 && w12 == 1000 && w52 == 500000 && p[32] == 0x1F &&
-              p[37] == 9 && p[38] == 12 && p[39] == 12 &&
+              ((p[37] == 9 && p[38] == 12 && p[39] == 12) ||
+               (p[37] == p[38] && p[38] == p[39] && (p[37] == BT_SCHED_CIS || p[37] == BT_SCHED_CIS_LE_IN))) &&
               p[33] <= 15 && p[34] <= 15 && p[35] <= 15 && p[36] <= 15;
     if (!ok) {
         ESP_LOGE(TAG, "ISO cfg block %p fingerprint mismatch (w0=%lu b32=%02x b33..39=%u/%u/%u/%u/%u/%u/%u)"
@@ -186,14 +200,23 @@ static void apply(const prio_profile_t *pr, const char *why)
         old_acl = pti[0];
         pti[0] = pr->acl;
     }
+    uint8_t first = s_le_input && pr->first > BT_SCHED_FIRST_LE_IN ? BT_SCHED_FIRST_LE_IN : pr->first;
+    uint8_t cis = s_le_input ? BT_SCHED_CIS_LE_IN : BT_SCHED_CIS;
     if (iso != NULL) {
         memcpy(old_iso, iso + 33, 4);
-        iso[33] = pr->first;
+        iso[33] = first;
         iso[34] = pr->rep;
         iso[35] = pr->pto;
         iso[36] = pr->ctrl;
+        iso[37] = iso[38] = iso[39] = cis;
     }
     portEXIT_CRITICAL(&s_lock);
+    static bool cis_logged;
+    if (iso != NULL && !cis_logged) {
+        cis_logged = true;
+        ESP_LOGW(TAG, "CIS priority %u (stock 9..12): the phone's LE Audio stream above the BIS repetitions",
+                 BT_SCHED_CIS);
+    }
 
     if (pti != NULL) {
         acl_ok = r_olc_sched_pti_dft_get(0) == pr->acl;
@@ -203,13 +226,13 @@ static void apply(const prio_profile_t *pr, const char *why)
         }
     }
     if (iso != NULL) {
-        iso_ok = iso[33] == pr->first && iso[34] == pr->rep && iso[35] == pr->pto && iso[36] == pr->ctrl;
+        iso_ok = iso[33] == first && iso[34] == pr->rep && iso[35] == pr->pto && iso[36] == pr->ctrl;
     }
     bool changed = (acl_ok && old_acl != pr->acl) || (iso_ok && memcmp(old_iso, iso + 33, 4) != 0);
     if (changed || !acl_ok || !iso_ok) {
         ESP_LOGW(TAG, "%s [%s]: ACL %u->%s%u | BIS first %u->%u rep %u->%u pto %u->%u ctrl %u->%u%s", why,
                  s_mode == BT_SCHED_MODE_A2DP_FIRST ? "A2DP_FIRST" : s_mode == BT_SCHED_MODE_MASTER ? "MASTER" : "AURACAST_FIRST", old_acl,
-                 acl_ok ? "" : "FAILED ", pr->acl, old_iso[0], pr->first, old_iso[1], pr->rep, old_iso[2],
+                 acl_ok ? "" : "FAILED ", pr->acl, old_iso[0], first, old_iso[1], pr->rep, old_iso[2],
                  pr->pto, old_iso[3], pr->ctrl, iso_ok ? "" : " (ISO FAILED)");
     }
 }
@@ -233,6 +256,15 @@ void bt_sched_tune_set_mode(bt_sched_mode_t mode)
         return;
     }
     s_mode = mode;
+    bt_sched_tune_streaming(s_streaming);
+}
+
+void bt_sched_tune_le_input(bool on)
+{
+    if (s_le_input == on) return;
+    s_le_input = on;
+    ESP_LOGW(TAG, "LE Audio input %s: CIS %u, BIS first copies %s", on ? "on" : "off",
+             on ? BT_SCHED_CIS_LE_IN : BT_SCHED_CIS, on ? "13 (below the CIS)" : "back to the profile");
     bt_sched_tune_streaming(s_streaming);
 }
 

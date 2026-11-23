@@ -13,6 +13,30 @@ bool a2dp_in_connected(void);
 /* BT thread: ACL of the phone with the A2DP link, HCI_CON_HANDLE_INVALID if none */
 uint16_t a2dp_in_con_handle(void);
 
+/* Another audio source feeding the same pipeline as phone A2DP (resampler, PCM
+ * ring, local output / broadcast): LE Audio unicast. While it is active the
+ * phone's A2DP packets are dropped and a2dp_in_streaming() is true.
+ * BT thread: start / stop / push (one SDU, len 0 = lost).
+ * DSP task: the decode callback gets each pushed SDU and hands its PCM
+ * (interleaved stereo) to a2dp_in_ext_pcm(). */
+typedef void (*a2dp_in_ext_decode_t)(const uint8_t *data, uint16_t len);
+void a2dp_in_ext_start(a2dp_in_ext_decode_t decode, const char *what, uint32_t target_ms);
+void a2dp_in_ext_stop(void);
+
+/* DSP task: the one decoder workspace in internal SRAM (AAC or LE Audio LC3, one at a
+ * time - only the DSP task decodes). owner: 1 AAC, 2 LC3. Returns false if the other
+ * decoder had it: the caller sets its decoder up again. */
+void *a2dp_in_codec_ws(unsigned *size);
+bool a2dp_in_codec_ws_take(int owner);
+void a2dp_in_probe_log(const char *what);    /* DSP task: core + workspace speed */
+
+/* BT thread: the phone is fully connected (A2DP media channel open / LE Audio in use):
+ * a pairing mode started for a new phone ends */
+void a2dp_in_pairing_done(const char *why);
+bool a2dp_in_ext_active(void);
+void a2dp_in_ext_push(const uint8_t *data, uint16_t len);
+void a2dp_in_ext_pcm(int16_t *lr, int frames, int rate);
+
 /* Encoder side (core 0): pop n 48 kHz stereo frames; returns frames copied,
  * the rest is zero-filled (underrun). */
 int a2dp_in_read(int16_t *pcm, int n);
@@ -39,6 +63,16 @@ bool a2dp_in_muted(void);
 bool a2dp_in_media_op(uint8_t op);
 /* BT thread: AVRCP playback status (AVRCP_PLAYBACK_STATUS_*) and track info. */
 uint8_t a2dp_in_play_status(void);
+
+/* BT thread: A2DP was playing when it went away less than within_ms ago (the phone
+ * moved to LE Audio mid-song: le_audio asks it to play on) */
+bool a2dp_in_was_playing(uint32_t within_ms);
+
+/* BT thread: the phone moved A2DP -> LE Audio mid-song and did not resume: AVRCP Play
+ * (opens AVRCP to the last A2DP phone first if it is closed) */
+void a2dp_in_avrcp_play_after_switch(void);
+/* any thread: ms since the A2DP "connected" tone (0 = never) */
+uint32_t a2dp_in_ms_since_connect_tone(void);
 const char *a2dp_in_track_title(void);
 const char *a2dp_in_track_artist(void);
 
@@ -56,6 +90,19 @@ const char *a2dp_in_track_artist(void);
  * the PA and the JBL beacon stay on air. 0 = normal. */
 #ifndef S31_QUIET_RADIO_TEST
 #define S31_QUIET_RADIO_TEST 0
+
+/* BT thread: discoverable (classic inquiry scan + "general discoverable" in the LE Audio
+ * advert) only in pairing mode or with no phone at all - classic or LE Audio. As a JBL
+ * speaker: a linked phone takes it out of pairing; the pairing button puts it back. */
+void a2dp_in_refresh_discoverable(void);
+bool a2dp_in_pairing(void);
+
+/* BT thread: a phone just bonded over LE (its classic key derived, CTKD). Samsung pages
+ * us for SDP right then, its own controller answers CONTROLLER_BUSY (still on the LE
+ * pairing) and Android waits 60 s before trying again - "Pairing..." for a minute. If no
+ * classic link is up 2.5 s later, the S31 opens it (A2DP), and the phone's SDP + profiles
+ * run on that. Only after a new bond, never on reconnects. */
+void a2dp_in_call_after_le_pairing(const uint8_t identity[6]);
 #endif
 /* test cycle phase of the last frame read: 0 up-sweep, 1 gap, 2 down-sweep, 3 gap */
 int a2dp_in_test_phase(void);

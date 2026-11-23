@@ -34,6 +34,7 @@
 #include "jbl_v5.h"
 #include "link_tune.h"
 #include "party.h"
+#include "le_audio.h"
 #include "audio_out.h"
 #include "buttons.h"
 #include "tones.h"
@@ -129,11 +130,12 @@ static void stats_task(void *arg)
         a2dp_in_log_stats();
         auracast_log_stats();
         party_log_stats();
+        le_audio_log_stats();
         audio_out_log_stats();
         /* slow beacon (100 ms) while streaming OR listening: at 20 ms it collides with the master's 20 ms BIG */
         /* slow beacon (100 ms) only while a BIG needs the air: broadcasting or listening.
          * Phone audio alone keeps 20 ms, so JBL One finds the speaker quickly. */
-        jbl_set_streaming(auracast_state() != AURACAST_STATE_OFF || party_listening());
+        jbl_set_streaming(auracast_state() != AURACAST_STATE_OFF || party_listening() || le_audio_phone_linked());
         jbl_log_stats();
         log_heap();
     }
@@ -180,6 +182,7 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
         /* no broadcast at boot: nothing plays yet, and the radio is better spent
          * paging the last phone (party starts LISTEN once it is connected) */
         party_on_hci_working();
+        le_audio_on_hci_working();
     }
 }
 
@@ -215,6 +218,7 @@ static void btstack_task(void *arg)
         tones_play("poweron");
         auracast_setup();
         party_setup();
+        le_audio_setup();
         buttons_setup();
         gap_set_security_level(LEVEL_0);     /* incoming ATT-over-BR/EDR (JBL One): the phone authenticates */
         jbl_setup();

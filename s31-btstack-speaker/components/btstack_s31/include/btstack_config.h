@@ -18,6 +18,10 @@
 /* ---- BR/EDR: A2DP sink (+ AVRCP), GATT over BR/EDR for JBL One ----------- */
 #define ENABLE_CLASSIC
 #define ENABLE_GATT_OVER_CLASSIC
+/* CTKD: one LE pairing (Android pairs a dual-mode LE Audio speaker over LE) also
+ * gives the Classic link key, so the phone switches LE Audio <-> A2DP without a new
+ * pairing. The derived key is P-256; with BR/EDR Secure Connections off here the
+ * link comes up E0 and BTstack's downgrade check (only active with SC on) stays out. */
 #define ENABLE_CROSS_TRANSPORT_KEY_DERIVATION
 #define NVM_NUM_LINK_KEYS 16
 /* one 2-DH5 (679 B payload) per A2DP media packet: at bitpool 53 the phone packs
@@ -56,6 +60,6 @@
 /* transport ring buffer: ISO SDUs received while listening to a master */
 #define S31_HOST_ISO_PACKET_LEN   (HCI_ISO_PAYLOAD_SIZE + 4)
 #define S31_HOST_ISO_PACKET_NUM   16
-#define MAX_NR_HCI_ISO_STREAMS    4
+#define MAX_NR_HCI_ISO_STREAMS    6   /* broadcast BIG 2 + listen sync 2 + LE Audio CIS 1 + spare */
 
 #endif

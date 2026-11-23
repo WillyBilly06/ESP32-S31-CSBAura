@@ -61,6 +61,9 @@ typedef struct {
 /**
  * Initialize decoder
  */
+/* Use this buffer (fast internal SRAM, owned by the caller) instead of a heap one */
+void aac_decoder_set_workspace(void *buf, unsigned size);
+unsigned aac_decoder_workspace_need(void);
 int aac_decoder_init(aac_decoder_t *dec);
 
 /**

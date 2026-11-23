@@ -31,6 +31,7 @@ void jbl_v5_set_local_addr(const bd_addr_t addr);
  * last one that sent a V5 command, is the app link. */
 void jbl_v5_link_up(hci_con_handle_t con);
 void jbl_v5_link_down(hci_con_handle_t con);
+bool jbl_v5_is_link(hci_con_handle_t con);
 
 /* A complete write to excelpoint.com ...0002 (prepared writes already joined). */
 void jbl_v5_on_write(hci_con_handle_t con, const uint8_t *data, uint16_t len);

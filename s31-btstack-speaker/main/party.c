@@ -42,6 +42,7 @@
 #include "audio_out.h"
 #include "auracast.h"
 #include "jbl.h"
+#include "le_audio.h"
 
 static const char *TAG = "PARTY";
 
@@ -197,9 +198,17 @@ static uint32_t s_last_sdu_ms;
 /* ---- helpers ---------------------------------------------------------------- */
 static uint32_t now_ms(void) { return btstack_run_loop_get_time_ms(); }
 
+static volatile bool s_host_failed;                  /* HOST, broadcast start failed: local output */
+static uint32_t s_host_retry_ms, s_host_retry_gap = 2000;   /* backs off 2 s .. 16 s */
+
+bool party_host_failed(void) { return s_host_failed; }
+
 static void set_role(role_t r, const char *why)
 {
     if (r != s_role) {
+        s_host_failed = false;
+        s_host_retry_ms = now_ms();
+        s_host_retry_gap = 2000;
         ESP_LOGW(TAG, "role %s -> %s (%s)", role_names[s_role], role_names[r], why);
         s_role = r;
         s_role_ms = now_ms();
@@ -528,6 +537,9 @@ static void audio_stop(void)
 static void iso_rx(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size)
 {
     (void)channel;
+    if (packet_type == HCI_ISO_DATA_PACKET && le_audio_iso_rx(packet, size)) {
+        return;                                        /* LE Audio CIS */
+    }
     if (packet_type != HCI_ISO_DATA_PACKET || size < 4 || s_ls != L_STREAM) {
         return;
     }
@@ -985,7 +997,7 @@ static void listen_poll(void)
 
 static void tick(btstack_timer_source_t *ts)
 {
-    bool playing = a2dp_in_streaming() && !s_as.target;   /* a JBL One join wins over the phone */
+    bool playing = (a2dp_in_streaming() || le_audio_starting()) && !s_as.target;   /* a JBL One join wins over the phone */
     s_idle_ms = playing ? 0 : s_idle_ms + TICK_MS;
     if (s_as.scanning && (int32_t)(s_as.scan_until - now_ms()) <= 0) {
         party_assist_scan(false, 0);
@@ -1046,6 +1058,19 @@ static void tick(btstack_timer_source_t *ts)
         }
         break;
     case R_HOST:
+        if (auracast_state() == AURACAST_STATE_ON) {
+            if (s_host_failed) ESP_LOGW(TAG, "broadcast up after a retry: output back in sync with it");
+            s_host_failed = false;
+            s_host_retry_gap = 2000;
+        } else if (auracast_state() == AURACAST_STATE_OFF && !s_as.target &&
+                   now_ms() - s_host_retry_ms >= s_host_retry_gap) {
+            /* the start failed (e.g. no ISO resources yet): play locally, try again */
+            if (s_host_failed && s_host_retry_gap < 16000) s_host_retry_gap *= 2;
+            ESP_LOGW(TAG, "broadcast did not start: playing locally, retrying (next in %lu ms)", (unsigned long)s_host_retry_gap);
+            s_host_failed = true;
+            s_host_retry_ms = now_ms();
+            auracast_host_start();
+        }
         if (s_as.target) {
             auracast_host_stop();                         /* JBL One join: our broadcast ends now */
             set_role(R_HOST_STOPPING, "JBL One: join a broadcast");
@@ -1066,6 +1091,19 @@ static void tick(btstack_timer_source_t *ts)
         }
         break;
     case R_LISTEN:
+        /* an LE Audio phone is linked: our party scan (high duty) starves its link - the
+         * CIS request then came 3 s late or failed and the phone dropped LE Audio. Hold
+         * the scan for as long as it is linked; the phone has priority. */
+        if (le_audio_setting_up() && !s_as.target && s_ls == L_SCAN) {
+            /* only while the phone sets LE Audio up: linked and idle, we must still find
+             * (and play) a JBL party master */
+            if (!s_scan_held) {
+                gap_stop_scan();
+                s_scan_held = true;
+                ESP_LOGW(TAG, "LE Audio phone setting up: party scan paused");
+            }
+            s_scan_hold_until = now_ms() + 1000;
+        }
         if (playing) {
             set_role(R_LISTEN_STOPPING, "audio playing - host has priority");
             listen_reset("stop listening");
@@ -1074,6 +1112,17 @@ static void tick(btstack_timer_source_t *ts)
         }
         break;
     case R_LISTEN_STOPPING:
+        if (le_audio_starting() && now_ms() - s_role_ms < 6000) {
+            /* the phone is configuring / creating its CIS: a BIG created now (30 ms
+             * block next to the phone's 30 ms LE link) kept the CIS from coming up and
+             * the LE link timed out (0x08) - host once the stream is up */
+            static uint32_t logged_ms;
+            if (s_role_ms != logged_ms) {
+                logged_ms = s_role_ms;
+                ESP_LOGW(TAG, "host: waiting for the phone's LE Audio stream (CIS) before the broadcast");
+            }
+            break;
+        }
         if (!s_big_active && !s_big_pending && !s_pa_pending) {
             jbl_assist_set_paused(s_std_on);
             jbl_set_party_info(party_info_hosting());

@@ -28,6 +28,7 @@ static const char *TAG = "I2S_OUT";
 #define DMA_FRAMES       240                     /* 4 x 5 ms = 20 ms in DMA */
 #define RING_MS          400
 #define LOCAL_DELAY_MS   60                      /* Auracast off: A2DP ring already absorbs the jitter */
+#define LOCAL_DELAY_LE_MS 30                     /* LE Audio: steady ISO delivery, low latency */
 
 static i2s_chan_handle_t s_i2s;
 static spsc_ring_t s_ring;
@@ -154,14 +155,7 @@ void audio_out_push(ao_owner_t owner, const int16_t *lr, int n)
     static int16_t vol_buf[480 * 2];
     if ((owner == AO_HOST || owner == AO_LOCAL) && n <= 480) {
         memcpy(vol_buf, lr, (size_t)n * 4);       /* phone volume: here, not on the broadcast */
-        if (owner == AO_LOCAL) {
-            v5_eq_process(vol_buf, n);            /* JBL One EQ (HOST: already in the encoder path) */
-        }
-        a2dp_in_apply_volume(vol_buf, n);
-        lr = vol_buf;
-    } else if (owner == AO_LISTEN && n <= 480 && s_rate == OUT_RATE) {
-        memcpy(vol_buf, lr, (size_t)n * 4);       /* party audio: our EQ on our speaker */
-        v5_eq_process(vol_buf, n);
+        a2dp_in_apply_volume(vol_buf, n);         /* EQ: in the writer (HOST: in the encoder path) */
         lr = vol_buf;
     }
     uint32_t space = ring_space(&s_ring);
@@ -211,7 +205,14 @@ static void writer_task(void *arg)
             st_err_frames = (int32_t)s_err_ema;
             /* AO_LOCAL is pulled on demand by this line (no second clock): no servo -
              * trimming it only made the A2DP ring drain 0.4 % fast */
-            if (++s_since_prime == SERVO_SETTLE && s_owner != AO_LOCAL && (s_err_ema > COARSE_FRAMES || s_err_ema < -COARSE_FRAMES)) {
+            /* once after settling, and again whenever the line stays > 20 ms off for 1 s
+             * (a skipped BIG event moved it more than the 1-frame trims fix in seconds) */
+            static uint16_t far_chunks;
+            bool far = s_err_ema > 4 * COARSE_FRAMES || s_err_ema < -4 * COARSE_FRAMES;
+            far_chunks = (far && s_since_prime > SERVO_SETTLE) ? far_chunks + 1 : 0;
+            bool refix = far_chunks >= SERVO_SETTLE;
+            if (refix) far_chunks = 0;
+            if ((++s_since_prime == SERVO_SETTLE || refix) && s_owner != AO_LOCAL && (s_err_ema > COARSE_FRAMES || s_err_ema < -COARSE_FRAMES)) {
                 if (s_err_ema > 0) {                  /* too late: jump ahead once */
                     uint32_t k = (uint32_t)s_err_ema;
                     if (k > ring_fill(&s_ring) - CHUNK) k = ring_fill(&s_ring) - CHUNK;
@@ -235,6 +236,13 @@ static void writer_task(void *arg)
         } else if (s_primed && ring_fill(&s_ring) >= CHUNK + 1) {
             uint32_t take = (uint32_t)(CHUNK + adj);
             ring_read(&s_ring, in, take);
+            /* JBL One EQ here, after the delay line: a change is heard within one DMA
+             * period instead of after delay + DMA (~80 ms). HOST has it in the encoder
+             * path (the broadcast carries it); LISTEN: our EQ on the party audio. */
+            ao_owner_t ow = s_owner;
+            if (ow == AO_LOCAL || (ow == AO_LISTEN && s_rate_cur == OUT_RATE)) {
+                v5_eq_process((int16_t *)in, take < CHUNK ? (int)take : CHUNK);
+            }
             const int16_t *p = (const int16_t *)in;
             for (int i = 0; i < CHUNK * 2; i++) {
                 out[i] = ((int32_t)p[i]) << 16;           /* drop: the extra frame is simply skipped */
@@ -269,7 +277,8 @@ static void local_feed_task(void *arg)
     static int16_t pcm[480 * 2];
     for (;;) {
         bool want = a2dp_in_streaming() && auracast_state() == AURACAST_STATE_OFF &&
-                    (s_owner == AO_NONE || s_owner == AO_LOCAL) && !party_auracast_enabled() &&
+                    (s_owner == AO_NONE || s_owner == AO_LOCAL) &&
+                    (!party_auracast_enabled() || party_host_failed()) &&
                     !party_assist_active();       /* a joined broadcast wins over the phone */
         if (!want) {
             if (s_owner == AO_LOCAL) {
@@ -279,7 +288,7 @@ static void local_feed_task(void *arg)
             continue;
         }
         if (s_owner != AO_LOCAL) {
-            audio_out_begin(AO_LOCAL, LOCAL_DELAY_MS);
+            audio_out_begin(AO_LOCAL, a2dp_in_ext_active() ? LOCAL_DELAY_LE_MS : LOCAL_DELAY_MS);
             vTaskDelay(pdMS_TO_TICKS(5));         /* writer flushes first */
         }
         /* keep the line at its delay: read 10 ms whenever it is below delay + 10 ms */

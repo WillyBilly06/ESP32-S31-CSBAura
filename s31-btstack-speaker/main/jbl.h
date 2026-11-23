@@ -50,6 +50,9 @@ void jbl_set_streaming(bool streaming);
 /* Any thread. Bluetooth name of the connected phone (NULL / "" = none): its
  * CRC-16/ARC goes into the beacon as srcName1Crc. The string is not kept. */
 void jbl_set_phone_name(const char *name);
+/* BT thread: ask a phone for its name (BR/EDR remote name request, no link needed);
+ * the answer goes to jbl_set_phone_name. For an LE-only (LE Audio) phone. */
+bool jbl_request_phone_name(const bd_addr_t addr);
 
 /* Any thread. Party role LISTEN: stop the assistant's scan / joins (and close
  * its control link) so the LE scanner belongs to the sink; false = resume. */

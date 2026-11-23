@@ -24,6 +24,8 @@
 #include "link_tune.h"
 #include "a2dp_in.h"
 #include "auracast.h"
+#include "le_audio.h"
+#include "jbl_v5.h"
 #include "hci_transport_s31_vhci.h"
 
 #include <stdio.h>
@@ -62,6 +64,7 @@ static btstack_packet_callback_registration_t s_reg;
 static struct {
     hci_con_handle_t h;
     uint16_t applied;                             /* poll slots set, 0 = redo */
+    bool had_a2dp;                                /* A2DP ran on it (and may be gone now) */
 } s_links[MAX_ACL];
 static hci_con_handle_t s_acl = HCI_CON_HANDLE_INVALID;   /* newest link */
 static hci_con_handle_t s_le = HCI_CON_HANDLE_INVALID;
@@ -76,11 +79,39 @@ static int link_count(void)
     return n;
 }
 
+int link_tune_classic_links(void) { return link_count(); }
+
 static uint16_t poll_wanted(hci_con_handle_t h)
 {
     hci_con_handle_t audio = a2dp_in_con_handle();
     if (link_count() > 1 && audio != HCI_CON_HANDLE_INVALID && h != audio) return POLL_SLOTS_OTHER;
+    if (h != audio) {
+        for (int i = 0; i < MAX_ACL; i++) {
+            /* the phone dropped A2DP but kept the link (switching to LE Audio): at a
+             * 7.5 ms guaranteed poll the controller had no air left to answer the
+             * phone's LE connect (0x3E). A link setting A2DP up stays fast. */
+            if (s_links[i].h == h && s_links[i].had_a2dp) return POLL_SLOTS_OTHER;
+        }
+    }
+    if (h != audio && le_audio_phone_linked() &&
+        (le_audio_starting() || (a2dp_in_ext_active() && auracast_state() != AURACAST_STATE_OFF))) {
+        /* a classic link without A2DP (JBL One over BR/EDR GATT) while the phone sets up
+         * its LE Audio stream, or while that stream feeds our broadcast: 7.5-15 ms
+         * guaranteed polls took the air the CIS (and the BIG) need */
+        return POLL_SLOTS_OTHER;
+    }
     return auracast_state() == AURACAST_STATE_OFF ? POLL_SLOTS_IDLE : POLL_SLOTS_HOSTING;
+}
+
+static void poll_apply(const char *why);
+
+void link_tune_refresh(const char *why)
+{
+    hci_con_handle_t audio = a2dp_in_con_handle();
+    for (int i = 0; i < MAX_ACL; i++) {
+        if (audio != HCI_CON_HANDLE_INVALID && s_links[i].h == audio) s_links[i].had_a2dp = true;
+    }
+    poll_apply(why);
 }
 
 static void poll_apply(const char *why)
@@ -95,7 +126,7 @@ static void poll_apply(const char *why)
                     other ? 4000 : 48000 /* B/s */, 0, (uint32_t)want * 625u, 0xFFFFFFFFu);
         s_links[i].applied = want;
         ESP_LOGW(TAG, "ACL 0x%04x: poll every %u slots (%.1f ms, %u polls/s) - %s", h, want, want * 0.625,
-                 (unsigned)(1600u / want), other ? "second phone, not the A2DP one" : why);
+                 (unsigned)(1600u / want), other ? (link_count() > 1 ? "second phone, not the A2DP one" : "no A2DP on it now") : why);
     }
 }
 
@@ -126,10 +157,27 @@ static void log_features(const char *who, const uint8_t *f)
              (f[4] & 0x80) ? "yes" : "NO", (f[5] & 0x01) ? "yes" : "NO");
 }
 
+static uint16_t s_le_itvl, s_le_lat, s_le_to;     /* current LE link parameters (HCI units) */
+
 static void le_update_cb(btstack_timer_source_t *ts)
 {
     (void)ts;
     if (s_le == HCI_CON_HANDLE_INVALID) {
+        return;
+    }
+    bool jbl = jbl_v5_is_link(s_le);
+    if (le_audio_owns_link(s_le) || jbl) {
+        /* an LE Audio phone: its own short interval keeps the link alive next to the CIS
+         * and the JBL party BIG (at 60 ms it timed out, 0x08). JBL One's control link:
+         * at 60 ms every Get/Set round trip (EQ, volume, ...) waited several intervals. */
+        ESP_LOGW(TAG, "LE 0x%04x is %s: interval left as the phone set it (latency %u)", s_le,
+                 jbl ? "the JBL One link" : "an LE Audio phone", s_le_lat);
+        if (jbl && s_le_lat > 0) {
+            /* peripheral latency lets the S31 sleep through events: every app command
+             * (it waits for each reply) then waits too - same interval, latency 0 */
+            int rc = gap_request_connection_parameter_update(s_le, s_le_itvl, s_le_itvl, 0, s_le_to);
+            ESP_LOGW(TAG, "LE 0x%04x: JBL One link - asking latency 0 -> %d", s_le, rc);
+        }
         return;
     }
     int rc = gap_request_connection_parameter_update(s_le, LE_ITVL_MIN, LE_ITVL_MAX, LE_LATENCY, LE_TIMEOUT);
@@ -162,13 +210,14 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
             if (s_links[i].h == HCI_CON_HANDLE_INVALID || s_links[i].h == s_acl) {
                 s_links[i].h = s_acl;
                 s_links[i].applied = 0;
+                s_links[i].had_a2dp = false;
                 break;
             }
         }
         s_pkt_types = hci_usable_acl_packet_types();
         hci_send_cmd(&hci_change_connection_packet_type, s_acl, s_pkt_types);
         poll_apply("phone connected");
-        gap_discoverable_control(0);
+        a2dp_in_refresh_discoverable();
         ESP_LOGW(TAG, "ACL 0x%04x: packet types 0x%04x (%s), inquiry scan off",
                  s_acl, s_pkt_types, pkt_types_str(s_pkt_types, buf, sizeof(buf)));
         break;
@@ -215,8 +264,8 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
             for (int i = 0; i < MAX_ACL; i++) s_links[i].applied = 0;   /* the other phone may be the audio one now */
             if (link_count() == 0) {
                 s_acl = HCI_CON_HANDLE_INVALID;
-                gap_discoverable_control(!S31_QUIET_RADIO_TEST);
-                ESP_LOGW(TAG, "ACL gone: inquiry scan back on");
+                a2dp_in_refresh_discoverable();      /* back on unless an LE Audio phone is linked */
+                ESP_LOGW(TAG, "ACL gone");
             }
         }
         if (h == s_le) {
@@ -231,6 +280,9 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
             if (gap_subevent_le_connection_complete_get_status(packet) == ERROR_CODE_SUCCESS &&
                 gap_subevent_le_connection_complete_get_role(packet) == HCI_ROLE_SLAVE) {
                 s_le = gap_subevent_le_connection_complete_get_connection_handle(packet);
+                s_le_itvl = gap_subevent_le_connection_complete_get_conn_interval(packet);
+                s_le_lat = gap_subevent_le_connection_complete_get_conn_latency(packet);
+                s_le_to = gap_subevent_le_connection_complete_get_supervision_timeout(packet);
                 ESP_LOGW(TAG, "LE 0x%04x up, interval %u.%02u ms", s_le,
                          gap_subevent_le_connection_complete_get_conn_interval(packet) * 5 / 4,
                          (gap_subevent_le_connection_complete_get_conn_interval(packet) * 125) % 100);
@@ -248,8 +300,22 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
         if (hci_event_le_meta_get_subevent_code(packet) == HCI_SUBEVENT_LE_CONNECTION_UPDATE_COMPLETE &&
             hci_subevent_le_connection_update_complete_get_connection_handle(packet) == s_le) {
             uint16_t i = hci_subevent_le_connection_update_complete_get_conn_interval(packet);
-            ESP_LOGW(TAG, "LE 0x%04x interval now %u.%02u ms (status 0x%02x)", s_le, i * 5 / 4, (i * 125) % 100,
+            uint16_t lat = hci_subevent_le_connection_update_complete_get_conn_latency(packet);
+            uint16_t to = hci_subevent_le_connection_update_complete_get_supervision_timeout(packet);
+            ESP_LOGW(TAG, "LE 0x%04x interval now %u.%02u ms, latency %u, timeout %u ms (status 0x%02x)", s_le,
+                     i * 5 / 4, (i * 125) % 100, lat, to * 10u,
                      hci_subevent_le_connection_update_complete_get_status(packet));
+            if (hci_subevent_le_connection_update_complete_get_status(packet) == ERROR_CODE_SUCCESS) {
+                s_le_itvl = i;
+                s_le_lat = lat;
+                s_le_to = to;
+            }
+            if (lat > 0 && jbl_v5_is_link(s_le)) {
+                /* JBL One link: with peripheral latency the S31 may sleep through events and
+                 * every app reply waits - ask for latency 0, same interval */
+                int rc = gap_request_connection_parameter_update(s_le, i, i, 0, to);
+                ESP_LOGW(TAG, "LE 0x%04x: JBL One on the LE Audio link - asking latency 0 -> %d", s_le, rc);
+            }
         }
         break;
     default:

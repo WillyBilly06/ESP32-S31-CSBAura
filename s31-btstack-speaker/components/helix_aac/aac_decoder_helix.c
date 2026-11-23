@@ -41,6 +41,16 @@
  * at a time). Previously a permanent static .bss array that wasted 20 KB
  * whenever any other codec was in use. */
 static uint8_t *s_helix_buffer = NULL;
+static uint8_t *s_ext_ws = NULL;                 /* caller's workspace (aac_decoder_set_workspace) */
+static unsigned s_ext_ws_size;
+
+void aac_decoder_set_workspace(void *buf, unsigned size)
+{
+    s_ext_ws = (uint8_t *)buf;
+    s_ext_ws_size = size;
+}
+
+unsigned aac_decoder_workspace_need(void) { return (unsigned)HELIX_BUFFER_SIZE; }
 static HAACDecoder s_helix_dec = NULL;
 static AACFrameInfo s_frame_info = {0};
 static bool s_initialized = false;
@@ -65,6 +75,9 @@ int aac_decoder_init(aac_decoder_t *dec)
 
     /* Lazily allocate the ~27 KB working buffer (internal RAM, 8-byte aligned
      * for the Helix struct layout). Freed in aac_decoder_deinit. */
+    if (!s_helix_buffer && s_ext_ws != NULL && s_ext_ws_size >= HELIX_BUFFER_SIZE) {
+        s_helix_buffer = s_ext_ws;              /* static SRAM: never the slow RTC RAM heap */
+    }
     if (!s_helix_buffer) {
         s_helix_buffer = (uint8_t *)heap_caps_aligned_alloc(
             8, HELIX_BUFFER_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);

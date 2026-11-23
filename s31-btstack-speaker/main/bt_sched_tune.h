@@ -66,6 +66,11 @@ void bt_sched_tune_set_mode(bt_sched_mode_t mode);
 /* A/B testing: explicit ACL base / BIS first / repetition / pre-tx priorities. */
 void bt_sched_tune_apply_custom(uint8_t acl, uint8_t first, uint8_t rep, uint8_t pto, const char *why);
 
+/* The phone streams to us over LE Audio (CIS): the CIS goes above every BIS copy
+ * (it has no spare copies, the BIS has IRC 4) and the BIS first copies come down to
+ * 13 so the LE links can win their slots too. Off: CIS 14, BIS first 15. */
+void bt_sched_tune_le_input(bool on);
+
 #ifdef __cplusplus
 }
 #endif

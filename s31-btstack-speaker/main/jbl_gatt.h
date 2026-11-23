@@ -29,6 +29,9 @@ uint16_t jbl_gatt_v5_notify_handle(void);
 /* ATT MTU of a connection, 0 if it has no ATT bearer. */
 uint16_t jbl_gatt_mtu(hci_con_handle_t con);
 
+/* value handle of an LE Audio attribute (le_audio_attr_t) */
+uint16_t jbl_gatt_le_audio_handle(int attr);
+
 /* Free queue bytes; a notification of n bytes needs n + JBL_GATT_TX_OVERHEAD. */
 uint32_t jbl_gatt_tx_free(void);
 

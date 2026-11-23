@@ -45,6 +45,7 @@
 #include "jbl_beacon.h"
 #include "hci_transport_s31_vhci.h"
 #include "jbl_gatt.h"
+#include "le_audio.h"
 #include "jbl_v5.h"
 #include "party.h"
 #include "tones.h"
@@ -276,6 +277,17 @@ static const uint8_t s_std_type[7] = { 0, 1, 1, 1, 1, 1, 2 };
 static const float s_std_f[7] = { 125, 250, 500, 1000, 2000, 4000, 8000 };
 static const float s_std_q[7] = { 0.707f, 2, 2, 2, 2, 2, 0.707f };
 static eq_canon_t s_eqc;
+
+/* an EQ slider drag sends a Set every ~100 ms: log at most one per second (the UART
+ * time is BT-thread time, and every Set is a round trip the app waits on) */
+static bool eq_log_ok(void)
+{
+    static uint32_t last_ms;
+    uint32_t now = btstack_run_loop_get_time_ms();
+    if (last_ms != 0 && now - last_ms < 1000) return false;
+    last_ms = now;
+    return true;
+}
 static hci_con_handle_t s_cur_con = HCI_CON_HANDLE_INVALID;   /* link the current reply goes to */
 static hci_con_handle_t s_ios_con = HCI_CON_HANDLE_INVALID;   /* link of the iOS app */
 
@@ -439,10 +451,13 @@ static bool eq_info_apply(const uint8_t *v, uint16_t n)
         cfg.eq_be = bands_be;
         s_cfg_dirty = true;
     }
-    ESP_LOGW(TAG, "EQ (EqInfo, header %s, bands %s): category 0x%02x%s%s%s (%s)", hdr_be ? "BE" : "LE",
-             be_seen ? (le_seen ? "mixed" : "BE") : "LE", c.cat, c.name[0] ? " '" : "", c.name,
-             c.name[0] ? "'" : "", v5_eq_is_on() ? "applied to audio" : "flat");
-    ESP_LOGW(TAG, "EQ bands:%s", dbg);
+    if (eq_log_ok()) {
+        ESP_LOGW(TAG, "EQ (EqInfo, header %s, bands %s): category 0x%02x%s%s%s (%s) | %lu sets",
+                 hdr_be ? "BE" : "LE", be_seen ? (le_seen ? "mixed" : "BE") : "LE", c.cat,
+                 c.name[0] ? " '" : "", c.name, c.name[0] ? "'" : "",
+                 v5_eq_is_on() ? "applied to audio" : "flat", (unsigned long)(s_eq_sets + 1));
+        ESP_LOGW(TAG, "EQ bands:%s", dbg);
+    }
     return true;
 }
 
@@ -564,7 +579,7 @@ static bool feat_value(uint16_t id, uint8_t *v, uint16_t *n)
     case 0x2C80: v[0] = cfg.lls ? 0x01 : 0x00; *n = 1; return true;            /* stereo link */
     case 0x2C81: memcpy(v, cfg.partner, 6); *n = 6; return true;
     /* lights (stored for the WS2812B effects) */
-    case 0x0D00: v[0] = cfg.light_status; *n = 1; return true;
+    case 0x0D00: v[0] = cfg.light_status & 0xCF; *n = 1; return true;     /* never "syncing" */
     case 0x0D40: v[0] = cfg.light_show; *n = 1; return true;
     case 0x0D41: v[0] = cfg.light_bright; *n = 1; return true;
     case 0x0D42: v[0] = cfg.light_temp; *n = 1; return true;
@@ -1054,6 +1069,9 @@ static void handle_set(hci_con_handle_t con, const uint8_t *pl, uint16_t len)
 {
     s_cur_con = con;
     static const uint8_t ok[2] = { 0, 0 };
+    /* JBL One sends one command at a time and waits for this reply: send it before the
+     * work, so a slider drag (an EQ Set every few connection events) is not slowed down */
+    send_frame(con, 2, ok, sizeof(ok));               /* every Set gets "00 00" */
     bool eq_query = false, eq_changed = false, cfg_changed = false, renamed = false, reset = false;
     uint16_t post[12];                                /* notify these after the "00 00" reply */
     int npost = 0;
@@ -1102,9 +1120,11 @@ static void handle_set(hci_con_handle_t con, const uint8_t *pl, uint16_t len)
                 eq_changed = true;
                 s_eq_sets++;
                 eqc_from_portable();
-                ESP_LOGW(TAG, "EQ set: category 0x%02x, bands %d %d %d %d %d %d %d (%s)",
-                         s_eq[0], s_eq[1], s_eq[2], s_eq[3], s_eq[4], s_eq[5], s_eq[6], s_eq[7],
-                         v5_eq_is_on() ? "applied to audio" : "flat");
+                if (eq_log_ok()) {
+                    ESP_LOGW(TAG, "EQ set: category 0x%02x, bands %d %d %d %d %d %d %d (%s)",
+                             s_eq[0], s_eq[1], s_eq[2], s_eq[3], s_eq[4], s_eq[5], s_eq[6], s_eq[7],
+                             v5_eq_is_on() ? "applied to audio" : "flat");
+                }
             }
             break;
         /* settings */
@@ -1136,10 +1156,16 @@ static void handle_set(hci_con_handle_t con, const uint8_t *pl, uint16_t len)
         case 0x0056: if (n) cfg.remote_power = v[0]; break;
         case 0x0BA0:
             if (n) {
+                bool was = (cfg.le_audio & 0x80) != 0, on = (v[0] & 0x80) != 0;
                 cfg.le_audio = v[0];
-                ESP_LOGW(TAG, "app LE Audio %s - stored (no LE Audio unicast receiver on the S31 yet)",
-                         (v[0] & 0x80) ? "ON" : "OFF");
+                ESP_LOGW(TAG, "app LE Audio %s", on ? "ON" : "OFF");
+                le_audio_set_enabled(on);
                 POST(0x0BA0);
+                if (on && !was) {
+                    /* as the Xtreme 5: LE Audio switched on -> pairing mode, so the phone
+                     * can pair again and pick up the LE Audio bond (CTKD) */
+                    a2dp_in_button(A2DP_BTN_PAIRING);
+                }
             }
             break;
         case 0x2009: if (n) cfg.bass_boost = v[0]; break;
@@ -1154,7 +1180,7 @@ static void handle_set(hci_con_handle_t con, const uint8_t *pl, uint16_t len)
         case 0x2007: if (n) cfg.mood = v[0]; break;
         case 0x200B: if (n) cfg.vocal_removal = v[0]; break;
         case 0x30C2: if (n >= 4) memcpy(&cfg.pitch, v, 4); break;
-        case 0x0D00: if (n) cfg.light_status = v[0]; POST(0x0D00); break;
+        case 0x0D00: if (n && v[0] != 0x1F) cfg.light_status = v[0] & 0xCF; POST(0x0D00); break;
         case 0x0D40: if (n) cfg.light_show = v[0]; POST(0x0D40); break;
         case 0x0D41: if (n) cfg.light_bright = v[0]; POST(0x0D41); break;
         case 0x0D42: if (n) cfg.light_temp = v[0]; POST(0x0D42); break;
@@ -1305,11 +1331,12 @@ static void handle_set(hci_con_handle_t con, const uint8_t *pl, uint16_t len)
             int hl = 0;
             h[0] = 0;
             for (uint16_t k = 0; k < n && k < 12; k++) hl += snprintf(h + hl, sizeof(h) - (size_t)hl, "%02x ", v[k]);
-            ESP_LOGI(TAG, "app Set 0x%04x (%u B): %s%s", id, n, h, n > 12 ? "..." : "");
+            if (id != 0x0E02 && id != 0x0E7F) {         /* EQ: its own (rate-limited) log */
+                ESP_LOGI(TAG, "app Set 0x%04x (%u B): %s%s", id, n, h, n > 12 ? "..." : "");
+            }
         }
         i += 4 + n;
     }
-    send_frame(con, 2, ok, sizeof(ok));               /* every Set gets "00 00" */
     if (eq_query) {
         /* both forms, EqInfo first (it must be the frame's first record). Not after a
          * Set: the app knows what it sent, and a reply in the wrong header order
@@ -1455,6 +1482,8 @@ void jbl_v5_link_up(hci_con_handle_t con)
     ESP_LOGW(TAG, "JBL One control link up (con 0x%04x, MTU %u)", con, jbl_gatt_mtu(con));
 }
 
+bool jbl_v5_is_link(hci_con_handle_t con) { return s_linked && con == s_link; }
+
 void jbl_v5_link_down(hci_con_handle_t con)
 {
     if (s_linked && con == s_link) {
@@ -1550,6 +1579,7 @@ void jbl_v5_setup(void)
 {
     cfg_load();
     eq_restore();
+    le_audio_set_enabled((cfg.le_audio & 0x80) != 0);   /* advertised once HCI is up */
     ESP_LOGW(TAG, "V5 server: name '%s', firmware %u.%u.%u", cfg.name, cfg.fw[0], cfg.fw[1], cfg.fw[2]);
     btstack_run_loop_set_timer_handler(&s_idle_timer, &idle_tick);
     btstack_run_loop_set_timer(&s_idle_timer, 1000);

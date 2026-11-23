@@ -15,7 +15,9 @@
 #include "freertos/task.h"
 
 #include "jbl.h"
+#include "a2dp_in.h"
 #include "jbl_assist.h"
+#include "le_audio.h"
 #include "jbl_beacon.h"
 #include "jbl_gatt.h"
 #include "jbl_util.h"
@@ -104,11 +106,27 @@ static void sm_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, u
     case SM_EVENT_NUMERIC_COMPARISON_REQUEST:
         sm_numeric_comparison_confirm(sm_event_numeric_comparison_request_get_handle(packet));
         break;
-    case SM_EVENT_PAIRING_COMPLETE:
-        ESP_LOGI(TAG, "LE pairing con 0x%04x: status 0x%02x, reason 0x%02x",
-                 sm_event_pairing_complete_get_handle(packet), sm_event_pairing_complete_get_status(packet),
+    case SM_EVENT_PAIRING_COMPLETE: {
+        hci_con_handle_t con = sm_event_pairing_complete_get_handle(packet);
+        uint8_t st = sm_event_pairing_complete_get_status(packet);
+        ESP_LOGI(TAG, "LE pairing con 0x%04x: status 0x%02x, reason 0x%02x", con, st,
                  sm_event_pairing_complete_get_reason(packet));
+        if (st != ERROR_CODE_SUCCESS || jbl_assist_is_link(con)) break;   /* not our own speaker links */
+        le_audio_note_pairing(con);
+        /* the phone's identity address (public = its classic address) */
+        bd_addr_t id;
+        int type = -1;
+        int idx = sm_le_device_index(con);
+        if (idx >= 0) le_device_db_info(idx, &type, id, NULL);
+        if (type != BD_ADDR_TYPE_LE_PUBLIC) {
+            sm_event_pairing_complete_get_address(packet, id);
+            type = sm_event_pairing_complete_get_addr_type(packet);
+        }
+        if (type == BD_ADDR_TYPE_LE_PUBLIC) {
+            a2dp_in_call_after_le_pairing(id);
+        }
         break;
+    }
     default:
         break;
     }
@@ -242,6 +260,16 @@ void jbl_set_phone_name(const char *name)
     }
     s_name_word = nw;
     jbl_run_on_bt(&s_apply_reg);
+}
+
+bool jbl_request_phone_name(const bd_addr_t addr)
+{
+    if (s_name_req_active) {
+        return false;                             /* one at a time (BTstack: one pending) */
+    }
+    bd_addr_copy(s_name_req_addr, addr);
+    s_name_req_active = gap_remote_name_request(s_name_req_addr, 0x01 /* R1 */, 0) == ERROR_CODE_SUCCESS;
+    return s_name_req_active;
 }
 
 uint16_t jbl_mac_crc(void)

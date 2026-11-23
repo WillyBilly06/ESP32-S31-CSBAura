@@ -28,6 +28,7 @@
 #include "jbl_gatt.h"
 #include "jbl_gatt_db.h"
 #include "jbl_v5.h"
+#include "le_audio.h"
 #include "hci_transport_s31_vhci.h"
 
 static const char *TAG = "JBL_GATT";
@@ -293,6 +294,37 @@ uint16_t jbl_gatt_mtu(hci_con_handle_t con)
     return att_server_get_mtu(con);
 }
 
+/* ---- LE Audio attributes (served by le_audio.c) ------------------------------------ */
+#define LA_H(x) ATT_CHARACTERISTIC_ORG_BLUETOOTH_CHARACTERISTIC_##x##_01_VALUE_HANDLE
+#define LA_C(x) ATT_CHARACTERISTIC_ORG_BLUETOOTH_CHARACTERISTIC_##x##_01_CLIENT_CONFIGURATION_HANDLE
+static const uint16_t s_la_val[LA_N] = {
+    [LA_PAC] = LA_H(SINK_PAC), [LA_LOC] = LA_H(SINK_AUDIO_LOCATIONS),
+    [LA_AVAIL] = LA_H(AVAILABLE_AUDIO_CONTEXTS), [LA_SUPP] = LA_H(SUPPORTED_AUDIO_CONTEXTS),
+    [LA_ASE] = LA_H(SINK_ASE), [LA_ASE_CP] = LA_H(ASE_CONTROL_POINT),
+    [LA_VOL_STATE] = LA_H(VOLUME_STATE), [LA_VOL_CP] = LA_H(VOLUME_CONTROL_POINT),
+    [LA_VOL_FLAGS] = LA_H(VOLUME_FLAGS), [LA_TMAP] = LA_H(TMAP_ROLE),
+};
+static const uint16_t s_la_ccc[LA_N] = {
+    [LA_PAC] = LA_C(SINK_PAC), [LA_LOC] = LA_C(SINK_AUDIO_LOCATIONS),
+    [LA_AVAIL] = LA_C(AVAILABLE_AUDIO_CONTEXTS), [LA_SUPP] = LA_C(SUPPORTED_AUDIO_CONTEXTS),
+    [LA_ASE] = LA_C(SINK_ASE), [LA_ASE_CP] = LA_C(ASE_CONTROL_POINT),
+    [LA_VOL_STATE] = LA_C(VOLUME_STATE), [LA_VOL_FLAGS] = LA_C(VOLUME_FLAGS),
+};
+
+static int la_find(uint16_t handle, bool *ccc)
+{
+    for (int a = 0; a < LA_N; a++) {
+        if (s_la_val[a] == handle) { *ccc = false; return a; }
+        if (s_la_ccc[a] != 0 && s_la_ccc[a] == handle) { *ccc = true; return a; }
+    }
+    return -1;
+}
+
+uint16_t jbl_gatt_le_audio_handle(int attr)
+{
+    return (attr >= 0 && attr < LA_N) ? s_la_val[attr] : 0;
+}
+
 /* ---- ATT callbacks ------------------------------------------------------------- */
 
 static uint16_t att_read_cb(hci_con_handle_t con, uint16_t handle, uint16_t offset, uint8_t *buffer, uint16_t size)
@@ -328,6 +360,11 @@ static uint16_t att_read_cb(hci_con_handle_t con, uint16_t handle, uint16_t offs
         link_t *l = link_find(con);
         return att_read_callback_handle_little_endian_16(l ? l->cccd[ci] : 0, offset, buffer, size);
     }
+    bool la_ccc;
+    int la = la_find(handle, &la_ccc);
+    if (la >= 0) {
+        return le_audio_att_read(con, (le_audio_attr_t)la, la_ccc, offset, buffer, size);
+    }
     return 0;
 }
 
@@ -355,6 +392,7 @@ static int att_write_cb(hci_con_handle_t con, uint16_t handle, uint16_t mode, ui
             s_rx_prep_frames++;
             uint16_t n = s_prep_len;
             prep_reset();
+            if (!jbl_v5_is_link(con)) jbl_v5_link_up(con);
             jbl_v5_on_write(con, s_prep, n);
         } else if (con == s_prep_con) {
             prep_reset();
@@ -370,7 +408,15 @@ static int att_write_cb(hci_con_handle_t con, uint16_t handle, uint16_t mode, ui
     }
 
     s_rx_writes++;
+    {
+        bool la_ccc;
+        int la = la_find(handle, &la_ccc);
+        if (la >= 0) {
+            return le_audio_att_write(con, (le_audio_attr_t)la, la_ccc, buf, len);
+        }
+    }
     if (handle == H_COM_WR) {
+        if (!jbl_v5_is_link(con)) jbl_v5_link_up(con);
         s_rx_v5++;
         jbl_v5_on_write(con, buf, len);         /* JBL One command channel */
         return 0;
@@ -383,6 +429,9 @@ static int att_write_cb(hci_con_handle_t con, uint16_t handle, uint16_t mode, ui
         }
         if (l != NULL && len >= 2) {
             l->cccd[ci] = little_endian_read_16(buf, 0);
+        }
+        if (ci == CCCD_COM && len >= 2 && (buf[0] & 1) && !jbl_v5_is_link(con)) {
+            jbl_v5_link_up(con);                /* JBL One subscribed on this link */
         }
     }
     log_write(handle, buf, len);
@@ -411,7 +460,12 @@ static void att_event_handler(uint8_t packet_type, uint16_t channel, uint8_t *pa
         }
         ESP_LOGW(TAG, ">>> GATT CONNECT from %s over %s (con 0x%04x, MTU %u)", bd_addr_to_str(a),
                  classic ? "BR/EDR" : "LE", con, att_server_get_mtu(con));
-        jbl_v5_link_up(con);
+        if (classic) {
+            jbl_v5_link_up(con);                /* JBL One (Android + iOS) talks V5 over BR/EDR GATT */
+        }
+        /* LE: also an LE Audio phone's link - marking it as the app link set the
+         * beacon's "app connected" bit and JBL One then stayed away. It becomes the
+         * app link when JBL One subscribes to / writes the V5 channel. */
         break;
     }
     case ATT_EVENT_DISCONNECTED: {

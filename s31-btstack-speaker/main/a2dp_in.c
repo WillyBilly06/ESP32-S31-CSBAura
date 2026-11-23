@@ -12,6 +12,8 @@
  * media packet), SBC bitpool pinned at 53.
  */
 #include "a2dp_in.h"
+#include "le_audio.h"
+#include "link_tune.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -48,7 +50,11 @@ static const char *TAG = "A2DP";
  * late packets and stretches ~3 % below realtime on top: 130 ms ran dry a few
  * times a minute, and every underrun costs a re-prime (silence) + a splice.
  * The delay report tells the phone (video lip sync). */
-#define TARGET_MS       180
+#define A2DP_TARGET_MS  180
+/* LE Audio: SDUs come on the controller's fixed ISO schedule, no phone bursts -
+ * one ISO interval + 20 ms is enough (set per stream, a2dp_in_ext_start) */
+static volatile uint32_t s_target_ms = A2DP_TARGET_MS;
+#define TARGET_MS       (s_target_ms)
 #define PRIME_MS        TARGET_MS             /* start output at the target fill: no start-up underruns / integrator wind-up */
 #define MS_FRAMES(ms)   ((OUT_RATE / 1000) * (ms))
 
@@ -64,6 +70,9 @@ static uint8_t s_aac_caps[6] = { 0xC0, 0x01, 0x8C, 0x84, 0xE2, 0x00 };
 static uint8_t s_aac_cfg[6];
 static uint8_t s_sbc_seid, s_aac_seid;
 enum { CODEC_SBC = 0, CODEC_AAC = 1 };
+static volatile bool s_ext_on;                       /* LE Audio feeds the pipeline */
+static a2dp_in_ext_decode_t s_ext_dec;
+static const char *s_ext_what = "";
 static volatile uint8_t s_codec = CODEC_SBC;           /* configured by the phone */
 static uint8_t s_sdp_a2dp[150];
 static uint8_t s_sdp_avrcp_ct[200];
@@ -181,6 +190,52 @@ static int16_t s_aac_pcm[2 * 1024];
 static int16_t s_aac_st[2 * 1024];
 static volatile uint32_t s_aac_frames, s_aac_errs;
 
+/* the decoder workspace: AAC (Helix ~20.7 KB) or 2 x LC3 decoder (~18 KB), static in
+ * main SRAM. Heap copies landed in the slow RTC RAM once internal RAM ran low and the
+ * decoder then ran 10-15x slower (stutter, then the task watchdog). */
+#define CODEC_WS_SIZE (24 * 1024)
+static uint8_t s_codec_ws[CODEC_WS_SIZE] __attribute__((aligned(16)));
+static int s_ws_owner;
+
+void *a2dp_in_codec_ws(unsigned *size)
+{
+    if (size) *size = sizeof(s_codec_ws);
+    return s_codec_ws;
+}
+
+bool a2dp_in_codec_ws_take(int owner)
+{
+    if (s_ws_owner == owner) return true;
+    s_ws_owner = owner;
+    return false;
+}
+
+/* probes: is the core slow, or the memory? (logged with the decode times) */
+static uint32_t probe_loop_us(void)
+{
+    int64_t t0 = esp_timer_get_time();
+    volatile uint32_t acc = 1;
+    for (uint32_t k = 0; k < 20000; k++) acc = acc * 1664525u + 1013904223u;
+    return (uint32_t)(esp_timer_get_time() - t0);
+}
+
+static uint32_t probe_mem_us(const void *p, unsigned bytes)
+{
+    int64_t t0 = esp_timer_get_time();
+    uint32_t sum = 0;
+    const volatile uint32_t *w = (const volatile uint32_t *)p;
+    for (int r = 0; r < 4; r++) for (unsigned k = 0; k < bytes / 4; k += 8) sum += w[k];
+    (void)sum;
+    return (uint32_t)(esp_timer_get_time() - t0);
+}
+
+void a2dp_in_probe_log(const char *what)
+{
+    ESP_LOGI(TAG, "%s probes: loop %lu us, workspace %lu us (ws at %p) | internal free %u B", what,
+             (unsigned long)probe_loop_us(), (unsigned long)probe_mem_us(s_codec_ws, sizeof(s_codec_ws)),
+             (void *)s_codec_ws, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+}
+
 static void aac_reset(void)
 {
     latm_parser_reset(&s_latm);
@@ -193,6 +248,7 @@ static void aac_reset(void)
 /* RTP header, then one LATM AudioMuxElement (StreamMuxConfig in band) */
 static void aac_decode_packet(const uint8_t *d, int len)
 {
+    if (!a2dp_in_codec_ws_take(1)) aac_reset();          /* LE Audio had the workspace */
     if (!s_aac_ready || len < 13) return;
     int pos = 12 + 4 * (d[0] & 0x0f);
     if (pos >= len) return;
@@ -211,7 +267,21 @@ static void aac_decode_packet(const uint8_t *d, int len)
                  (unsigned long)ac->sample_rate, ac->channel_config);
     }
     int n = 0;
-    if (aac_decoder_decode(&s_aac, s_aac_raw, (int)raw, s_aac_pcm, &n) != AAC_OK || n <= 0) {
+    int64_t t0 = esp_timer_get_time();
+    int ar = (int)aac_decoder_decode(&s_aac, s_aac_raw, (int)raw, s_aac_pcm, &n);
+    uint32_t us = (uint32_t)(esp_timer_get_time() - t0);
+    static uint32_t us_sum, us_max, us_n;
+    us_sum += us; us_n++;
+    if (us > us_max) us_max = us;
+    if (us_n == 430) {                                  /* ~10 s at 44.1 kHz */
+        ESP_LOGI(TAG, "AAC decode: avg %lu us, max %lu us per frame (%lu B in, budget %lu us) | errs %lu",
+                 (unsigned long)(us_sum / us_n), (unsigned long)us_max, (unsigned long)raw,
+                 (unsigned long)(1024u * 1000000u / (ac->sample_rate ? ac->sample_rate : 44100u)),
+                 (unsigned long)s_aac_errs);
+        a2dp_in_probe_log("AAC");
+        us_sum = us_max = us_n = 0;
+    }
+    if (ar != AAC_OK || n <= 0) {
         s_aac_errs++;
         return;
     }
@@ -229,7 +299,21 @@ static void dsp_task(void *arg)
 {
     (void)arg;
     static pkt_t p;
+    int64_t busy_since = 0;
     for (;;) {
+        /* any codec: never hold the core for long - after 50 ms of back-to-back
+         * decoding, give it up for a tick (the idle task / watchdog, other tasks) */
+        if (uxQueueMessagesWaiting(s_pkt_q) == 0) {
+            busy_since = 0;                        /* about to block: not busy */
+        } else {
+            int64_t now = esp_timer_get_time();
+            if (busy_since == 0) {
+                busy_since = now;
+            } else if (now - busy_since > 50000) {
+                vTaskDelay(1);
+                busy_since = 0;
+            }
+        }
         if (xQueueReceive(s_pkt_q, &p, portMAX_DELAY) != pdTRUE) {
             continue;
         }
@@ -243,7 +327,11 @@ static void dsp_task(void *arg)
             s_primed = false;
             s_reset_deficit = true;
             s_sbc->configure(&s_sbc_ctx, SBC_MODE_STANDARD, on_pcm, NULL);
-            if (s_codec == CODEC_AAC) aac_reset();
+            if (s_codec == CODEC_AAC && !s_ext_on) aac_reset();
+        }
+        if (s_ext_on) {
+            if (s_ext_dec) s_ext_dec(p.data, p.len);
+            continue;
         }
         if (s_codec == CODEC_AAC) {
             aac_decode_packet(p.data, p.len);
@@ -285,8 +373,8 @@ static void media_handler(uint8_t seid, uint8_t *packet, uint16_t size)
     static uint16_t last_seq;
     static uint32_t last_rtp;
     static bool have_seq;
-    if (size < 13 || size > PKT_MAX) {
-        return;
+    if (size < 13 || size > PKT_MAX || s_ext_on) {
+        return;                                    /* LE Audio owns the pipeline meanwhile */
     }
     uint16_t seq = big_endian_read_16(packet, 2);
     uint32_t rtp = big_endian_read_32(packet, 4);
@@ -485,6 +573,8 @@ static bool catch_up(int16_t *pcm, int n, bool excess)
 }
 
 /* ---- encoder side --------------------------------------------------------------- */
+static void ext_target_follow(void);
+
 int a2dp_in_read(int16_t *pcm, int n)
 {
 #if S31_TEST_SIGNAL
@@ -494,6 +584,7 @@ int a2dp_in_read(int16_t *pcm, int n)
     test_fill(pcm, n);
     return n;
 #endif
+    ext_target_follow();
     if (s_flush_req) {
         s_flush_req = false;
         ring_skip(&s_ring, ring_fill(&s_ring));
@@ -538,11 +629,11 @@ int a2dp_in_read(int16_t *pcm, int n)
          * link's controller priority (base 2 -> 9: with missed-poll escalation it
          * beats the BIS repetitions (12) after ~30 ms instead of ~100 ms) */
         static bool boosted;
-        if (!boosted && f < (float)MS_FRAMES(TARGET_MS - 60) && s_streaming) {
+        if (!boosted && !s_ext_on && f < (float)(OUT_RATE / 1000) * ((float)TARGET_MS - 60.0f) && s_streaming) {
             boosted = true;
             s_acl_boosts++;
             bt_sched_tune_apply_custom(9, 15, 12, 11, "A2DP cushion low: phone link boosted");
-        } else if (boosted && (f > (float)MS_FRAMES(TARGET_MS - 20) || !s_streaming)) {
+        } else if (boosted && (f > (float)(OUT_RATE / 1000) * ((float)TARGET_MS - 20.0f) || !s_streaming || s_ext_on)) {
             boosted = false;
             bt_sched_tune_apply_custom(2, 15, 12, 11, "A2DP cushion back: BIS copies first");
         }
@@ -640,6 +731,84 @@ int a2dp_in_read(int16_t *pcm, int n)
 }
 
 bool a2dp_in_streaming(void) { return s_streaming; }
+
+/* LE Audio: the base buffer, plus one more broadcast interval while we host (the
+ * encoder pulls ISO-interval bursts) - follows Auracast going on / off mid-stream */
+static volatile uint32_t s_ext_base_ms;
+
+static void ext_target_follow(void)
+{
+    if (!s_ext_on) return;
+    uint32_t t = s_ext_base_ms + (auracast_state() != AURACAST_STATE_OFF ? 30u : 0u);
+    if (t > A2DP_TARGET_MS) t = A2DP_TARGET_MS;
+    if (t != s_target_ms) {
+        ESP_LOGW(TAG, "%s buffer %lu -> %lu ms (broadcast %s)", s_ext_what, (unsigned long)s_target_ms,
+                 (unsigned long)t, auracast_state() != AURACAST_STATE_OFF ? "on" : "off");
+        s_target_ms = t;
+    }
+}
+
+void a2dp_in_ext_start(a2dp_in_ext_decode_t decode, const char *what, uint32_t target_ms)
+{
+    s_ext_dec = decode;
+    s_target_ms = target_ms < 30 ? 30 : target_ms > A2DP_TARGET_MS ? A2DP_TARGET_MS : target_ms;
+    s_ext_base_ms = s_target_ms;
+    if (auracast_state() != AURACAST_STATE_OFF && s_target_ms + 30u <= A2DP_TARGET_MS) s_target_ms += 30u;
+    s_ext_what = what ? what : "";
+    xQueueReset(s_pkt_q);
+    s_last_arrival = 0;
+    s_reset_dsp = true;
+    s_ext_on = true;
+    s_streaming = true;
+    bt_sched_tune_le_input(true);
+    ESP_LOGW(TAG, "audio source: %s (phone A2DP set aside), buffer %lu ms", s_ext_what, (unsigned long)s_target_ms);
+}
+
+void a2dp_in_ext_stop(void)
+{
+    if (!s_ext_on) return;
+    s_ext_on = false;
+    s_streaming = false;
+    bt_sched_tune_le_input(false);
+    s_target_ms = A2DP_TARGET_MS;
+    xQueueReset(s_pkt_q);
+    s_reset_dsp = true;
+    s_flush_req = true;
+    ESP_LOGW(TAG, "audio source: %s ended", s_ext_what);
+}
+
+bool a2dp_in_ext_active(void) { return s_ext_on; }
+
+void a2dp_in_ext_push(const uint8_t *data, uint16_t len)
+{
+    if (!s_ext_on || len > PKT_MAX) return;
+    static pkt_t p;
+    p.len = len;
+    if (len) memcpy(p.data, data, len);
+    int64_t now = esp_timer_get_time();
+    s_last_arrival = now;
+    s_last_media_us = now;
+    s_pkts++;
+    s_frames++;
+    if (xQueueSend(s_pkt_q, &p, 0) != pdTRUE) {
+        s_pkt_drops++;
+    }
+}
+
+void a2dp_in_ext_pcm(int16_t *lr, int frames, int rate)
+{
+    int64_t t0 = esp_timer_get_time();
+    on_pcm(lr, frames, 2, rate, NULL);
+    static uint32_t us_sum, us_max, n;
+    uint32_t us = (uint32_t)(esp_timer_get_time() - t0);
+    us_sum += us; n++;
+    if (us > us_max) us_max = us;
+    if (n == 1000) {
+        ESP_LOGI(TAG, "ext PCM path (resample + ring): avg %lu us, max %lu us per %d frames",
+                 (unsigned long)(us_sum / n), (unsigned long)us_max, frames);
+        us_sum = us_max = n = 0;
+    }
+}
 bool a2dp_in_connected(void) { return s_connected; }
 static hci_con_handle_t s_a2dp_con = HCI_CON_HANDLE_INVALID;
 uint16_t a2dp_in_con_handle(void) { return s_connected ? s_a2dp_con : HCI_CON_HANDLE_INVALID; }
@@ -840,19 +1009,95 @@ static void avrcp_connect_cb(btstack_timer_source_t *ts)
     btstack_run_loop_add_timer(ts);
 }
 
+static bool s_play_after_connect;
+
+void a2dp_in_avrcp_play_after_switch(void)
+{
+    if (s_avrcp_cid != 0) {
+        uint8_t st = avrcp_controller_play(s_avrcp_cid);
+        ESP_LOGW(TAG, "AVRCP Play to the phone (now on LE Audio) -> 0x%02x", st);
+        return;
+    }
+    bd_addr_t none = { 0 };
+    if (memcmp(s_peer, none, 6) == 0) return;
+    uint16_t cid = 0;
+    uint8_t st = avrcp_connect(s_peer, &cid);
+    s_play_after_connect = st == ERROR_CODE_SUCCESS;
+    ESP_LOGW(TAG, "AVRCP Play for the phone on LE Audio: opening AVRCP to %s first -> 0x%02x",
+             bd_addr_to_str(s_peer), st);
+}
+
 /* ---- buttons (posted to the BT thread) ---------------------------------------- */
 static volatile uint32_t s_btn_pending;          /* bit per a2dp_btn_t */
 static btstack_context_callback_registration_t s_btn_reg;
 static btstack_timer_source_t s_pair_timer;
 static bool s_pairing;
+static bool s_new_bond;                          /* a phone bonded in this pairing mode */
+static btstack_timer_source_t s_pair_call_timer;
+static bd_addr_t s_pair_call_addr;
+static uint8_t s_pair_call_tries;
+static bool s_pair_call_active;                  /* our A2DP connect after an LE pairing is in flight */
+static bool s_pair_incoming;                     /* the phone's own classic connect reached us */
+
+bool a2dp_in_pairing(void) { return s_pairing; }
+
+void a2dp_in_refresh_discoverable(void)
+{
+    bool linked = link_tune_classic_links() > 0 || le_audio_phone_linked();
+    /* only in pairing mode (button, JBL One LE Audio on, or a speaker with no phone
+     * paired yet); bonded phones reconnect by page scan / the LE Audio advert */
+    bool disc = !S31_QUIET_RADIO_TEST && s_pairing;
+    static int last = -1;
+    gap_discoverable_control(disc);
+    le_audio_set_discoverable(disc);
+    /* page scan: wide while nothing is linked (fast reconnect); short while an LE Audio
+     * phone is linked - 22.5 ms windows ate its connection events and its CIS setup
+     * took 2 s - still enough for it to page back for A2DP */
+    static int last_ps = -1;
+    int ps = le_audio_phone_linked() ? 1 : 0;
+    if (ps != last_ps) {
+        last_ps = ps;
+        if (ps) gap_set_page_scan_activity(0x0200, 0x0012);
+        else gap_set_page_scan_activity(0x0100, 0x0024);
+    }
+    if (last != (int)disc) {
+        ESP_LOGW(TAG, "discoverable %s (%s)", disc ? "ON" : "off",
+                 s_pairing ? "pairing mode" : linked ? "a phone is linked" : "not in pairing mode");
+        last = disc;
+    }
+}
+
+static void pairing_stop(const char *why)
+{
+    btstack_run_loop_remove_timer(&s_pair_timer);
+    s_pairing = false;
+    s_new_bond = false;
+    a2dp_in_refresh_discoverable();
+    gap_connectable_control(!S31_QUIET_RADIO_TEST && !s_streaming);
+    ESP_LOGW(TAG, "pairing mode ended (%s)", why);
+}
 
 static void pairing_end(btstack_timer_source_t *ts)
 {
     (void)ts;
-    s_pairing = false;
-    gap_discoverable_control(!S31_QUIET_RADIO_TEST);
-    gap_connectable_control(!S31_QUIET_RADIO_TEST && !s_streaming);
-    ESP_LOGW(TAG, "pairing mode ended");
+    /* a phone that is still pairing / connecting keeps it open: until it is done */
+    if (s_new_bond || link_tune_classic_links() > 0 || le_audio_phone_linked()) {
+        static uint8_t ext;
+        if (++ext <= 6) {
+            ESP_LOGW(TAG, "pairing mode: a phone is still connecting - 30 s more");
+            btstack_run_loop_set_timer(&s_pair_timer, 30000);
+            btstack_run_loop_add_timer(&s_pair_timer);
+            return;
+        }
+        ext = 0;
+    }
+    pairing_stop("3 min");
+}
+
+void a2dp_in_pairing_done(const char *why)
+{
+    if (!s_pairing || !s_new_bond) return;        /* a bonded phone reconnecting: keep pairing */
+    pairing_stop(why);
 }
 
 static void btn_run(void *ctx)
@@ -885,7 +1130,7 @@ static void btn_run(void *ctx)
     }
     if (b & (1u << A2DP_BTN_PAIRING)) {
         s_pairing = true;
-        gap_discoverable_control(1);
+        a2dp_in_refresh_discoverable();
         gap_connectable_control(1);
         btstack_run_loop_remove_timer(&s_pair_timer);
         btstack_run_loop_set_timer_handler(&s_pair_timer, pairing_end);
@@ -897,6 +1142,36 @@ static void btn_run(void *ctx)
 }
 
 /* ---- JBL One: volume / mute / transport / track info (BT thread) ---------------- */
+static volatile uint32_t s_cnt_tone_ms;            /* A2DP "connected" tone */
+static bool s_conn_toned;                        /* played for this A2DP connection */
+static bool s_play_at_release;                   /* A2DP was playing when it went away */
+static uint32_t s_stream_stop_ms;                /* the A2DP stream last stopped / suspended */
+static btstack_timer_source_t s_drop_timer;
+static hci_con_handle_t s_drop_con = HCI_CON_HANDLE_INVALID;
+
+static void drop_bare_link(btstack_timer_source_t *ts)
+{
+    (void)ts;
+    hci_con_handle_t h = s_drop_con;
+    s_drop_con = HCI_CON_HANDLE_INVALID;
+    if (h == HCI_CON_HANDLE_INVALID || s_connected) return;            /* A2DP is back */
+    if (gap_get_connection_type(h) != GAP_CONNECTION_ACL) return;        /* gone already */
+    if (jbl_v5_is_link(h)) return;                                       /* JBL One on it */
+    ESP_LOGW(TAG, "A2DP gone, classic link 0x%04x left bare: closing it (the phone goes LE Audio)", h);
+    gap_disconnect(h);
+}
+static uint32_t s_release_ms;
+
+uint32_t a2dp_in_ms_since_connect_tone(void)
+{
+    return s_cnt_tone_ms ? btstack_run_loop_get_time_ms() - s_cnt_tone_ms : 0;
+}
+
+bool a2dp_in_was_playing(uint32_t within_ms)
+{
+    return s_play_at_release && btstack_run_loop_get_time_ms() - s_release_ms < within_ms;
+}
+
 static uint8_t s_play_status = 0xFE;             /* AVRCP_PLAYBACK_STATUS_*, 0xFE = not reported */
 static char s_title[64], s_artist[64];
 
@@ -967,7 +1242,8 @@ void a2dp_in_log_stats(void)
     uint32_t dp = pk - last_pkts;
     ESP_LOGW(TAG, "A2DP 2s: %s %s, media pkts %lu (+%lu, %lu.%lu frames/pkt, max %u B), q drops %lu, seq gaps %lu | bitpool %lu (min %lu max %lu) | "
              "PCM %lu ms (avg %lu, min %lu, max %lu), aligns %lu, ceilings %lu, ACL boosts %lu, underruns %lu, oldest dropped %lu, clock corr %ld ppm | catch-ups %lu (%lu ms skipped, %lu expired) | volume %u/127%s | gaps max %lu ms, >60 %lu >100 %lu >200 %lu",
-             s_streaming ? "STREAMING" : s_connected ? "connected" : "no phone", s_codec == CODEC_AAC ? "AAC" : "SBC",
+             s_streaming ? "STREAMING" : s_connected ? "connected" : "no phone",
+             s_ext_on ? "LE Audio LC3" : s_codec == CODEC_AAC ? "AAC" : "SBC",
              (unsigned long)pk, (unsigned long)dp,
              (unsigned long)(dp ? (fr - last_frames) / dp : 0), (unsigned long)(dp ? ((fr - last_frames) * 10 / dp) % 10 : 0),
              (unsigned)s_pkt_max, (unsigned long)s_pkt_drops,
@@ -1011,11 +1287,19 @@ static void a2dp_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet,
         if (st != ERROR_CODE_SUCCESS) {
             ESP_LOGW(TAG, "A2DP connect to %s failed, status 0x%02x", bd_addr_to_str(s_peer), st);
             reconnect_failed();
+            if (s_pair_call_active) {                 /* after an LE pairing: try again shortly */
+                s_pair_call_active = false;
+                btstack_run_loop_remove_timer(&s_pair_call_timer);
+                btstack_run_loop_set_timer(&s_pair_call_timer, 1500);
+                btstack_run_loop_add_timer(&s_pair_call_timer);
+            }
             break;
         }
+        s_pair_call_active = false;
         reconnect_succeeded();
         s_a2dp_cid = a2dp_subevent_signaling_connection_established_get_a2dp_cid(packet);
         s_connected = true;
+        link_tune_refresh("A2DP connected");
         {   /* remember the phone: called back at power-up */
             nvs_handle_t h;
             if (nvs_open("s31", NVS_READWRITE, &h) == ESP_OK) {
@@ -1027,7 +1311,7 @@ static void a2dp_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet,
         hci_con_handle_t h = a2dp_subevent_signaling_connection_established_get_con_handle(packet);
         s_a2dp_con = h;
         hci_role_t role = gap_get_role(h);
-        tones_play("bt_cnt");
+        s_conn_toned = false;                     /* tone once the stream channel is open */
         ESP_LOGW(TAG, "A2DP connected %s, role %s", bd_addr_to_str(s_peer),
                  role == HCI_ROLE_MASTER ? "MASTER (S31 schedules the phone)" : "SLAVE");
         if (role != HCI_ROLE_MASTER) {
@@ -1096,6 +1380,14 @@ static void a2dp_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet,
         ESP_LOGW(TAG, "A2DP stream established, status 0x%02x", a2dp_subevent_stream_established_get_status(packet));
         if (a2dp_subevent_stream_established_get_status(packet) == ERROR_CODE_SUCCESS) {
             delay_report_soon(50);
+            a2dp_in_pairing_done("phone connected");
+            if (!s_conn_toned) {
+                /* the phone shows "Connected" when the media channel opens (Android A2DP
+                 * CONNECTED), not at the signaling channel 1-2 s earlier */
+                s_conn_toned = true;
+                s_cnt_tone_ms = btstack_run_loop_get_time_ms();
+                tones_play("bt_cnt");
+            }
         }
         break;
     case A2DP_SUBEVENT_SIGNALING_DELAY_REPORTING_CAPABILITY:
@@ -1112,16 +1404,31 @@ static void a2dp_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet,
         break;
     case A2DP_SUBEVENT_STREAM_SUSPENDED:
     case A2DP_SUBEVENT_STREAM_STOPPED:
+        if (s_streaming) s_stream_stop_ms = btstack_run_loop_get_time_ms();
         s_streaming = false;
         bt_sched_tune_streaming(false);
         gap_connectable_control(!S31_QUIET_RADIO_TEST);
         ESP_LOGW(TAG, "A2DP audio %s", packet[2] == A2DP_SUBEVENT_STREAM_SUSPENDED ? "suspended" : "stopped");
         break;
     case A2DP_SUBEVENT_SIGNALING_CONNECTION_RELEASED:
+        s_release_ms = btstack_run_loop_get_time_ms();
+        /* a phone switching to LE Audio pauses the stream itself ~0.7 s before it drops A2DP */
+        s_play_at_release = s_streaming || s_play_status == AVRCP_PLAYBACK_STATUS_PLAYING ||
+                            (s_stream_stop_ms != 0 && s_release_ms - s_stream_stop_ms < 3000);
+        if (le_audio_enabled() && s_a2dp_con != HCI_CON_HANDLE_INVALID) {
+            /* the phone keeps the bare classic link ~4 s while it connects LE Audio; meanwhile
+             * its first LE connect fails (0x3E). Close the link (unless JBL One uses it). */
+            s_drop_con = s_a2dp_con;
+            btstack_run_loop_remove_timer(&s_drop_timer);
+            btstack_run_loop_set_timer_handler(&s_drop_timer, drop_bare_link);
+            btstack_run_loop_set_timer(&s_drop_timer, 300);
+            btstack_run_loop_add_timer(&s_drop_timer);
+        }
         s_streaming = false;
         s_connected = false;
         s_a2dp_con = HCI_CON_HANDLE_INVALID;
         bt_sched_tune_streaming(false);
+        link_tune_refresh("A2DP gone, link kept");
         gap_connectable_control(!S31_QUIET_RADIO_TEST);
         ESP_LOGW(TAG, "A2DP disconnected");
         break;
@@ -1162,6 +1469,13 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
         return;
     }
     switch (hci_event_packet_get_type(packet)) {
+    case HCI_EVENT_CONNECTION_REQUEST: {
+        bd_addr_t a;
+        hci_event_connection_request_get_bd_addr(packet, a);
+        ESP_LOGW(TAG, "classic connect request from %s", bd_addr_to_str(a));
+        if (bd_addr_cmp(a, s_pair_call_addr) == 0) s_pair_incoming = true;
+        break;
+    }
     case HCI_EVENT_COMMAND_COMPLETE:
         if (hci_event_command_complete_get_command_opcode(packet) == 0x1408 && size >= 9) {   /* Read Encryption Key Size */
             ESP_LOGW(TAG, "encryption key size: status 0x%02x, con 0x%04x, %u bytes", packet[5],
@@ -1227,6 +1541,7 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
         break;
     case HCI_EVENT_LINK_KEY_NOTIFICATION:
         ESP_LOGW(TAG, "new link key, type %u", packet[2 + 6 + 16]);   /* event: bd_addr(6) key(16) type(1) */
+        s_new_bond = true;                        /* a new classic bond (pairing mode ends on its connect) */
         break;
     case HCI_EVENT_IO_CAPABILITY_REQUEST:
         ESP_LOGW(TAG, "phone starts (re)pairing (IO capability request)");
@@ -1270,7 +1585,13 @@ static void avrcp_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet
         avrcp_level_restore(NULL);
         if (st != ERROR_CODE_SUCCESS) {
             ESP_LOGW(TAG, "AVRCP connect failed 0x%02x", st);
+            s_play_after_connect = false;
             break;
+        }
+        if (s_play_after_connect) {
+            s_play_after_connect = false;
+            uint8_t ps = avrcp_controller_play(avrcp_subevent_connection_established_get_avrcp_cid(packet));
+            ESP_LOGW(TAG, "AVRCP open: Play to the phone (now on LE Audio) -> 0x%02x", ps);
         }
         s_avrcp_tries = 0;
         btstack_run_loop_remove_timer(&s_avrcp_timer);
@@ -1391,7 +1712,15 @@ void a2dp_in_setup(void)
     s_sbc = btstack_sbc_decoder_bluedroid_init_instance(&s_sbc_ctx);
     s_sbc->configure(&s_sbc_ctx, SBC_MODE_STANDARD, on_pcm, NULL);
     /* core 0 = DSP core, below the LC3 encoder (21) */
-    xTaskCreatePinnedToCore(dsp_task, "sbc_dsp", 6144,   /* SBC ~0.8 KB peak; Helix AAC uses more */ NULL, configMAX_PRIORITIES - 6, NULL, 0);
+    /* core 1: core 0 carries the broadcast LC3 encoder, I2S and the party decoder; core 1
+     * only BTstack (higher priority, preempts this) and the controller. With both decoders
+     * on core 0, 320 kbps AAC + hosting pinned core 0 at 100% (task watchdog). */
+    if (aac_decoder_workspace_need() > sizeof(s_codec_ws)) {
+        ESP_LOGE(TAG, "AAC needs %u B > workspace %u B", aac_decoder_workspace_need(), (unsigned)sizeof(s_codec_ws));
+    } else {
+        aac_decoder_set_workspace(s_codec_ws, sizeof(s_codec_ws));
+    }
+    xTaskCreatePinnedToCore(dsp_task, "sbc_dsp", 6144,   /* SBC ~0.8 KB peak; Helix AAC uses more */ NULL, configMAX_PRIORITIES - 6, NULL, 1);
 
     /* Bluetooth side */
     l2cap_init();
@@ -1463,9 +1792,9 @@ void a2dp_in_setup(void)
      * phone's reconnect miss window after window behind the 20 ms LE beacon and
      * the assistant's LE scan. Interlaced every 320 ms catches both page trains
      * in one window; off anyway while a phone streams (gap_connectable_control). */
-    gap_set_page_scan_activity(0x0200, 0x0012);
+    gap_set_page_scan_activity(0x0100, 0x0024);  /* 22.5 ms every 160 ms (interlaced: 2 per 160 ms) */
     gap_set_page_scan_type(PAGE_SCAN_MODE_INTERLACED);
-    gap_discoverable_control(!S31_QUIET_RADIO_TEST);
+    gap_discoverable_control(0);                  /* a2dp_in_on_hci_working: pairing mode or not */
     gap_connectable_control(!S31_QUIET_RADIO_TEST);
 
     s_hci_reg.callback = &hci_handler;
@@ -1546,6 +1875,49 @@ static void reconnect_cb(btstack_timer_source_t *ts)
     btstack_run_loop_add_timer(&s_reconn_timer);
 }
 
+
+static void pair_call(btstack_timer_source_t *ts)
+{
+    (void)ts;
+    if (s_connected || link_tune_classic_links() > 0) {
+        ESP_LOGI(TAG, "after LE pairing: the phone's classic link is up by itself");
+        return;
+    }
+    if (s_reconn_pending) return;                 /* the power-up call-back is paging already */
+    if (++s_pair_call_tries > 5) {
+        ESP_LOGW(TAG, "after LE pairing: gave up calling %s", bd_addr_to_str(s_pair_call_addr));
+        return;
+    }
+    /* the phone's own page arrived (or a link object exists): creating ours now makes the
+     * controller refuse it (0x0B) and drops the phone's too - wait for it instead */
+    if (s_pair_incoming || hci_connection_for_bd_addr_and_type(s_pair_call_addr, BD_ADDR_TYPE_ACL) != NULL) {
+        ESP_LOGI(TAG, "after LE pairing: the phone's classic connect is under way - waiting");
+        s_pair_incoming = false;
+        btstack_run_loop_set_timer(&s_pair_call_timer, 1500);
+        btstack_run_loop_add_timer(&s_pair_call_timer);
+        return;
+    }
+    gap_set_security_level(LEVEL_2);              /* the CTKD key authenticates the link */
+    s_pair_call_active = true;
+    uint8_t st = a2dp_sink_establish_stream(s_pair_call_addr, &s_a2dp_cid);
+    ESP_LOGW(TAG, "after LE pairing: no classic link from %s yet - connecting A2DP ourselves (try %u) -> 0x%02x",
+             bd_addr_to_str(s_pair_call_addr), s_pair_call_tries, st);
+}
+
+void a2dp_in_call_after_le_pairing(const uint8_t identity[6])
+{
+    if (S31_QUIET_RADIO_TEST) return;
+    bd_addr_copy(s_pair_call_addr, identity);
+    s_pair_call_tries = 0;
+    s_pair_incoming = false;
+    s_pair_call_active = false;
+    s_new_bond = true;                            /* pairing mode ends once this phone is connected */
+    btstack_run_loop_remove_timer(&s_pair_call_timer);
+    btstack_run_loop_set_timer_handler(&s_pair_call_timer, pair_call);
+    btstack_run_loop_set_timer(&s_pair_call_timer, 1200);   /* Samsung pages ~1 s after the keys: let it */
+    btstack_run_loop_add_timer(&s_pair_call_timer);
+}
+
 static void reconnect_failed(void)
 {
     if (!s_reconn_pending) return;
@@ -1584,6 +1956,19 @@ void a2dp_in_on_hci_working(void)
     }
     nvs_handle_t h;
     size_t n = 6;
+    btstack_link_key_iterator_t it;
+    bool any_key = false;
+    if (gap_link_key_iterator_init(&it)) {
+        bd_addr_t a; link_key_t k; link_key_type_t t;
+        any_key = gap_link_key_iterator_get_next(&it, a, k, &t);
+        gap_link_key_iterator_done(&it);
+    }
+    if (!any_key && le_device_db_count() == 0) {
+        ESP_LOGW(TAG, "no phone paired yet: pairing mode");
+        a2dp_in_button(A2DP_BTN_PAIRING);             /* as a new JBL speaker */
+    } else {
+        a2dp_in_refresh_discoverable();               /* not discoverable until the button */
+    }
     if (nvs_open("s31", NVS_READONLY, &h) != ESP_OK) {
         return;
     }
