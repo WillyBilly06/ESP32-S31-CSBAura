@@ -9,12 +9,14 @@ Every flashed board is **its own Xtreme 5**: address, serial number, beacon iden
 standard Auracast Broadcast_ID all come from the chip's factory MAC, and the color shown in JBL
 One is picked when flashing.
 
-## Quick start: flash a board
+## Quick start: build and flash a board
 
-1. Get `S31Flasher.exe` and its `firmware` folder (a release zip, or build them, see below).
-2. Connect the board over USB and run `S31Flasher.exe`.
-3. Pick the port and the color, optionally a name, tick **Erase the board first** for a new
-   board, press **Flash**.
+1. Download this repository (or clone it) and put `S31Flasher.exe` (from the
+   [Releases](../../releases) page) into the folder.
+2. Run it. If step **1 Setup** is not "Ready to build", press **Set up ESP-IDF + BTstack**: it
+   downloads the exact ESP-IDF this project uses (ESP-IDF commit `idf-patches/IDF_COMMIT` +
+   `idf-patches/0010`) and BTstack, once. Needs [git](https://git-scm.com) and Python 3.10+.
+3. Pick the board's port, click the speaker color, optionally a name, press **Build + Flash**.
 
 | Color | ID |
 |---|---|
@@ -24,7 +26,6 @@ One is picked when flashing.
 | Purple | `0x05` |
 | Camo | `0x1A` |
 
-**Set color only** changes the color / name of a flashed board and keeps its pairings.
 Details: [`tools/flasher/README.md`](tools/flasher/README.md).
 
 ## Features
@@ -59,8 +60,8 @@ More on the modules: [`s31-btstack-speaker/README.md`](s31-btstack-speaker/READM
 
 ### 1. ESP-IDF
 
-ESP-IDF **v6.1** with ESP32-S31 support (`release/v6.1`, built against commit `c43d665a96`), with
-[`idf-patches/0010-controller-only-iso-rx.patch`](idf-patches) applied (required: without it a
+ESP-IDF **v6.1** with ESP32-S31 support: exactly commit `c43d665a96` of `release/v6.1`
+(`idf-patches/IDF_COMMIT`), with [`idf-patches/0010-controller-only-iso-rx.patch`](idf-patches) applied (required: without it a
 controller-only build drops every received ISO packet). See [`idf-patches/README.md`](idf-patches/README.md).
 
 ```bash
@@ -91,12 +92,8 @@ idf.py -p <PORT> flash monitor        # console at 921600 baud
 ```
 
 `idf.py flash` writes bootloader, partition table and app; the board then has the default
-color (Black). To pick the color, or to make the flasher for other people:
-
-```bash
-python tools/flasher/make_package.py   # build -> tools/flasher/firmware/
-python tools/flasher/build_exe.py      # -> tools/flasher/dist/S31Flasher.exe
-```
+color (Black). The S31 Flasher does the same build and also writes the color, name and tones;
+`python tools/flasher/build_exe.py` makes `S31Flasher.exe`.
 
 ### Flash layout
 
@@ -120,7 +117,7 @@ and stays silent if it is empty. Put your own tone files (MP3, or 16 kHz s16 mon
 python tools/tones_pack.py <dir with tone files> tones.bin
 ```
 
-Put `tones.bin` into the flasher's `firmware` folder and it is written with the firmware.
+Put `tones.bin` into the project folder and the S31 Flasher writes it with the firmware.
 
 ## Using it
 

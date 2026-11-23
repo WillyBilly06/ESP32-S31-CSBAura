@@ -33,7 +33,7 @@ ap.add_argument("--idf-env")
 a = ap.parse_args()
 sp = idf_site_packages(a.idf_env)
 work = os.path.join(here, "build_pyi")
-cmd = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--onefile", "--name", "S31Flasher",
+cmd = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--onefile", "--windowed", "--name", "S31Flasher",
        "--paths", sp, "--collect-all", "esptool", "--hidden-import", "serial.tools.list_ports",
        "--distpath", os.path.join(here, "dist"), "--workpath", work, "--specpath", work,
        os.path.join(here, "s31_flasher.py")]
