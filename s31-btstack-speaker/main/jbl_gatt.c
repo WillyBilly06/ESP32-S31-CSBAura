@@ -584,8 +584,12 @@ static void sdp_setup(void)
 /* ---- setup ------------------------------------------------------------------ */
 
 /* ---- ATT client-role PDUs ----------------------------------------------------------
- * We run no GATT client, so BTstack's ATT dispatcher drops every server->client PDU
- * (indications, notifications, responses) - an indication then stays unconfirmed.
+ * The ATT dispatcher has ONE client slot. BTstack's GATT Client (LE Audio media
+ * control, JBL speaker assistant) owns it and confirms LE indications itself; this
+ * handler sits in front and passes everything on - registering in its place made every
+ * GATT client request "time out" (the phone's answers never reached it).
+ * BR/EDR is different: BTstack's GATT Client only knows channels it opened itself, so
+ * an indication on the GATT-over-BR/EDR channel the phone opened stays unconfirmed.
  * The iPhone indicates its own Service Changed (handle 0x0008) the moment the
  * GATT-over-BR/EDR channel opens; without the confirmation iOS hits the ATT
  * transaction timeout and closes the channel exactly 30 s later (JBL One "keeps
@@ -617,12 +621,14 @@ static void confirm_try(btstack_timer_source_t *ts)
     }
 }
 
+static btstack_packet_handler_t s_gatt_client_pdu;          /* BTstack's GATT Client */
+
 static void att_client_pdu(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size)
 {
-    if ((packet_type != ATT_DATA_PACKET && packet_type != L2CAP_DATA_PACKET) || size < 1) return;
+    if (s_gatt_client_pdu != NULL) s_gatt_client_pdu(packet_type, channel, packet, size);
+    if (packet_type != L2CAP_DATA_PACKET || size < 1) return;      /* LE: the GATT Client confirms */
     if (packet[0] != ATT_HANDLE_VALUE_INDICATION) return;
-    if (packet_type == L2CAP_DATA_PACKET) s_conf_cid = channel;    /* channel = local L2CAP cid */
-    else s_conf_le = channel;                                        /* channel = con handle */
+    s_conf_cid = channel;                                            /* channel = local L2CAP cid */
     s_ind_confirmed++;
     ESP_LOGW(TAG, ">>> peer INDICATION handle 0x%04x (%u B) - confirmed (%lu so far)",
              size >= 3 ? little_endian_read_16(packet, 1) : 0, size, (unsigned long)s_ind_confirmed);
@@ -649,7 +655,9 @@ void jbl_gatt_setup(void)
 
     att_server_init(profile_data, &att_read_cb, &att_write_cb);
     att_server_register_packet_handler(&att_event_handler);
-    att_dispatch_register_client(&att_client_pdu);          /* confirm the phone's indications */
+    s_gatt_client_pdu = att_dispatch_get_client_handler();  /* gatt_client_init() ran first (jbl.c) */
+    att_dispatch_register_client(&att_client_pdu);          /* BR/EDR indications, the rest chained on */
+    if (s_gatt_client_pdu == NULL) ESP_LOGE(TAG, "no GATT Client registered before jbl_gatt_setup()");
     sdp_setup();
 
     ESP_LOGW(TAG, "GATT excelpoint.cnl: notify 0x%04x, write 0x%04x | excelpoint.com: notify 0x%04x, "

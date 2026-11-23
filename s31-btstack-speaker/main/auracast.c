@@ -1314,17 +1314,7 @@ static void on_pa_enable_complete(uint8_t status)
     s_big_params.advertising_handle = s_adv_handle;
     s_big_params.encryption = (s_std && s_std_enc) ? 1 : 0;
     memcpy(s_big_params.broadcast_code, s_std_code, 16);
-    s_big_run = s_big_test;
-    if (a2dp_in_ext_active() && s_std) {   /* JBL party: the Xtreme 5 does not join IRC 2 */
-        /* the phone's LE Audio CIS (its own timing) has to fit next to the BIG: with
-         * 4 copies the BIG block is 14.3 ms of every 30 and the two kept colliding
-         * (7-18 % of the phone's SDUs lost, BIG events skipped, local sync off).
-         * 2 copies = the S26 Ultra's own broadcast, which the Xtreme 5 plays cleanly. */
-        s_big_run.irc = 2;
-        s_big_run.nse = AURA_BN * 2;
-        ESP_LOGW(TAG, "input is LE Audio (standard broadcast): BIG with IRC 2 (NSE %u) to leave room for the CIS",
-                 s_big_run.nse);
-    }
+    s_big_run = s_big_test;                 /* IRC 4 always: the Xtreme 5 does not join IRC 2 */
     uint8_t st = gap_big_create_test(&s_big, &s_big_params, &s_big_run);
     if (st != ERROR_CODE_SUCCESS) {
         ESP_LOGE(TAG, "gap_big_create_test: 0x%02x", st);

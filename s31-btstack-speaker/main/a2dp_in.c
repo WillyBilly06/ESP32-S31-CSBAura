@@ -367,6 +367,17 @@ static volatile uint16_t s_pkt_max;
 static volatile uint32_t s_gap_max_us, s_gap_n60, s_gap_n100, s_gap_n200;
 static int64_t s_last_arrival;
 
+static uint32_t s_conn_ms, s_start_ms, s_media_first_ms;   /* A2DP settle window (BT thread) */
+
+bool a2dp_in_settling(void)
+{
+    if (!s_connected || s_ext_on) return false;
+    uint32_t now = btstack_run_loop_get_time_ms();
+    if (now - s_conn_ms < 4000) return true;
+    if (s_streaming && (s_media_first_ms == 0 || now - s_media_first_ms < 1000)) return now - s_start_ms < 8000;
+    return false;
+}
+
 static void media_handler(uint8_t seid, uint8_t *packet, uint16_t size)
 {
     (void)seid;
@@ -376,6 +387,7 @@ static void media_handler(uint8_t seid, uint8_t *packet, uint16_t size)
     if (size < 13 || size > PKT_MAX || s_ext_on) {
         return;                                    /* LE Audio owns the pipeline meanwhile */
     }
+    if (s_media_first_ms == 0) s_media_first_ms = btstack_run_loop_get_time_ms();
     uint16_t seq = big_endian_read_16(packet, 2);
     uint32_t rtp = big_endian_read_32(packet, 4);
     int64_t now = esp_timer_get_time();
@@ -1297,6 +1309,8 @@ static void a2dp_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet,
         }
         s_pair_call_active = false;
         reconnect_succeeded();
+        s_conn_ms = btstack_run_loop_get_time_ms();
+        s_media_first_ms = 0;
         s_a2dp_cid = a2dp_subevent_signaling_connection_established_get_a2dp_cid(packet);
         s_connected = true;
         link_tune_refresh("A2DP connected");
@@ -1394,6 +1408,8 @@ static void a2dp_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet,
         ESP_LOGW(TAG, "phone supports delay reporting");
         break;
     case A2DP_SUBEVENT_STREAM_STARTED:
+        s_start_ms = btstack_run_loop_get_time_ms();
+        s_media_first_ms = 0;
         s_last_arrival = 0;
         s_reset_dsp = true;
         s_streaming = true;

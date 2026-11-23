@@ -68,6 +68,11 @@ uint8_t a2dp_in_play_status(void);
  * moved to LE Audio mid-song: le_audio asks it to play on) */
 bool a2dp_in_was_playing(uint32_t within_ms);
 
+/* BT thread: the phone is settling into A2DP - connected < 4 s ago, or streaming but
+ * without 1 s of media yet (capped at 8 s after Start). The party holds its scan and
+ * its broadcast meanwhile: a BIG created right at Start left the stream empty. */
+bool a2dp_in_settling(void);
+
 /* BT thread: the phone moved A2DP -> LE Audio mid-song and did not resume: AVRCP Play
  * (opens AVRCP to the last A2DP phone first if it is closed) */
 void a2dp_in_avrcp_play_after_switch(void);

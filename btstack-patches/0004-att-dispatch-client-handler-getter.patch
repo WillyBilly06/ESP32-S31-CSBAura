@@ -1,0 +1,28 @@
+--- a/src/ble/att_dispatch.c
++++ b/src/ble/att_dispatch.c
+@@ -246,6 +246,10 @@ void att_dispatch_register_client(btstack_packet_handler_t packet_handler){
+     l2cap_register_fixed_channel(att_packet_handler, L2CAP_CID_ATTRIBUTE_PROTOCOL);
+ }
+ 
++btstack_packet_handler_t att_dispatch_get_client_handler(void){
++    return subscriptions[ATT_CLIENT].packet_handler;
++}
++
+ void att_dispatch_register_server(btstack_packet_handler_t packet_handler){
+     subscriptions[ATT_SERVER].packet_handler = packet_handler;
+     l2cap_register_fixed_channel(att_packet_handler, L2CAP_CID_ATTRIBUTE_PROTOCOL);
+--- a/src/ble/att_dispatch.h
++++ b/src/ble/att_dispatch.h
+@@ -60,6 +60,12 @@ extern "C" {
+  */
+ void att_dispatch_register_client(btstack_packet_handler_t packet_handler);
+ 
++/**
++ * @brief The registered ATT client packet handler (e.g. GATT Client), to chain another one in front
++ * @return handler or NULL
++ */
++btstack_packet_handler_t att_dispatch_get_client_handler(void);
++
+ /**
+  * @brief Register packet handler for ATT Server PDUs
+  * @param packet_handler

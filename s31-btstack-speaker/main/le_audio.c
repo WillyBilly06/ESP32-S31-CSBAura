@@ -137,7 +137,7 @@ static btstack_packet_callback_registration_t s_hci_reg;
 static void connected_tone(void);
 static void mcp_start_ms(uint32_t ms);
 /* Play over LE (media control client) state, see mcp_play() */
-static btstack_timer_source_t s_mcp_timer, s_mcp_dump_timer;
+static btstack_timer_source_t s_mcp_timer;
 static gatt_client_service_t s_mcs_svc;
 static gatt_client_characteristic_t s_mcs_cp_chr;
 static gatt_client_notification_t s_mcs_notif;
@@ -162,7 +162,9 @@ static uint16_t ase_value(uint8_t *v)
     case ASE_CODEC:
         v[i++] = 0x00;                               /* unframed ISOAL PDUs supported */
         v[i++] = 0x02;                               /* preferred PHY: 2M */
-        v[i++] = 2;                                  /* preferred retransmissions */
+        /* next to a 4-copy BIG (14.3 ms of every 30) the CIS loses slots: as many
+         * retransmissions as BAP's high-reliability configs use */
+        v[i++] = 13;                                 /* preferred retransmissions */
         little_endian_store_16(v, i, 100); i += 2;   /* max transport latency 100 ms */
         little_endian_store_24(v, i, 20000); i += 3; /* presentation delay min 20 ms */
         little_endian_store_24(v, i, 400000); i += 3; /*                   max 400 ms */
@@ -437,6 +439,9 @@ static void ase_control(hci_con_handle_t con, const uint8_t *b, uint16_t n)
         s_ase.rtn = p[9];
         s_ase.latency = little_endian_read_16(p, 10);
         s_ase.pd = little_endian_read_24(p, 12);
+        ESP_LOGW(TAG, "phone QoS: SDU every %lu us, max SDU %u B, RTN %u, max transport latency %u ms, "
+                 "presentation delay %lu us, PHY 0x%02x", (unsigned long)s_ase.sdu_itvl, s_ase.max_sdu, s_ase.rtn,
+                 s_ase.latency, (unsigned long)s_ase.pd, s_ase.phy);
         if (s_ase.max_sdu > LA_MAX_SDU) { cp_respond(op, RSP_UNSUPPORTED_PARAM, 0x04); return; }
         cp_respond(op, RSP_OK, 0);
         ase_set(ASE_QOS, "Config QoS");
@@ -808,13 +813,6 @@ static void connected_tone(void)
  * (0x2BA4). The phone did not answer a GATT read before when BTstack's client started
  * with its own MTU exchange: that is off for this link (a one-byte write anyway). */
 
-static void mcp_dump_off(btstack_timer_source_t *ts)
-{
-    (void)ts;
-    hci_dump_enable_packet_log(false);
-    ESP_LOGW(TAG, "Play over LE: HCI packet log off");
-}
-
 static void mcp_fail(const char *what, uint8_t st)
 {
     ESP_LOGW(TAG, "Play over LE: %s (ATT 0x%02x)", what, st);
@@ -898,11 +896,6 @@ static void mcp_play(btstack_timer_source_t *ts)
     s_mcp_done = true;                                        /* once per connection */
     s_mcs_found = false;
     s_mcp_state = 1;
-    hci_dump_enable_packet_log(true);                          /* see what really goes over the air */
-    btstack_run_loop_remove_timer(&s_mcp_dump_timer);
-    btstack_run_loop_set_timer_handler(&s_mcp_dump_timer, &mcp_dump_off);
-    btstack_run_loop_set_timer(&s_mcp_dump_timer, 4000);
-    btstack_run_loop_add_timer(&s_mcp_dump_timer);
     gatt_client_mtu_enable_auto_negotiation(0);             /* this link's client context: no MTU exchange */
     uint8_t st = gatt_client_discover_primary_services_by_uuid16(&mcp_handler, s_con,
                                                                  ORG_BLUETOOTH_SERVICE_GENERIC_MEDIA_CONTROL_SERVICE);
@@ -989,6 +982,19 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
                 s_toned = false;                         /* tone once the LE Audio handshake is done */
                 s_last_gatt_ms = btstack_run_loop_get_time_ms();
                 ready_start();
+            }
+            break;
+        case HCI_SUBEVENT_LE_CIS_ESTABLISHED:
+            if (hci_subevent_le_cis_established_get_status(packet) == ERROR_CODE_SUCCESS) {
+                ESP_LOGW(TAG, "CIS layout: NSE %u, BN %u, FT %u, max PDU %u B, ISO interval %u us, "
+                         "transport latency %lu us, PHY %u",
+                         hci_subevent_le_cis_established_get_nse(packet),
+                         hci_subevent_le_cis_established_get_bn_c_to_p(packet),
+                         hci_subevent_le_cis_established_get_ft_c_to_p(packet),
+                         hci_subevent_le_cis_established_get_max_pdu_c_to_p(packet),
+                         hci_subevent_le_cis_established_get_iso_interval(packet) * 1250u,
+                         (unsigned long)hci_subevent_le_cis_established_get_transport_latency_c_to_p(packet),
+                         hci_subevent_le_cis_established_get_phy_c_to_p(packet));
             }
             break;
         case HCI_SUBEVENT_LE_CIS_REQUEST: {

@@ -1094,13 +1094,13 @@ static void tick(btstack_timer_source_t *ts)
         /* an LE Audio phone is linked: our party scan (high duty) starves its link - the
          * CIS request then came 3 s late or failed and the phone dropped LE Audio. Hold
          * the scan for as long as it is linked; the phone has priority. */
-        if (le_audio_setting_up() && !s_as.target && s_ls == L_SCAN) {
-            /* only while the phone sets LE Audio up: linked and idle, we must still find
-             * (and play) a JBL party master */
+        if ((le_audio_setting_up() || a2dp_in_settling()) && !s_as.target && s_ls == L_SCAN) {
+            /* only while the phone sets LE Audio / A2DP up: linked and idle, we must still
+             * find (and play) a JBL party master */
             if (!s_scan_held) {
                 gap_stop_scan();
                 s_scan_held = true;
-                ESP_LOGW(TAG, "LE Audio phone setting up: party scan paused");
+                ESP_LOGW(TAG, "phone setting up %s: party scan paused", a2dp_in_settling() ? "A2DP" : "LE Audio");
             }
             s_scan_hold_until = now_ms() + 1000;
         }
@@ -1112,14 +1112,15 @@ static void tick(btstack_timer_source_t *ts)
         }
         break;
     case R_LISTEN_STOPPING:
-        if (le_audio_starting() && now_ms() - s_role_ms < 6000) {
+        if ((le_audio_starting() || a2dp_in_settling()) && now_ms() - s_role_ms < 8000) {
             /* the phone is configuring / creating its CIS: a BIG created now (30 ms
              * block next to the phone's 30 ms LE link) kept the CIS from coming up and
              * the LE link timed out (0x08) - host once the stream is up */
             static uint32_t logged_ms;
             if (s_role_ms != logged_ms) {
                 logged_ms = s_role_ms;
-                ESP_LOGW(TAG, "host: waiting for the phone's LE Audio stream (CIS) before the broadcast");
+                ESP_LOGW(TAG, "host: waiting for the phone's %s stream to settle before the broadcast",
+                         a2dp_in_settling() ? "A2DP" : "LE Audio");
             }
             break;
         }

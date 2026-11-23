@@ -44,7 +44,7 @@ extern uint8_t _data_start[], _data_end[];
 #endif
 /* LE Audio input feeding the broadcast: CIS 15, BIS first copies 13 */
 #define BT_SCHED_CIS_LE_IN   15
-#define BT_SCHED_FIRST_LE_IN 13
+#define BT_SCHED_FIRST_LE_IN 15   /* 13 made no measurable difference to the CIS loss */
 static bool s_le_input;
 
 /* ---- profiles ------------------------------------------------------------ */
