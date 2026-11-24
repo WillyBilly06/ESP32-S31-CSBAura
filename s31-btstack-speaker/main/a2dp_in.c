@@ -974,7 +974,9 @@ static void delay_report_soon(uint32_t ms)
  * link 4 s after the attempt -> drop the pending one and try again (3 tries). */
 #define AVRCP_TRIES      3
 /* how long the phone gets to open AVRCP itself (console "avrcpwait <ms>") */
-static uint32_t s_avrcp_wait_ms = 400;
+/* the Xtreme 5 gives the phone ~6 s from the ACL to open AVRCP (fw 0x108EA50, 30 x 200 ms)
+ * before it connects it itself; ours runs from A2DP up (~1 s after the ACL) */
+static uint32_t s_avrcp_wait_ms = 5000;
 void a2dp_in_set_avrcp_wait(uint32_t ms) { s_avrcp_wait_ms = ms; ESP_LOGW(TAG, "AVRCP wait %lu ms", (unsigned long)ms); }
 #define AVRCP_WATCH_MS   4000
 static uint16_t s_avrcp_pending_cid;
@@ -1913,7 +1915,8 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
         break;
     case HCI_EVENT_COMMAND_STATUS:
         if (hci_event_command_status_get_status(packet) != ERROR_CODE_SUCCESS &&
-            hci_event_command_status_get_command_opcode(packet) != 0x0413) {
+            hci_event_command_status_get_command_opcode(packet) != 0x0413 &&
+            hci_event_command_status_get_command_opcode(packet) != 0x0807) {   /* QoS Setup: link_tune.c */
             ESP_LOGW(TAG, "HCI command 0x%04x refused: status 0x%02x", hci_event_command_status_get_command_opcode(packet),
                      hci_event_command_status_get_status(packet));
             /* Accept Connection Request (as master, with a role switch) refused: right after
@@ -2257,10 +2260,19 @@ void a2dp_in_setup(void)
                                 DEVICE_ID_VENDOR_ID_SOURCE_BLUETOOTH, BLUETOOTH_COMPANY_ID_BLUEKITCHEN_GMBH, 1, 1);
     sdp_register_service(s_sdp_did);
 
-    /* BR/EDR master, never switch, no sniff (sniff anchors starve against the BIG) */
-    gap_set_default_link_policy_settings(0);
-    gap_set_allow_role_switch(false);
-    hci_set_master_slave_policy(HCI_ROLE_MASTER);
+    /* As the Xtreme 5 (fw 0x10A3090 / 0x10A5550): a phone's connection is accepted staying
+     * SLAVE (accepting with a role switch was refused by our controller, 0x0C, and the phone's
+     * connect failed), role switches are allowed. No sniff (the Xtreme 5 sniffs when idle;
+     * here sniff anchors starve against the BIG). Once the link is up and we do not broadcast,
+     * we still ask for MASTER (role_check_soon): the S31 then schedules the phone around a
+     * later broadcast. */
+    gap_set_default_link_policy_settings(LM_LINK_POLICY_ENABLE_ROLE_SWITCH);
+    gap_set_allow_role_switch(true);
+    hci_set_master_slave_policy(HCI_ROLE_SLAVE);
+    /* the Xtreme 5's page timeout (5.12 s, fw init 0xC18) and supervision timeout on links
+     * where it is master (5 s, fw 0x1090904): a failed page or a lost phone is known sooner */
+    gap_set_page_timeout(0x2000);
+    gap_set_link_supervision_timeout(0x1F40);
     gap_ssp_set_io_capability(SSP_IO_CAPABILITY_NO_INPUT_NO_OUTPUT);
     /* Just Works like a speaker: BTstack's default leaves the phone's User
      * Confirmation Request unanswered, so pairing timed out (reason 0x15). */

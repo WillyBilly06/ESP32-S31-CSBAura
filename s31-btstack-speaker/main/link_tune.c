@@ -104,6 +104,7 @@ static uint16_t poll_wanted(hci_con_handle_t h)
 }
 
 static void poll_apply(const char *why);
+static int s_qos_retries;                         /* QoS Setup refusals retried (reset per new link) */
 
 void link_tune_refresh(const char *why)
 {
@@ -205,6 +206,7 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
             hci_event_connection_complete_get_link_type(packet) != 0x01) {
             break;
         }
+        s_qos_retries = 0;
         s_acl = hci_event_connection_complete_get_connection_handle(packet);
         for (int i = 0; i < MAX_ACL; i++) {
             if (s_links[i].h == HCI_CON_HANDLE_INVALID || s_links[i].h == s_acl) {
@@ -238,7 +240,18 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
          * applied - make every link ask again on the next tick */
         if (hci_event_command_status_get_command_opcode(packet) == 0x0807 &&
             hci_event_command_status_get_status(packet) != ERROR_CODE_SUCCESS) {
-            for (int i = 0; i < MAX_ACL; i++) s_links[i].applied = 0;
+            /* 3 more tries in all, then the controller's default poll stays. The controller
+             * refuses (0x12) or takes the same request depending on the link's state - not the
+             * role, not the interval asked for (seen 2026-11-24 over ~200 links); audio is fine
+             * either way, so this is a note, not an error */
+            if (s_qos_retries < 3) {
+                s_qos_retries++;
+                for (int i = 0; i < MAX_ACL; i++) s_links[i].applied = 0;
+            } else if (s_qos_retries == 3) {
+                s_qos_retries++;
+                ESP_LOGI(TAG, "QoS Setup refused 4 times (0x%02x): this link keeps the controller's poll interval",
+                         hci_event_command_status_get_status(packet));
+            }
         }
         break;
     case HCI_EVENT_MAX_SLOTS_CHANGED:
