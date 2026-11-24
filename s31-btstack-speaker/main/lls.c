@@ -142,6 +142,8 @@ static bool s_forever;                       /* lls_start(LLS_FOREVER): a stored
 static btstack_timer_source_t s_retry_timer;
 static void retry_cb(btstack_timer_source_t *ts);
 
+static void send_team_end(void);
+
 static void finish(bool linked, const char *why)
 {
     btstack_run_loop_remove_timer(&s_timer);
@@ -441,6 +443,7 @@ static void on_linked(void)
         send(req, sizeof(req), "device info request");
         lls_send_tone_setting();
         lls_light_changed();                    /* the secondary takes our theme at once */
+        send_team_end();
         /* as the Xtreme 5 primary once its broadcast source is up (fw 0x10FE834): 75 ms, latency 0,
          * 4 s - the link only carries small control frames, the airtime goes to the BIG */
         uint8_t st = gap_update_connection_parameters(s_con, 60, 60, 0, 400);
@@ -536,6 +539,22 @@ void lls_send_bt_led(uint8_t state)
     if (s_state != L_LINKED || !s_central) return;
     uint8_t f[] = { 0xAA, 0x41, 0x01, state };
     send(f, sizeof(f), "BT LED state");
+    /* the BT-layer effect record (AA 44), as the Xtreme 5's light engine sends it: pairing
+     * blink (wire 0x80 = effect 7) while pairing, else the steady connected state (0x81 = 8).
+     * The S31 has no LEDs - the partner's lights and the app follow it all the same. */
+    uint8_t r[18] = { 0xAA, 0x44, 0x0F };
+    jbl_v5_light_record(r + 3);
+    r[3] = state == 2 ? 0x80 : 0x81;
+    send(r, sizeof(r), "BT light effect (AA 44)");
+}
+
+/* the pair formed: the team animation ends on the partner (AA 48, wire 0x84 = effect 52) */
+static void send_team_end(void)
+{
+    uint8_t r[18] = { 0xAA, 0x48, 0x0F };
+    jbl_v5_light_record(r + 3);
+    r[3] = 0x84;
+    send(r, sizeof(r), "team animation end (AA 48)");
 }
 
 static volatile bool s_light_dirty;
