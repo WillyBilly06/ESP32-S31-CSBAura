@@ -89,6 +89,9 @@ CONFIG_BT_LE_MAX_EXT_ADV_INSTANCES=3
 CONFIG_BT_LE_DFT_TX_POWER_LEVEL_P20=y
 # (Kconfig range is 4..8: the old value 10 was rejected and silently fell back to 6)
 CONFIG_BT_CTRL_BR_EDR_ACLU_RX_BUF_NB=8
+# three ACL slots: with two the controller pages out only while no phone is linked
+# ("alloc conn failed", 0x09) - the second phone could not be called back
+CONFIG_BT_CTRL_BR_EDR_MAX_ACL_CONN=3
 
 # Core layout. Core 0: BT controller "btdm" (prio 23, highest on its core) +
 # esp_timer (22, drives the k_work TX scheduler) + Bluedroid hciT/BTU/BTC (22/20/19)

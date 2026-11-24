@@ -70,7 +70,7 @@ static uint8_t s_sbc_cfg[4];
  * most Android phones prefer it over SBC. */
 static uint8_t s_aac_caps[6] = { 0xC0, 0x01, 0x8C, 0x84, 0xE2, 0x00 };
 static uint8_t s_aac_cfg[6];
-static uint8_t s_sbc_seid, s_aac_seid;
+static uint8_t s_sbc_seid, s_aac_seid, s_aac2_seid;   /* aac2: the second phone's */
 enum { CODEC_SBC = 0, CODEC_AAC = 1 };
 static volatile bool s_ext_on;                       /* LE Audio feeds the pipeline */
 static a2dp_in_ext_decode_t s_ext_dec;
@@ -1395,6 +1395,39 @@ static void avrcp_pause_active(const char *why)
 }
 
 /* standby <-> active */
+/* The power-up call-back order, as the Xtreme 5's reconnect list: the phone that played
+ * last ("last_phone") first, then the one before it ("prev_phone"). */
+static bd_addr_t s_last_phone;                    /* tentative: defined again below */
+static bd_addr_t s_prev_phone;
+static bool s_prev_valid;
+static void remember_phones(const bd_addr_t first, const bd_addr_t second)
+{
+    static const bd_addr_t zero = { 0 };
+    bool same_first = bd_addr_cmp(first, s_last_phone) == 0;
+    bd_addr_t prev;
+    bool have_prev = false;
+    if (second != NULL && bd_addr_cmp(second, zero) != 0 && bd_addr_cmp(second, first) != 0) {
+        bd_addr_copy(prev, second);
+        have_prev = true;
+    } else if (!same_first && bd_addr_cmp(s_last_phone, zero) != 0) {
+        bd_addr_copy(prev, s_last_phone);         /* a new first phone: the old one moves down */
+        have_prev = true;
+    }
+    bool same_prev = !have_prev || (s_prev_valid && bd_addr_cmp(prev, s_prev_phone) == 0);
+    if (same_first && same_prev) return;          /* nothing new: no flash write */
+    nvs_handle_t h;
+    if (nvs_open("s31", NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_blob(h, "last_phone", first, 6);
+    bd_addr_copy(s_last_phone, first);
+    if (have_prev) {
+        nvs_set_blob(h, "prev_phone", prev, 6);
+        bd_addr_copy(s_prev_phone, prev);
+        s_prev_valid = true;
+    }
+    nvs_commit(h);
+    nvs_close(h);
+}
+
 static void phone_swap(const char *why)
 {
     phone_t a = s_alt;
@@ -1427,6 +1460,7 @@ static void phone_swap(const char *why)
     if (!s_ext_on) s_streaming = s_a2dp_started;
     ESP_LOGW(TAG, "multipoint: playing %s now (%s)", bd_addr_to_str(s_peer), why);
     if (s_alt.used) ESP_LOGW(TAG, "multipoint: %s on standby", bd_addr_to_str(s_alt.addr));
+    if (s_connected && s_alt.used) remember_phones(s_peer, s_alt.addr);   /* the playing one first */
     if (s_avrcp_cid) {
         avrcp_target_volume_changed(s_avrcp_cid, s_volume);    /* its slider follows ours */
         avrcp_controller_get_now_playing_info(s_avrcp_cid);
@@ -1483,6 +1517,31 @@ static void active_stopped(void)
     }
 }
 
+/* We opened the stream (power-up call-back): BTstack would pick SBC on its own - choose
+ * AAC-LC when the phone has it. Bitmaps as BTstack reports them: object type b6 MPEG-2 LC,
+ * b5 MPEG-4 LC; rate 0x010 44.1 kHz, 0x008 48 kHz; channels 0x4 two, 0x8 one. */
+static void aac_choose(uint8_t *packet, uint8_t seid)
+{
+    uint8_t ot = a2dp_subevent_signaling_media_codec_mpeg_aac_capability_get_object_type_bitmap(packet);
+    uint16_t sf = a2dp_subevent_signaling_media_codec_mpeg_aac_capability_get_sampling_frequency_bitmap(packet);
+    uint8_t ch = a2dp_subevent_signaling_media_codec_mpeg_aac_capability_get_channels_bitmap(packet);
+    if (seid == 0 || !(ot & 0x60) || !(sf & 0x018)) return;
+    avdtp_configuration_mpeg_aac_t c;
+    memset(&c, 0, sizeof(c));
+    c.object_type = (ot & 0x40) ? AVDTP_AAC_MPEG2_LC : AVDTP_AAC_MPEG4_LC;
+    c.sampling_frequency = (sf & 0x010) ? 44100 : 48000;
+    c.channels = (ch & 0x4) ? 2 : 1;
+    uint32_t br = a2dp_subevent_signaling_media_codec_mpeg_aac_capability_get_bit_rate(packet);
+    c.bit_rate = (br == 0 || br > 320000) ? 320000 : br;
+    c.vbr = a2dp_subevent_signaling_media_codec_mpeg_aac_capability_get_vbr(packet);
+    c.drc = false;
+    uint8_t st = a2dp_sink_set_config_mpeg_aac(a2dp_subevent_signaling_media_codec_mpeg_aac_capability_get_a2dp_cid(packet),
+                                               seid,
+                                               a2dp_subevent_signaling_media_codec_mpeg_aac_capability_get_remote_seid(packet), &c);
+    ESP_LOGW(TAG, "phone offers AAC: choosing it (%lu Hz, %u ch, seid %u) -> 0x%02x", (unsigned long)c.sampling_frequency,
+             c.channels, seid, st);
+}
+
 /* events of the standby phone; true = handled here */
 static bool alt_event(uint8_t *packet)
 {
@@ -1508,12 +1567,16 @@ static bool alt_event(uint8_t *packet)
         s_alt.con = h;
         s_alt.cfg_rate = 44100;
         ESP_LOGW(TAG, "multipoint: second phone %s connected (standby)", bd_addr_to_str(a));
+        remember_phones(s_peer, a);
         if (gap_get_role(h) != HCI_ROLE_MASTER) role_check_soon(h, a);
         a2dp_in_refresh_discoverable();                     /* two phones: not connectable */
         return true;
     }
     if (!s_alt.used || cid != s_alt.a2dp_cid || cid == s_a2dp_cid) return false;
     switch (packet[2]) {
+    case A2DP_SUBEVENT_SIGNALING_MEDIA_CODEC_MPEG_AAC_CAPABILITY:
+        aac_choose(packet, s_aac2_seid);          /* we called it: the second phone's AAC endpoint */
+        return true;
     case A2DP_SUBEVENT_SIGNALING_MEDIA_CODEC_MPEG_AAC_CONFIGURATION:
         s_alt.codec = CODEC_AAC;
         s_alt.local_seid = a2dp_subevent_signaling_media_codec_mpeg_aac_configuration_get_local_seid(packet);
@@ -1688,9 +1751,12 @@ static void a2dp_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet,
     switch (packet[2]) {
     case A2DP_SUBEVENT_SIGNALING_CONNECTION_ESTABLISHED: {
         uint8_t st = a2dp_subevent_signaling_connection_established_get_status(packet);
-        a2dp_subevent_signaling_connection_established_get_bd_addr(packet, s_peer);
+        bd_addr_t addr;
+        a2dp_subevent_signaling_connection_established_get_bd_addr(packet, addr);
         if (st != ERROR_CODE_SUCCESS) {
-            ESP_LOGW(TAG, "A2DP connect to %s failed, status 0x%02x", bd_addr_to_str(s_peer), st);
+            /* s_peer stays: a failed connect to another phone (the second call-back) must not
+             * point AVRCP, volume and the call-back at it while the first phone plays on */
+            ESP_LOGW(TAG, "A2DP connect to %s failed, status 0x%02x", bd_addr_to_str(addr), st);
             reconnect_failed();
             if (s_pair_call_active) {                 /* after an LE pairing: try again shortly */
                 s_pair_call_active = false;
@@ -1700,6 +1766,7 @@ static void a2dp_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet,
             }
             break;
         }
+        bd_addr_copy(s_peer, addr);
         s_pair_call_active = false;
         reconnect_succeeded();
         s_conn_ms = btstack_run_loop_get_time_ms();
@@ -1707,14 +1774,7 @@ static void a2dp_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet,
         s_a2dp_cid = a2dp_subevent_signaling_connection_established_get_a2dp_cid(packet);
         s_connected = true;
         link_tune_refresh("A2DP connected");
-        {   /* remember the phone: called back at power-up */
-            nvs_handle_t h;
-            if (nvs_open("s31", NVS_READWRITE, &h) == ESP_OK) {
-                nvs_set_blob(h, "last_phone", s_peer, 6);
-                nvs_commit(h);
-                nvs_close(h);
-            }
-        }
+        remember_phones(s_peer, s_alt.used ? s_alt.addr : NULL);   /* called back at power-up */
         hci_con_handle_t h = a2dp_subevent_signaling_connection_established_get_con_handle(packet);
         s_a2dp_con = h;
         hci_role_t role = gap_get_role(h);
@@ -1732,30 +1792,9 @@ static void a2dp_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet,
         btstack_run_loop_add_timer(&s_avrcp_timer);
         break;
     }
-    case A2DP_SUBEVENT_SIGNALING_MEDIA_CODEC_MPEG_AAC_CAPABILITY: {
-        /* We opened the stream (power-up call-back): BTstack would pick SBC on its
-         * own - choose AAC-LC when the phone has it. Bitmaps as BTstack reports them:
-         * object type b6 MPEG-2 LC, b5 MPEG-4 LC; rate 0x010 44.1 kHz, 0x008 48 kHz;
-         * channels 0x4 two, 0x8 one. */
-        uint8_t ot = a2dp_subevent_signaling_media_codec_mpeg_aac_capability_get_object_type_bitmap(packet);
-        uint16_t sf = a2dp_subevent_signaling_media_codec_mpeg_aac_capability_get_sampling_frequency_bitmap(packet);
-        uint8_t ch = a2dp_subevent_signaling_media_codec_mpeg_aac_capability_get_channels_bitmap(packet);
-        if (s_aac_seid == 0 || !(ot & 0x60) || !(sf & 0x018)) break;
-        avdtp_configuration_mpeg_aac_t c;
-        memset(&c, 0, sizeof(c));
-        c.object_type = (ot & 0x40) ? AVDTP_AAC_MPEG2_LC : AVDTP_AAC_MPEG4_LC;
-        c.sampling_frequency = (sf & 0x010) ? 44100 : 48000;
-        c.channels = (ch & 0x4) ? 2 : 1;
-        uint32_t br = a2dp_subevent_signaling_media_codec_mpeg_aac_capability_get_bit_rate(packet);
-        c.bit_rate = (br == 0 || br > 320000) ? 320000 : br;
-        c.vbr = a2dp_subevent_signaling_media_codec_mpeg_aac_capability_get_vbr(packet);
-        c.drc = false;
-        uint8_t st = a2dp_sink_set_config_mpeg_aac(a2dp_subevent_signaling_media_codec_mpeg_aac_capability_get_a2dp_cid(packet),
-                                                   s_aac_seid,
-                                                   a2dp_subevent_signaling_media_codec_mpeg_aac_capability_get_remote_seid(packet), &c);
-        ESP_LOGW(TAG, "phone offers AAC: choosing it (%lu Hz, %u ch) -> 0x%02x", (unsigned long)c.sampling_frequency, c.channels, st);
+    case A2DP_SUBEVENT_SIGNALING_MEDIA_CODEC_MPEG_AAC_CAPABILITY:
+        aac_choose(packet, s_aac_seid);
         break;
-    }
     case A2DP_SUBEVENT_SIGNALING_MEDIA_CODEC_MPEG_AAC_CONFIGURATION: {
         uint32_t sr = a2dp_subevent_signaling_media_codec_mpeg_aac_configuration_get_sampling_frequency(packet);
         s_codec = CODEC_AAC;
@@ -2242,7 +2281,10 @@ void a2dp_in_setup(void)
                                                                     sizeof(aac_cfg2));
     avdtp_stream_endpoint_t *ep2 = a2dp_sink_create_stream_endpoint(AVDTP_AUDIO, AVDTP_CODEC_SBC, s_sbc_caps,
                                                                    sizeof(s_sbc_caps), sbc_cfg2, sizeof(sbc_cfg2));
-    if (aep2) avdtp_sink_register_delay_reporting_category(avdtp_local_seid(aep2));
+    if (aep2) {
+        s_aac2_seid = avdtp_local_seid(aep2);
+        avdtp_sink_register_delay_reporting_category(s_aac2_seid);
+    }
     if (ep2) avdtp_sink_register_delay_reporting_category(avdtp_local_seid(ep2));
     ESP_LOGW(TAG, "A2DP sink endpoints: AAC-LC seid %u, SBC seid %u (+ AAC %u, SBC %u for a second phone)", s_aac_seid,
              s_sbc_seid, aep2 ? avdtp_local_seid(aep2) : 0, ep2 ? avdtp_local_seid(ep2) : 0);
@@ -2277,11 +2319,12 @@ void a2dp_in_setup(void)
     /* Just Works like a speaker: BTstack's default leaves the phone's User
      * Confirmation Request unanswered, so pairing timed out (reason 0x15). */
     gap_ssp_set_auto_accept(1);
-    /* BR/EDR Secure Connections off: the S31 controller brings a reconnect up
-     * with E0 encryption even when the bond used SC, and BTstack then aborts
-     * the link ("SC during pairing, but only E0 now" -> host disconnect, 0x16
-     * ~300 ms after the phone connects). Legacy SSP (P-192) like most speakers. */
-    gap_secure_connections_enable(false);
+    /* BR/EDR Secure Connections on, as the Xtreme 5. It was off because reconnects came up
+     * with E0 on SC bonds ("SC during pairing, but only E0 now" -> 0x16) - the controller
+     * AES bug (idf-patches/0011) that also broke LE encryption. Without it a phone paired
+     * over LE (CTKD, SC key) could not be called back: our outgoing link fell back to
+     * legacy authentication and the phone refused it. */
+    gap_secure_connections_enable(true);
     gap_set_bondable_mode(1);
     gap_set_class_of_device(0x240414);            /* audio, loudspeaker */
     /* Page scan: the controller default (11.25 ms every 1.28 s, standard) let a
@@ -2365,6 +2408,7 @@ static void reconn_level_restore(btstack_timer_source_t *ts)
 }
 static bd_addr_t s_last_phone;
 
+static void prev_phone_soon(uint32_t ms);
 static bool s_cb_boot_wait;                       /* the power-up call-back is scheduled, not run yet */
 
 bool a2dp_in_callback_busy(void) { return s_cb_boot_wait || s_reconn_pending; }
@@ -2382,22 +2426,11 @@ static void reconnect_cb(btstack_timer_source_t *ts)
         ESP_LOGW(TAG, "power-up call-back failed %d times: next boot leaves %s to reconnect itself",
                  RECONN_TRIES, bd_addr_to_str(s_last_phone));
         reconn_bad_store(true);
+        prev_phone_soon(500);
         return;
     }
-    /* A Secure Connections key (CTKD, from the phone's LE pairing) cannot authenticate a
-     * link WE start: with BR/EDR SC off the controller tries legacy authentication, the
-     * phone refuses it and a new pairing starts that hangs ~9 s and blocks the phone's own
-     * reconnect. Such a phone reconnects itself (LE first, then Classic) - leave it to it. */
-    {
-        link_key_t k;
-        link_key_type_t t = INVALID_LINK_KEY;
-        if (gap_get_link_key_for_bd_addr(s_last_phone, k, &t) && gap_secure_connection_for_link_key_type(t)) {
-            s_reconn_pending = false;
-            ESP_LOGW(TAG, "power-up: %s has an LE-paired (SC) key - not calling it back, it reconnects itself",
-                     bd_addr_to_str(s_last_phone));
-            return;
-        }
-    }
+    /* A phone paired over LE (CTKD, Secure Connections key) is called back like any other
+     * now that BR/EDR SC is on (see a2dp_in_setup) - as the Xtreme 5 pages its last phones */
     s_reconn_tries++;
     s_reconn_level = (s_reconn_tries & 1) ? s_reconn_first_level : (uint8_t)(2 - s_reconn_first_level);
     /* AVDTP takes the level when it opens its channel (after its SDP query) */
@@ -2472,6 +2505,51 @@ static void reconn_abort_on_pairing(const uint8_t *addr)
     if (c) gap_disconnect(c->con_handle);
 }
 
+/* After the last phone (or its failed call-back): page the phone before it too - the
+ * Xtreme 5 reconnects its recent phones, not only the last. One try; it lands on the
+ * second endpoint pair (alt_event) or, if the first phone is not back, as the first. */
+static btstack_timer_source_t s_prev_timer;
+static void prev_phone_cb(btstack_timer_source_t *ts)
+{
+    (void)ts;
+    if (!s_prev_valid || s_pairing || s_stereo_sec || s_alt.used) return;
+    if (bd_addr_cmp(s_prev_phone, s_last_phone) == 0) return;
+    if (s_connected && bd_addr_cmp(s_prev_phone, s_peer) == 0) return;
+    if (hci_connection_for_bd_addr_and_type(s_prev_phone, BD_ADDR_TYPE_ACL) != NULL) return;   /* it came itself */
+    static uint8_t waits;
+    if (s_reconn_pending || auracast_state() != AURACAST_STATE_OFF) {
+        /* the last phone's try still runs, or a BIG is on air (paging next to it failed):
+         * later, for up to ~30 s */
+        if (++waits <= 15) {
+            btstack_run_loop_set_timer(&s_prev_timer, 2000);
+            btstack_run_loop_add_timer(&s_prev_timer);
+        }
+        return;
+    }
+    waits = 0;
+    gap_set_security_level(LEVEL_2);
+    uint16_t cid = 0;
+    uint8_t st;
+    if (s_connected) {
+        /* a second phone: open AVRCP only and let the phone bring its A2DP up itself, as when
+         * it connects to us. Our own A2DP setup to a second phone was torn down by the phone
+         * 0.4 s after its AVRCP came up, every time (one Android phone, 2026-11-24). */
+        st = avrcp_connect(s_prev_phone, &cid);
+    } else {
+        st = a2dp_sink_establish_stream(s_prev_phone, &cid);   /* the first phone is not back */
+    }
+    ESP_LOGW(TAG, "power-up: calling back the phone before it too, %s (%s) -> 0x%02x", bd_addr_to_str(s_prev_phone),
+             s_connected ? "AVRCP, the phone opens A2DP" : "A2DP", st);
+}
+
+static void prev_phone_soon(uint32_t ms)
+{
+    btstack_run_loop_remove_timer(&s_prev_timer);
+    btstack_run_loop_set_timer_handler(&s_prev_timer, prev_phone_cb);
+    btstack_run_loop_set_timer(&s_prev_timer, ms);
+    btstack_run_loop_add_timer(&s_prev_timer);
+}
+
 static void reconnect_failed(void)
 {
     if (!s_reconn_pending) return;
@@ -2496,6 +2574,7 @@ static void reconnect_succeeded(void)
         s_reconn_first_level = s_reconn_level;
     }
     ESP_LOGW(TAG, "power-up call-back worked at security level %u (try %d)", s_reconn_level, s_reconn_tries);
+    prev_phone_soon(5000);              /* a phone that reconnects itself does so in ~4 s */
     if (s_reconn_bad_valid) {
         s_reconn_bad_valid = false;
         reconn_bad_store(false);
@@ -2536,6 +2615,8 @@ void a2dp_in_on_hci_working(void)
         return;
     }
     esp_err_t err = nvs_get_blob(h, "last_phone", s_last_phone, &n);
+    size_t pn = 6;
+    s_prev_valid = nvs_get_blob(h, "prev_phone", s_prev_phone, &pn) == ESP_OK && pn == 6;
     uint8_t lvl;
     if (nvs_get_u8(h, "cb_level", &lvl) == ESP_OK && (lvl == 0 || lvl == 2)) s_reconn_first_level = lvl;
     size_t bn = 6;
@@ -2550,6 +2631,7 @@ void a2dp_in_on_hci_working(void)
         reconn_bad_store(false);
         ESP_LOGW(TAG, "power-up: not calling back %s this boot (its call-back failed last time; next boot tries again)",
                  bd_addr_to_str(s_last_phone));
+        prev_phone_soon(300);
         return;
     }
     btstack_run_loop_set_timer_handler(&s_reconn_timer, reconnect_cb);
@@ -2565,7 +2647,11 @@ static void callback_now(void *ctx)
     (void)ctx;
     static const bd_addr_t zero = { 0 };
     if (bd_addr_cmp(s_last_phone, zero) == 0) { ESP_LOGW(TAG, "callback: no last phone"); return; }
-    if (s_connected) { ESP_LOGW(TAG, "callback: a phone is connected already"); return; }
+    if (s_connected) {                            /* one is back: the one before it */
+        ESP_LOGW(TAG, "callback: a phone is connected - calling the one before it");
+        prev_phone_soon(10);
+        return;
+    }
     s_reconn_bad_valid = false;
     reconn_bad_store(false);
     s_reconn_tries = 0;
