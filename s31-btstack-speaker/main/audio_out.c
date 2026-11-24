@@ -2,6 +2,7 @@
 #include "audio_out.h"
 
 #include <stdlib.h>
+#include <math.h>
 #include <string.h>
 
 #include "driver/i2s_std.h"
@@ -55,6 +56,22 @@ static const int16_t *volatile s_tone_pcm;
 static volatile uint32_t s_tone_len, s_tone_rate, s_tone_seq;
 static volatile bool s_tone_cut;
 static volatile uint32_t st_tones;
+static volatile int32_t st_peak_in, st_peak_out;  /* |sample| max this window: before / after the volume */
+
+static int32_t peak_of(const int16_t *lr, int n)
+{
+    int32_t m = 0;
+    for (int i = 0; i < 2 * n; i++) {
+        int32_t v = lr[i] < 0 ? -(int32_t)lr[i] : lr[i];
+        if (v > m) m = v;
+    }
+    return m;
+}
+
+static int peak_db(int32_t p)                     /* dBFS, -99 = digital silence */
+{
+    return p <= 0 ? -99 : (int)lrintf(20.0f * log10f((float)p / 32768.0f));
+}
 
 void audio_out_tone(const int16_t *pcm, uint32_t samples, uint32_t rate, bool cut)
 {
@@ -167,6 +184,10 @@ void audio_out_push(ao_owner_t owner, const int16_t *lr, int n)
         return;                                   /* not ours, or the writer has not flushed yet */
     }
     static int16_t vol_buf[480 * 2];
+    {
+        int32_t p = peak_of(lr, n);
+        if (p > st_peak_in) st_peak_in = p;
+    }
     if ((owner == AO_HOST || owner == AO_LOCAL) && n <= 480) {
         memcpy(vol_buf, lr, (size_t)n * 4);       /* phone volume: here, not on the broadcast */
         a2dp_in_apply_volume(vol_buf, n);         /* EQ: in the writer (HOST: in the encoder path) */
@@ -187,6 +208,10 @@ void audio_out_push(ao_owner_t owner, const int16_t *lr, int n)
     uint32_t space = ring_space(&s_ring);
     if ((uint32_t)n > space) {                    /* producer ahead (should not happen): keep the newest */
         st_dropped += ring_drop_oldest(&s_ring, (uint32_t)n - space);
+    }
+    {
+        int32_t p = peak_of(lr, n);
+        if (p > st_peak_out) st_peak_out = p;
     }
     ring_write(&s_ring, (const uint32_t *)lr, (uint32_t)n);
     st_pushed += (uint32_t)n;
@@ -361,8 +386,8 @@ void audio_out_setup(void)
 void audio_out_log_stats(void)
 {
     static const char *const names[] = { "idle", "HOST", "LOCAL", "LISTEN" };
-    ESP_LOGI(TAG, "I2S 2s: %s, %s, line %lu ms (target %lu ms + 20 DMA), sync error %ld.%ld ms | trims %lu, coarse %lu | underruns %lu, primes %lu, dropped %lu | tones %lu",
-             names[s_owner], s_primed ? "playing" : "priming/silent",
+    ESP_LOGI(TAG, "I2S 2s: %s, %s, peak in %d dBFS -> out %d dBFS | line %lu ms (target %lu ms + 20 DMA), sync error %ld.%ld ms | trims %lu, coarse %lu | underruns %lu, primes %lu, dropped %lu | tones %lu",
+             names[s_owner], s_primed ? "playing" : "priming/silent", peak_db(st_peak_in), peak_db(st_peak_out),
              (unsigned long)(ring_fill(&s_ring) / (s_rate_cur / 1000u)),
              (unsigned long)(s_delay_frames / (s_rate_cur / 1000u)),
              (long)(st_err_frames * 10 / (int32_t)(s_rate_cur / 1000u)) / 10,
@@ -370,4 +395,5 @@ void audio_out_log_stats(void)
              (unsigned long)st_trims, (unsigned long)st_coarse,
              (unsigned long)st_underruns, (unsigned long)st_primes, (unsigned long)st_dropped,
              (unsigned long)st_tones);
+    st_peak_in = st_peak_out = 0;
 }

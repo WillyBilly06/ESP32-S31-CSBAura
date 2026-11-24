@@ -7,4 +7,6 @@
 
 void power_soft_off(const char *why);  /* BT thread */
 bool power_is_off(void);               /* any thread */
-void power_wake(void);                 /* any thread: restart if off */
+void power_wake(void);
+/* any thread: links closed (as power-off), then restart */
+void power_reboot(void);                 /* any thread: restart if off */

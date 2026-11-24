@@ -1000,6 +1000,38 @@ void jbl_v5_eq_tws_apply(const uint8_t *p, uint16_t n)
     ESP_LOGW(TAG, "stereo pair: EQ from the primary: category 0x%02x, %u bands", c.cat, nb);
 }
 
+/* power-up: call the phone back first, then make the pair - paging the phone next to the
+ * pair's broadcast failed (page timeout) or took 11 s; alone it takes ~1.5 s */
+static btstack_timer_source_t s_boot_resume_timer;
+static uint32_t s_boot_resume_t0;
+
+static void boot_resume_cb(btstack_timer_source_t *ts)
+{
+    (void)ts;
+    uint32_t now = btstack_run_loop_get_time_ms();
+    if (a2dp_in_callback_busy() && now - s_boot_resume_t0 < 8000) {
+        btstack_run_loop_set_timer(&s_boot_resume_timer, 200);
+        btstack_run_loop_add_timer(&s_boot_resume_timer);
+        return;
+    }
+    ESP_LOGW(TAG, "stereo pair: phone call-back %s after %lu ms - pair now", a2dp_in_callback_busy() ? "still busy" : "done",
+             (unsigned long)(now - s_boot_resume_t0));
+    jbl_v5_stereo_resume();
+}
+
+void jbl_v5_stereo_resume_at_boot(void)
+{
+    if (cfg.stereo_role != 2) {                   /* secondary: it drops its phone once linked anyway */
+        jbl_v5_stereo_resume();
+        return;
+    }
+    s_boot_resume_t0 = btstack_run_loop_get_time_ms();
+    btstack_run_loop_remove_timer(&s_boot_resume_timer);
+    btstack_run_loop_set_timer_handler(&s_boot_resume_timer, boot_resume_cb);
+    btstack_run_loop_set_timer(&s_boot_resume_timer, 500);   /* the call-back is scheduled 300 ms after HCI */
+    btstack_run_loop_add_timer(&s_boot_resume_timer);
+}
+
 void jbl_v5_stereo_ungroup_local(void)
 {
     if (cfg.stereo_role == 0) return;

@@ -40,6 +40,7 @@
 #include "sdkconfig.h"
 
 #include "a2dp_in.h"
+#include "power.h"
 #include "auracast.h"
 #include "jbl_v5.h"
 #include "csb.h"
@@ -167,6 +168,8 @@ static void run_cmd(void *ctx)
         }
     } else if (!strcmp(c, "lereach on") || !strcmp(c, "lereach off")) {
         le_audio_set_reachable(c[9] == 'n');
+    } else if (!strncmp(c, "avrcpwait ", 10)) {
+        a2dp_in_set_avrcp_wait((uint32_t)strtoul(c + 10, NULL, 10));
     } else if (!strcmp(c, "callback")) {
         a2dp_in_callback_now();
     } else if (!strcmp(c, "forget")) {
@@ -256,9 +259,8 @@ static void run_cmd(void *ctx)
     } else if (!strcmp(c, "stacks")) {
         stacks_dump();
     } else if (!strcmp(c, "reboot")) {
-        ESP_LOGW(TAG, "rebooting");
-        vTaskDelay(pdMS_TO_TICKS(50));
-        esp_restart();
+        ESP_LOGW(TAG, "rebooting (links closed first, as a power cycle)");
+        power_reboot();
     } else if (!strcmp(c, "help") || !c[0]) {
         ESP_LOGW(TAG, "commands: pair | aura [on|off] | vol+ | vol- | play | leaudio on|off | forget | switchpair | v5set <id> <hex> | "
                       "tone <name> | status | aestest | stacks | reboot");

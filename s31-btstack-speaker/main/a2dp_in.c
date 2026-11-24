@@ -973,6 +973,9 @@ static void delay_report_soon(uint32_t ms)
  * 11 Pro): without AVRCP the phone keeps its volume to itself. Watch it: no
  * link 4 s after the attempt -> drop the pending one and try again (3 tries). */
 #define AVRCP_TRIES      3
+/* how long the phone gets to open AVRCP itself (console "avrcpwait <ms>") */
+static uint32_t s_avrcp_wait_ms = 400;
+void a2dp_in_set_avrcp_wait(uint32_t ms) { s_avrcp_wait_ms = ms; ESP_LOGW(TAG, "AVRCP wait %lu ms", (unsigned long)ms); }
 #define AVRCP_WATCH_MS   4000
 static uint16_t s_avrcp_pending_cid;
 static int s_avrcp_tries;
@@ -1707,7 +1710,7 @@ static void a2dp_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet,
         s_avrcp_tries = 0;
         s_avrcp_pending_cid = 0;
         btstack_run_loop_set_timer_handler(&s_avrcp_timer, avrcp_connect_cb);
-        btstack_run_loop_set_timer(&s_avrcp_timer, 400);    /* the phone holds its stream until AVRCP is up: 2 s here = 2 s reconnect delay */
+        btstack_run_loop_set_timer(&s_avrcp_timer, s_avrcp_wait_ms);   /* the phone holds its stream until AVRCP is up */
         btstack_run_loop_add_timer(&s_avrcp_timer);
         break;
     }
@@ -2334,9 +2337,14 @@ static void reconn_level_restore(btstack_timer_source_t *ts)
 }
 static bd_addr_t s_last_phone;
 
+static bool s_cb_boot_wait;                       /* the power-up call-back is scheduled, not run yet */
+
+bool a2dp_in_callback_busy(void) { return s_cb_boot_wait || s_reconn_pending; }
+
 static void reconnect_cb(btstack_timer_source_t *ts)
 {
     (void)ts;
+    s_cb_boot_wait = false;
     if (s_connected) {
         s_reconn_pending = false;
         return;
@@ -2519,6 +2527,7 @@ void a2dp_in_on_hci_working(void)
     btstack_run_loop_set_timer_handler(&s_reconn_timer, reconnect_cb);
     btstack_run_loop_set_timer(&s_reconn_timer, 300);
     btstack_run_loop_add_timer(&s_reconn_timer);
+    s_cb_boot_wait = true;
 }
 
 /* console "callback": forget a failed call-back and call the last phone back now (BT thread) */

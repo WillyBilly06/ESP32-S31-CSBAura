@@ -32,6 +32,33 @@ void power_soft_off(const char *why)
 
 bool power_is_off(void) { return s_off; }
 
+/* a clean restart, as a power cycle: BTstack's power-off disconnects every link first, so
+ * phones see the speaker go (an abrupt restart left them on a dead link that ignored our
+ * call-back page until it timed out) */
+static btstack_timer_source_t s_reboot_timer;
+static btstack_context_callback_registration_t s_reboot_reg;
+
+static void reboot_now(btstack_timer_source_t *ts)
+{
+    (void)ts;
+    esp_restart();
+}
+
+static void reboot_on_bt(void *ctx)
+{
+    (void)ctx;
+    hci_power_control(HCI_POWER_OFF);
+    btstack_run_loop_set_timer_handler(&s_reboot_timer, reboot_now);
+    btstack_run_loop_set_timer(&s_reboot_timer, 800);
+    btstack_run_loop_add_timer(&s_reboot_timer);
+}
+
+void power_reboot(void)
+{
+    s_reboot_reg.callback = reboot_on_bt;
+    btstack_run_loop_execute_on_main_thread(&s_reboot_reg);
+}
+
 void power_wake(void)
 {
     if (s_off) {

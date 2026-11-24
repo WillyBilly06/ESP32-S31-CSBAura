@@ -39,6 +39,8 @@ void jbl_v5_on_write(hci_con_handle_t con, const uint8_t *data, uint16_t len);
 void jbl_v5_log_stats(void);
 /* BT thread, at HCI working: a stored stereo pair (0x2C03/0x2C81) reconnects, as a real speaker */
 void jbl_v5_stereo_resume(void);
+/* BT thread, at power-up: resume the stored pair once the phone call-back is done (8 s at most) */
+void jbl_v5_stereo_resume_at_boot(void);
 /* BT thread, from lls.c: the stereo partner ungrouped the pair / set our channel (AA 13) */
 void jbl_v5_stereo_partner_ungrouped(void);
 /* BT thread: ungroup from here (a key), as the app's 0x2C07 = 0 */

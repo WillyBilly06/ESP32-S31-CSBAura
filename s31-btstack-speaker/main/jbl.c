@@ -286,7 +286,7 @@ void jbl_on_hci_working(void)
         s_mac_crc = crc;
     }
     jbl_v5_set_local_addr(a);
-    jbl_v5_stereo_resume();
+    jbl_v5_stereo_resume_at_boot();
     ESP_LOGW(TAG, "JBL identity: BT MAC %s -> macAddressCrc 0x%04x (the user's Xtreme 5 is 0x10cd)",
              bd_addr_to_str(a), crc);
 

@@ -113,6 +113,10 @@ void a2dp_in_refresh_discoverable(void);
 void a2dp_in_set_stereo_secondary(bool on);
 /* any thread (console "callback"): clear a failed call-back and call the last phone back now */
 void a2dp_in_callback_now(void);
+/* the power-up call-back of the last phone is scheduled or paging (the stereo pair waits for it) */
+bool a2dp_in_callback_busy(void);
+/* console: how long the phone gets to open AVRCP itself before we do */
+void a2dp_in_set_avrcp_wait(uint32_t ms);
 bool a2dp_in_pairing(void);
 
 /* BT thread: a phone just bonded over LE (its classic key derived, CTKD). Samsung pages
