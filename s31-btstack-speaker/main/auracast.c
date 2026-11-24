@@ -1726,6 +1726,8 @@ void auracast_set_iso_forward_handler(btstack_packet_handler_t handler)
     s_iso_fwd = handler;
 }
 
+static uint32_t l_sent0_q, l_ns_q;               /* last logged: skip the lines while off and idle */
+
 void auracast_log_stats(void)
 {
     static uint32_t l_sent[AURA_NUM_BIS], l_done[AURA_NUM_BIS];
@@ -1743,6 +1745,13 @@ void auracast_log_stats(void)
     unsigned ctl_free = on ? r_ble_ll_iso_free_buf_num_get(s_bis[0]) : 0;
     st_stats_window++;                            /* encoder restarts its max */
 
+    /* off and nothing moved: no statistics (they printed zeros every 2 s) */
+    static bool was_on = true;
+    bool quiet = !on && !was_on && sent0 == l_sent0_q && ns == l_ns_q;
+    was_on = on;
+    l_sent0_q = sent0;
+    l_ns_q = ns;
+    if (quiet) return;
     ESP_LOGW(TAG, "AURA 2s: %s | SDUs sent L %lu R %lu, done L %lu R %lu (%s), not sent: host %lu ctrl %lu | "
              "late (silence) %lu, trimmed %lu | ready %lu/%d, in flight %lu, ctrl free %u | "
              "LC3 L+R avg %lu us max %lu us (%lu fr) | PCM underruns %lu, wdog %lu, rq full %lu, stack free %u B",

@@ -1052,6 +1052,22 @@ static void role_retry(btstack_timer_source_t *ts)
         ESP_LOGE(TAG, "role: still SLAVE after %d requests - phone audio may stutter", ROLE_TRIES);
         return;
     }
+    /* the controller cannot schedule a role switch next to our BIG ("r_olc_acl_rsw_sched sched
+     * failed"), and the failed tries left the link unstable (supervision timeouts): wait for
+     * the broadcast to stop (checked every 2 s, 2 min at most) */
+    static uint32_t waited_ms;
+    if (auracast_state() == AURACAST_STATE_OFF) waited_ms = 0;
+    if (auracast_state() != AURACAST_STATE_OFF) {
+        if (s_role_tries == 0 && waited_ms == 0) {
+            ESP_LOGW(TAG, "role: S31 is SLAVE - no switch while broadcasting (the controller cannot); asking once it stops");
+        }
+        waited_ms += 2000;
+        if (waited_ms > 120000) { waited_ms = 0; return; }
+        btstack_run_loop_set_timer_handler(ts, role_retry);
+        btstack_run_loop_set_timer(ts, 2000);
+        btstack_run_loop_add_timer(ts);
+        return;
+    }
     s_role_tries++;
     if (hci_can_send_command_packet_now()) {          /* our policy forbids switches: allow it on this link */
         hci_send_cmd(&hci_write_link_policy_settings, s_role_con, 0x0001);

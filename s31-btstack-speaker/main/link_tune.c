@@ -233,6 +233,14 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
                  hci_event_connection_packet_type_changed_get_packet_types(packet),
                  pkt_types_str(hci_event_connection_packet_type_changed_get_packet_types(packet), buf, sizeof(buf)));
         break;
+    case HCI_EVENT_COMMAND_STATUS:
+        /* QoS Setup refused (0x12 right after a connect, before the link is set up): it was marked
+         * applied - make every link ask again on the next tick */
+        if (hci_event_command_status_get_command_opcode(packet) == 0x0807 &&
+            hci_event_command_status_get_status(packet) != ERROR_CODE_SUCCESS) {
+            for (int i = 0; i < MAX_ACL; i++) s_links[i].applied = 0;
+        }
+        break;
     case HCI_EVENT_MAX_SLOTS_CHANGED:
         ESP_LOGW(TAG, "ACL 0x%04x max slots now %u", hci_event_max_slots_changed_get_handle(packet),
                  hci_event_max_slots_changed_get_lmp_max_slots(packet));

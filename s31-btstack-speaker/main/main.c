@@ -297,6 +297,9 @@ void app_main(void)
     /* LMP opcode 54 (LMP_page_scan_mode_req, deprecated) from phones: the closed
      * controller rejects it and continues - logged at ERROR on every connect */
     esp_log_level_set("OLM_LMP", ESP_LOG_NONE);
+    /* the controller's scheduler logs every page scan / page window at WARN ("OLC: pscan ...",
+     * "OLC: page tle ...") - debug noise; its errors stay */
+    esp_log_level_set("OLC", ESP_LOG_ERROR);
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         nvs_flash_erase();
