@@ -972,8 +972,13 @@ int
 wr_btdm_osal_task_create(btdm_osal_task_fn *fn, const char *name, uint32_t stack_size, void *arg,
                          uint32_t priority, btdm_osal_task_handle_t *task_handle, uint32_t core_id)
 {
-    return xTaskCreatePinnedToCore(fn, name, stack_size, arg, priority, (TaskHandle_t *)task_handle,
-                                   (core_id < portNUM_PROCESSORS ? core_id : tskNO_AFFINITY)) ==
+    /* The stack must be DMA-capable internal RAM: the BT MAC's AES (ECB) engine DMAs its result
+     * into a buffer on the calling task's stack (HCI LE Encrypt, the LE link session key). A stack
+     * in LP RAM (ESP_SYSTEM_ALLOW_RTC_FAST_MEM_AS_HEAP) never receives it: LE Encrypt answers zeros
+     * and every LE encryption start fails with a MIC failure (0x3D). */
+    return xTaskCreatePinnedToCoreWithCaps(fn, name, stack_size, arg, priority, (TaskHandle_t *)task_handle,
+                                           (core_id < portNUM_PROCESSORS ? core_id : tskNO_AFFINITY),
+                                           MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT) ==
                    pdPASS
                ? BTDM_OSAL_OK
                : BTDM_OSAL_ERROR;
@@ -982,7 +987,7 @@ wr_btdm_osal_task_create(btdm_osal_task_fn *fn, const char *name, uint32_t stack
 void
 wr_btdm_osal_task_delete(btdm_osal_task_handle_t task_handle)
 {
-    vTaskDelete(task_handle);
+    vTaskDeleteWithCaps(task_handle);
 }
 
 /*

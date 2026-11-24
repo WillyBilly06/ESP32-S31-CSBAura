@@ -20,6 +20,7 @@ typedef struct {
     uint16_t name_crc;          /* srcName1Crc, valid if name_known */
     bool name_known;
     bool streaming;             /* 100 ms instead of 20 ms */
+    uint8_t stereo_gid;         /* stereoGroupId (0 = none) */
 } jbl_beacon_state_t;
 
 void jbl_beacon_setup(void);

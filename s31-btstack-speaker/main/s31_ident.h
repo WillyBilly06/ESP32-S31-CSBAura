@@ -22,11 +22,16 @@ extern "C" {
 /* JBL color IDs of the Xtreme 5 (beacon colorID / V5 ColorID), from JBL's model config
  * for product 2169: 00 Black, 01 White, 02 Blue, 05 Purple, 1A Camo */
 #define S31_COLOR_BLACK 0x00
+/* the JBL product this board is (jbl_models.h); default the Xtreme 5 */
+#define S31_MODEL_DEFAULT 0x2169
 
 /* call once, early (before the beacon / JBL One settings are built) */
 void s31_ident_init(void);
 
 uint8_t s31_ident_color(void);
+uint16_t s31_ident_model(void);
+/* console: become another model (pid 0 = back to the flashed one); takes effect on reboot */
+void s31_ident_set_model(uint16_t pid, uint8_t color);
 /* the name chosen at flash time, or "" when none was set */
 const char *s31_ident_name(void);
 /* "S31X5" + the last 3 MAC bytes in hex, e.g. "S31X5A1B2C3" */

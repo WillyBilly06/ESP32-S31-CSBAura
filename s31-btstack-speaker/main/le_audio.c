@@ -18,6 +18,7 @@
  * Classic address), with the ASCS / CAS / TMAS announcements, so Android ties
  * it to the Classic-paired speaker and offers "LE Audio" for it.
  */
+#include "lls.h"
 #include "le_audio.h"
 
 #include <string.h>
@@ -91,6 +92,7 @@ static bool s_enabled;
 static hci_con_handle_t s_con = HCI_CON_HANDLE_INVALID;    /* LE link that drives the ASE */
 static hci_con_handle_t s_cis = HCI_CON_HANDLE_INVALID;
 static bool s_audio_on;
+static bool s_got_first;                                    /* see le_audio_iso_rx */
 static uint32_t s_iso_us = 30000;                           /* CIS ISO interval */
 static uint16_t s_ccc[LA_N];                                /* one client at a time */
 
@@ -143,7 +145,7 @@ static gatt_client_characteristic_t s_mcs_cp_chr;
 static gatt_client_notification_t s_mcs_notif;
 static bool s_mcs_found, s_mcs_cp_found, s_mcp_done, s_mcs_listening;
 static uint8_t s_mcp_state;                  /* 0 idle, 1 service, 2 char, 3 CCCD, 4 Play write */
-static uint8_t s_play_op = 0x01;
+static uint8_t s_mcp_op = 0x01;                      /* MCS opcode to write: 0x01 Play, 0x02 Pause */
 static uint32_t s_last_gatt_ms;                               /* last GATT write by the phone */
 static hci_con_handle_t s_paired_con = HCI_CON_HANDLE_INVALID;   /* LE link that just paired */
 
@@ -289,6 +291,7 @@ static void audio_start(void)
         return;
     }
     s_audio_on = true;
+    s_got_first = false;
     st_rx = st_lost = st_bad = st_plc = 0;
     /* the phone delivers one ISO interval of SDUs per burst; the broadcast encoder
      * also pulls in ISO-interval bursts, so hosting needs a second interval */
@@ -307,6 +310,9 @@ static void audio_stop(const char *why)
     ESP_LOGW(TAG, "LE Audio stream stopped (%s)", why);
 }
 
+/* the first CIS events carry no audio yet (the phone starts sending ~150 ms after the CIS
+ * is up): the controller reports them as empty / lost. They are not lost music - concealing
+ * them padded the buffer with ~160 ms of PLC and made every stream start "lose" ~16 SDUs. */
 bool le_audio_iso_rx(const uint8_t *packet, uint16_t size)
 {
     if (size < 4 || s_cis == HCI_CON_HANDLE_INVALID) return false;
@@ -324,11 +330,13 @@ bool le_audio_iso_rx(const uint8_t *packet, uint16_t size)
     uint8_t ps = (uint8_t)(lp >> 14);
     off += 4;
     if (ps != 0 || len == 0 || size < off + len) {
+        if (!s_got_first) return true;               /* before the phone's first SDU */
         st_lost++;
         a2dp_in_ext_push(NULL, 0);                   /* PLC */
         return true;
     }
     st_rx++;
+    s_got_first = true;
     a2dp_in_ext_push(packet + off, len);
     return true;
 }
@@ -562,6 +570,197 @@ static int vol_control(const uint8_t *b, uint16_t n)
 }
 
 /* ---- GATT ------------------------------------------------------------------------- */
+/* ---- BASS: scan delegator for the phone's "Listen to audio broadcast" -------------------
+ * The phone (broadcast assistant) finds an Auracast broadcast and writes Add Source; we
+ * join it with the JBL One assistant's machinery (party_assist_join: PA + BIG sync, our own
+ * broadcast off) and report progress in the one Broadcast Receive State. An encrypted
+ * broadcast: we report "Broadcast_Code required", the phone asks the user and writes Set
+ * Broadcast Code, we join again with it. */
+#define BASS_SRC_ID 1
+#define BASS_SUB_MAX 2
+#define BASS_META_MAX 24
+#define BASS_RS_MAX (16 + 16 + BASS_SUB_MAX * (5 + BASS_META_MAX))
+static struct {
+    bool used;
+    uint8_t addr_type;
+    bd_addr_t addr;                     /* BTstack order */
+    uint8_t sid;
+    uint32_t bcast_id;
+    uint8_t pa_req;                     /* 0 do not sync, 1/2 sync */
+    uint8_t nsub;
+    uint32_t bis_req[BASS_SUB_MAX];
+    uint8_t meta_len[BASS_SUB_MAX];
+    uint8_t meta[BASS_SUB_MAX][BASS_META_MAX];
+    bool has_code;
+    uint8_t code[16];                   /* party order (reversed HCI order) */
+    uint8_t pa_state;                   /* 0 not synced, 2 synced, 3 failed */
+    uint8_t enc;                        /* 0 none, 1 code required, 2 decrypting, 3 bad code */
+    bool joined;
+} s_bass;
+
+static uint16_t bass_rs_value(uint8_t *v)
+{
+    if (!s_bass.used) return 0;
+    uint16_t i = 0;
+    v[i++] = BASS_SRC_ID;
+    v[i++] = s_bass.addr_type;
+    reverse_bd_addr(s_bass.addr, v + i); i += 6;
+    v[i++] = s_bass.sid;
+    little_endian_store_24(v, i, s_bass.bcast_id); i += 3;
+    v[i++] = s_bass.pa_state;
+    v[i++] = s_bass.enc;
+    if (s_bass.enc == 3) { memset(v + i, 0, 16); i += 16; }   /* Bad_Code */
+    v[i++] = s_bass.nsub;
+    party_assist_t as;
+    party_assist_get(&as);
+    uint32_t mask = s_bass.joined ? (as.bis_mask ? as.bis_mask : 0x3u) : 0;
+    bool given = false;
+    for (int k = 0; k < s_bass.nsub; k++) {
+        uint32_t st = given ? 0 : (mask & s_bass.bis_req[k]);
+        if (!given && !st && k == s_bass.nsub - 1) st = mask;     /* none matched: the last one */
+        if (st) given = true;
+        little_endian_store_32(v, i, st); i += 4;
+        v[i++] = s_bass.meta_len[k];
+        memcpy(v + i, s_bass.meta[k], s_bass.meta_len[k]); i += s_bass.meta_len[k];
+    }
+    return i;
+}
+
+static void bass_notify(void)
+{
+    uint8_t v[BASS_RS_MAX];
+    uint16_t n = bass_rs_value(v);
+    notify(LA_BASS_RS, v, n);
+    ESP_LOGW(TAG, "BASS receive state: %s PA %u, encryption %u%s", s_bass.used ? "source," : "empty,",
+             s_bass.pa_state, s_bass.enc, s_bass.joined ? ", playing" : "");
+}
+
+static void bass_join(void)
+{
+    s_bass.joined = false;
+    s_bass.pa_state = 0;
+    if (s_bass.enc != 1 || s_bass.has_code) s_bass.enc = 0;
+    ESP_LOGW(TAG, "BASS: phone asks us to listen to broadcast %s (SID %u, Broadcast_ID 0x%06lx)%s",
+             bd_addr_to_str(s_bass.addr), s_bass.sid, (unsigned long)s_bass.bcast_id,
+             s_bass.has_code ? " with its Broadcast_Code" : "");
+    party_bass_join(s_bass.addr, s_bass.addr_type, s_bass.has_code ? s_bass.code : NULL);
+}
+
+/* subgroups of Add / Modify Source: [BIS_Sync 4][Metadata_Length][Metadata] each */
+static bool bass_subgroups(const uint8_t *p, const uint8_t *e, uint8_t nsub)
+{
+    uint8_t keep = nsub > BASS_SUB_MAX ? BASS_SUB_MAX : nsub;   /* more: only the first ones */
+    for (int k = 0; k < nsub; k++) {
+        if (e - p < 5) return false;
+        uint32_t bis = little_endian_read_32(p, 0);
+        uint8_t ml = p[4];
+        p += 5;
+        if (e - p < ml) return false;
+        if (k < keep) {
+            s_bass.bis_req[k] = bis;
+            s_bass.meta_len[k] = ml > BASS_META_MAX ? BASS_META_MAX : ml;
+            memcpy(s_bass.meta[k], p, s_bass.meta_len[k]);
+        }
+        p += ml;
+    }
+    s_bass.nsub = keep;
+    return true;
+}
+
+static int bass_control(hci_con_handle_t con, const uint8_t *b, uint16_t n)
+{
+    if (n < 1) return ATT_ERROR_INVALID_ATTRIBUTE_VALUE_LENGTH;
+    if (gap_get_connection_type(con) != GAP_CONNECTION_ACL) s_con = con;
+    const uint8_t *e = b + n;
+    switch (b[0]) {
+    case 0x00: case 0x01:                                 /* Remote Scan Stopped / Started */
+        ESP_LOGI(TAG, "BASS: phone %s scanning for us", b[0] ? "started" : "stopped");
+        return 0;
+    case 0x02: {                                          /* Add Source */
+        if (n < 16) return ATT_ERROR_INVALID_ATTRIBUTE_VALUE_LENGTH;
+        bool was = s_bass.used;
+        bd_addr_t a;
+        reverse_bd_addr(b + 2, a);
+        bool same = was && bd_addr_cmp(a, s_bass.addr) == 0;
+        s_bass.used = true;
+        s_bass.addr_type = b[1];
+        bd_addr_copy(s_bass.addr, a);
+        s_bass.sid = b[8];
+        s_bass.bcast_id = little_endian_read_24(b, 9);
+        s_bass.pa_req = b[12];
+        if (!same) { s_bass.has_code = false; s_bass.enc = 0; }
+        if (!bass_subgroups(b + 16, e, b[15])) return ATT_ERROR_INVALID_ATTRIBUTE_VALUE_LENGTH;
+        s_bass.joined = false;
+        s_bass.pa_state = 0;
+        if (s_bass.pa_req) bass_join();
+        else if (was) party_assist_leave();
+        bass_notify();
+        return 0;
+    }
+    case 0x03: {                                          /* Modify Source */
+        if (n < 6) return ATT_ERROR_INVALID_ATTRIBUTE_VALUE_LENGTH;
+        if (!s_bass.used || b[1] != BASS_SRC_ID) return 0x81;   /* Invalid Source_ID */
+        s_bass.pa_req = b[2];
+        if (!bass_subgroups(b + 6, e, b[5])) return ATT_ERROR_INVALID_ATTRIBUTE_VALUE_LENGTH;
+        bool any_bis = false;
+        for (int k = 0; k < s_bass.nsub; k++) any_bis |= s_bass.bis_req[k] != 0;
+        if (!s_bass.pa_req || !any_bis) {
+            ESP_LOGW(TAG, "BASS: phone stops our broadcast listening");
+            party_assist_leave();
+            s_bass.joined = false;
+            s_bass.pa_state = 0;
+        } else if (!s_bass.joined && !party_assist_active()) {
+            bass_join();
+        }
+        bass_notify();
+        return 0;
+    }
+    case 0x04:                                            /* Set Broadcast Code */
+        if (n < 18) return ATT_ERROR_INVALID_ATTRIBUTE_VALUE_LENGTH;
+        if (!s_bass.used || b[1] != BASS_SRC_ID) return 0x81;
+        for (int i = 0; i < 16; i++) s_bass.code[i] = b[2 + 15 - i];   /* HCI order -> party order */
+        s_bass.has_code = true;
+        ESP_LOGW(TAG, "BASS: phone sent the Broadcast_Code");
+        if (s_bass.pa_req) bass_join();
+        bass_notify();
+        return 0;
+    case 0x05:                                            /* Remove Source */
+        if (n < 2) return ATT_ERROR_INVALID_ATTRIBUTE_VALUE_LENGTH;
+        if (!s_bass.used || b[1] != BASS_SRC_ID) return 0x81;
+        ESP_LOGW(TAG, "BASS: phone removed the broadcast source");
+        party_assist_leave();
+        memset(&s_bass, 0, sizeof(s_bass));
+        bass_notify();
+        return 0;
+    default:
+        return 0x80;                                      /* Opcode Not Supported */
+    }
+}
+
+void le_audio_bass_assist_result(uint8_t action, uint8_t status)
+{
+    if (!s_bass.used) return;
+    if (action == 0) {                                    /* left */
+        s_bass.joined = false;
+        s_bass.pa_state = 0;
+    } else {
+        switch (status) {
+        case 1: {
+            party_assist_t as;
+            party_assist_get(&as);
+            s_bass.joined = true;
+            s_bass.pa_state = 2;
+            s_bass.enc = as.encrypted ? 2 : 0;
+            break;
+        }
+        case 3: s_bass.joined = false; s_bass.pa_state = 2; s_bass.enc = 3; break;
+        case 4: s_bass.joined = false; s_bass.pa_state = 2; s_bass.enc = 1; s_bass.has_code = false; break;
+        default: s_bass.joined = false; s_bass.pa_state = 3; break;
+        }
+    }
+    bass_notify();
+}
+
 uint16_t le_audio_att_read(hci_con_handle_t con, le_audio_attr_t a, bool ccc, uint16_t offset,
                            uint8_t *buf, uint16_t size)
 {
@@ -578,6 +777,11 @@ uint16_t le_audio_att_read(hci_con_handle_t con, le_audio_attr_t a, bool ccc, ui
     case LA_VOL_STATE: n = vol_state(v); break;
     case LA_VOL_FLAGS: v[0] = 0x01; n = 1; break; /* volume setting persisted */
     case LA_TMAP:  little_endian_store_16(v, 0, LA_TMAP_ROLE); n = 2; break;
+    case LA_BASS_RS: {
+        uint8_t w[BASS_RS_MAX];
+        uint16_t k = bass_rs_value(w);
+        return att_read_callback_handle_blob(w, k, offset, buf, size);
+    }
     default: return 0;
     }
     return att_read_callback_handle_blob(v, n, offset, buf, size);
@@ -595,6 +799,11 @@ int le_audio_att_write(hci_con_handle_t con, le_audio_attr_t a, bool ccc, const 
     }
     switch (a) {
     case LA_ASE_CP: ase_control(con, buf, len); return 0;
+    case LA_BASS_CP: {
+        int r = bass_control(con, buf, len);
+        if (r) ESP_LOGW(TAG, "BASS control point op 0x%02x refused: 0x%02x", len ? buf[0] : 0, r);
+        return r;
+    }
     case LA_VOL_CP: {
         s_con = con;
         int r = vol_control(buf, len);
@@ -607,23 +816,43 @@ int le_audio_att_write(hci_con_handle_t con, le_audio_attr_t a, bool ccc, const 
 
 /* ---- advertising -------------------------------------------------------------------- */
 static bool s_discoverable = true;
+/* LE Audio switched OFF: a phone that used LE Audio reconnects only over LE, to our public
+ * address. For the switch's pairing window that address stays connectable (no LE Audio data),
+ * so the phone gets there, its encryption fails "key missing" (the bonds are gone) and it
+ * drops its old entry, as with the Xtreme 5 - instead of showing "Disconnected" forever */
+static bool s_reach;
+static hci_con_handle_t s_reach_con = HCI_CON_HANDLE_INVALID;
+static bool s_adv_full;                                  /* the advert holds the LE Audio data */
 
 static void adv_build(void)
 {
     uint8_t *d = s_adv;
     unsigned i = 0;
+    s_adv_full = s_enabled;
+    if (!s_enabled) {                                    /* reachable only: flags + appearance */
+        d[i++] = 2; d[i++] = BLUETOOTH_DATA_TYPE_FLAGS;
+        d[i++] = 0x18;                                   /* not discoverable, dual mode */
+        d[i++] = 3; d[i++] = BLUETOOTH_DATA_TYPE_APPEARANCE;
+        little_endian_store_16(d, i, LA_APPEARANCE); i += 2;
+        s_adv_len = (uint8_t)i;
+        s_rsp_len = 0;
+        return;
+    }
     d[i++] = 2; d[i++] = BLUETOOTH_DATA_TYPE_FLAGS;
     d[i++] = s_discoverable ? 0x1A : 0x18;   /* (LE general discoverable) + LE/BR-EDR dual mode;
                                               * bonded phones reconnect without the general flag */
     d[i++] = 9; d[i++] = BLUETOOTH_DATA_TYPE_SERVICE_DATA_16_BIT_UUID;
     little_endian_store_16(d, i, ORG_BLUETOOTH_SERVICE_AUDIO_STREAM_CONTROL_SERVICE); i += 2;
-    d[i++] = 0x00;                                   /* general announcement */
+    /* BAP announcement type: general while pairing; TARGETED otherwise - Android only
+     * auto-reconnects a bonded LE Audio device on a targeted announcement (it saw our
+     * general one after a reboot and stayed "Disconnected" until Connect was tapped) */
+    d[i++] = s_discoverable ? 0x00 : 0x01;
     little_endian_store_16(d, i, LA_SINK_CONTEXTS); i += 2;
     little_endian_store_16(d, i, 0); i += 2;
     d[i++] = 0;                                      /* no metadata */
     d[i++] = 4; d[i++] = BLUETOOTH_DATA_TYPE_SERVICE_DATA_16_BIT_UUID;
     little_endian_store_16(d, i, ORG_BLUETOOTH_SERVICE_COMMON_AUDIO_SERVICE); i += 2;
-    d[i++] = 0x00;
+    d[i++] = s_discoverable ? 0x00 : 0x01;           /* CAP: same announcement type */
     d[i++] = 5; d[i++] = BLUETOOTH_DATA_TYPE_SERVICE_DATA_16_BIT_UUID;
     little_endian_store_16(d, i, ORT_BLUETOOTH_SERVICE_TMAS_SERVICE); i += 2;
     little_endian_store_16(d, i, LA_TMAP_ROLE); i += 2;
@@ -650,9 +879,27 @@ void le_audio_set_discoverable(bool on)
     }
 }
 
+/* stereo pair secondary: no phone links, the radio belongs to the primary's broadcast */
+static bool s_quiet;
+static void adv_update(void);
+
+void le_audio_set_quiet(bool on)
+{
+    if (on == s_quiet) return;
+    s_quiet = on;
+    ESP_LOGW(TAG, "LE Audio advertising %s (stereo pair secondary)", on ? "held" : "released");
+    if (hci_get_state() == HCI_STATE_WORKING) adv_update();
+}
+
 static void adv_update(void)
 {
-    bool want = s_enabled && s_con == HCI_CON_HANDLE_INVALID;
+    bool want = !s_quiet && (s_enabled || s_reach) && s_con == HCI_CON_HANDLE_INVALID && s_reach_con == HCI_CON_HANDLE_INVALID;
+    if (want && s_adv_on && s_adv_full != s_enabled) {   /* LE Audio <-> reachable only: new data */
+        adv_build();
+        gap_extended_advertising_set_adv_data(s_adv_handle, s_adv_len, s_adv);
+        gap_extended_advertising_set_scan_response_data(s_adv_handle, s_rsp_len, s_rsp);
+        ESP_LOGW(TAG, "LE advertising now %s", s_enabled ? "LE Audio" : "reachable only (LE Audio switch)");
+    }
     if (want == s_adv_on) return;
     if (want) {
         if (s_adv_handle == 0xFF) {
@@ -666,7 +913,8 @@ static void adv_update(void)
         gap_extended_advertising_set_adv_data(s_adv_handle, s_adv_len, s_adv);
         gap_extended_advertising_set_scan_response_data(s_adv_handle, s_rsp_len, s_rsp);
         gap_extended_advertising_start(s_adv_handle, 0, 0);
-        ESP_LOGW(TAG, "advertising LE Audio (set %u, public address)", s_adv_handle);
+        ESP_LOGW(TAG, "advertising %s (set %u, public address)",
+                 s_enabled ? "LE Audio" : "reachable only, for phones with the old bond", s_adv_handle);
     } else if (s_adv_handle != 0xFF) {
         gap_extended_advertising_stop(s_adv_handle);
         ESP_LOGW(TAG, "LE Audio advertising off");
@@ -683,6 +931,7 @@ static void link_gone(const char *why)
     s_paired_con = HCI_CON_HANDLE_INVALID;
     s_mcp_done = false;
     s_mcp_state = 0;
+    s_mcs_cp_found = false;
     if (s_mcs_listening) {
         gatt_client_stop_listening_for_characteristic_value_updates(&s_mcs_notif);
         s_mcs_listening = false;
@@ -867,9 +1116,10 @@ static void mcp_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
                 GATT_CLIENT_CHARACTERISTICS_CONFIGURATION_NOTIFICATION);
             break;
         case 3:
-            ESP_LOGW(TAG, "Play over LE: control point notifications on (ATT 0x%02x) - sending Play", st);
+            ESP_LOGW(TAG, "Play over LE: control point notifications on (ATT 0x%02x) - sending %s", st,
+                     s_mcp_op == 0x02 ? "Pause" : "Play");
             s_mcp_state = 4;
-            gatt_client_write_value_of_characteristic(&mcp_handler, s_con, s_mcs_cp_chr.value_handle, 1, &s_play_op);
+            gatt_client_write_value_of_characteristic(&mcp_handler, s_con, s_mcs_cp_chr.value_handle, 1, &s_mcp_op);
             break;
         case 4:
             ESP_LOGW(TAG, "Play over LE: written (ATT 0x%02x)", st);
@@ -894,6 +1144,7 @@ static void mcp_play(btstack_timer_source_t *ts)
      * Audio closes a new AVRCP channel within ms (Play dropped). */
     if (!a2dp_in_was_playing(30000)) return;
     s_mcp_done = true;                                        /* once per connection */
+    s_mcp_op = 0x01;
     s_mcs_found = false;
     s_mcp_state = 1;
     gatt_client_mtu_enable_auto_negotiation(0);             /* this link's client context: no MTU exchange */
@@ -902,6 +1153,41 @@ static void mcp_play(btstack_timer_source_t *ts)
     gatt_client_mtu_enable_auto_negotiation(1);             /* JBL speaker links keep theirs */
     ESP_LOGW(TAG, "A2DP was playing before the switch: Play over LE (media control) -> 0x%02x", st);
     if (st != ERROR_CODE_SUCCESS) s_mcp_state = 0;
+}
+
+/* multipoint: another phone started playing over A2DP - ask this LE Audio phone to pause
+ * (Media Control Point Pause), as a JBL speaker pauses the phone that played before */
+void le_audio_media_pause(void)
+{
+    if (s_con == HCI_CON_HANDLE_INVALID || s_mcp_state != 0) return;
+    s_mcp_op = 0x02;
+    if (s_mcs_cp_found && s_mcs_listening) {                  /* control point known: write now */
+        s_mcp_state = 4;
+        uint8_t st = gatt_client_write_value_of_characteristic(&mcp_handler, s_con, s_mcs_cp_chr.value_handle, 1, &s_mcp_op);
+        ESP_LOGW(TAG, "multipoint: Pause over LE to the LE Audio phone -> 0x%02x", st);
+        if (st != ERROR_CODE_SUCCESS) s_mcp_state = 0;
+        return;
+    }
+    s_mcs_found = false;
+    s_mcp_state = 1;
+    gatt_client_mtu_enable_auto_negotiation(0);
+    uint8_t st = gatt_client_discover_primary_services_by_uuid16(&mcp_handler, s_con,
+                                                                 ORG_BLUETOOTH_SERVICE_GENERIC_MEDIA_CONTROL_SERVICE);
+    gatt_client_mtu_enable_auto_negotiation(1);
+    ESP_LOGW(TAG, "multipoint: Pause over LE to the LE Audio phone (finding its media control) -> 0x%02x", st);
+    if (st != ERROR_CODE_SUCCESS) s_mcp_state = 0;
+}
+
+/* the LE Audio phone's identity address (its bond), false when not known */
+bool le_audio_phone_identity(bd_addr_t out)
+{
+    if (s_con == HCI_CON_HANDLE_INVALID) return false;
+    int idx = sm_le_device_index(s_con);
+    if (idx < 0) return false;
+    int type = BD_ADDR_TYPE_UNKNOWN;
+    sm_key_t irk;
+    le_device_db_info(idx, &type, out, irk);
+    return type != BD_ADDR_TYPE_UNKNOWN;
 }
 
 static void mcp_start_ms(uint32_t ms)
@@ -972,6 +1258,23 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
         case HCI_SUBEVENT_LE_ADVERTISING_SET_TERMINATED:
             if (hci_subevent_le_advertising_set_terminated_get_advertising_handle(packet) == s_adv_handle &&
                 hci_subevent_le_advertising_set_terminated_get_status(packet) == ERROR_CODE_SUCCESS) {
+                if (!s_enabled) {                        /* the reachable-only advert */
+                    s_reach_con = hci_subevent_le_advertising_set_terminated_get_connection_handle(packet);
+                    s_adv_on = false;
+                    ESP_LOGW(TAG, "phone reached us over LE (con 0x%04x) with LE Audio off: its old keys fail, "
+                                  "it pairs again", s_reach_con);
+                    break;
+                }
+                {
+                    hci_con_handle_t c = hci_subevent_le_advertising_set_terminated_get_connection_handle(packet);
+                    hci_connection_t *hc = hci_connection_for_handle(c);
+                    if (hc != NULL && lls_is_partner_addr(hc->address)) {
+                        ESP_LOGW(TAG, "LE connection 0x%04x is the stereo partner, not a phone", c);
+                        s_adv_on = false;
+                        adv_update();                    /* keep advertising for phones */
+                        break;
+                    }
+                }
                 s_con = hci_subevent_le_advertising_set_terminated_get_connection_handle(packet);
                 ESP_LOGW(TAG, "phone connected for LE Audio (con 0x%04x)", s_con);
                 name_start();                            /* srcName1Crc for JBL One */
@@ -1046,6 +1349,10 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
             ESP_LOGW(TAG, "LE Audio phone left (reason 0x%02x)", hci_event_disconnection_complete_get_reason(packet));
             link_gone("phone left");
             a2dp_in_refresh_discoverable();
+        } else if (h == s_reach_con) {
+            ESP_LOGW(TAG, "phone with the old bond left (reason 0x%02x)", hci_event_disconnection_complete_get_reason(packet));
+            s_reach_con = HCI_CON_HANDLE_INVALID;
+            adv_update();
         }
         break;
     }
@@ -1075,6 +1382,7 @@ void le_audio_set_enabled(bool on)
     if (on == s_enabled) return;
     s_enabled = on;
     ESP_LOGW(TAG, "LE Audio %s", on ? "ON" : "OFF");
+    jbl_gatt_set_le_audio(on);                       /* off: no LE Audio services for a phone to find */
     if (!on) {
         audio_stop("LE Audio off");
         if (s_con != HCI_CON_HANDLE_INVALID && gap_get_connection_type(s_con) != GAP_CONNECTION_ACL &&
@@ -1090,6 +1398,13 @@ void le_audio_set_enabled(bool on)
 }
 
 bool le_audio_enabled(void) { return s_enabled; }
+
+void le_audio_set_reachable(bool on)
+{
+    if (on == s_reach) return;
+    s_reach = on;
+    if (hci_get_state() == HCI_STATE_WORKING) adv_update();
+}
 
 bool le_audio_phone_linked(void) { return s_con != HCI_CON_HANDLE_INVALID; }
 

@@ -7,7 +7,8 @@ press **Build + Flash**.
 Everything it builds from comes with the repository, already patched:
 - **ESP-IDF** in [`third_party/esp-idf`](../../third_party/esp-idf/S31_README.md): Espressif's
   commit [`idf-patches/IDF_COMMIT`](../../idf-patches/IDF_COMMIT) with
-  [`idf-patches/0010`](../../idf-patches/0010-controller-only-iso-rx.patch) applied.
+  [`idf-patches/0010`](../../idf-patches/0010-controller-only-iso-rx.patch) and
+  [`0011`](../../idf-patches/0011-btdm-task-stack-dma.patch) applied.
 - **BTstack** in [`third_party/btstack`](../../third_party/btstack/S31_README.md).
 
 Only ESP-IDF's tools (compiler, CMake, Ninja, a Python environment) can't live in the

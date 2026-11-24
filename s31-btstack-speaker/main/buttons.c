@@ -7,6 +7,7 @@
  *   GPIO 42  Bluetooth pairing (discoverable + connectable for 3 min)
  *   GPIO 44  play / pause  (AVRCP to the phone)
  */
+#include "lls.h"
 #include "buttons.h"
 
 #include "driver/gpio.h"
@@ -44,6 +45,9 @@ static void press(btn_id_t b)
         power_wake();                             /* soft off: any button turns it on */
         return;
     }
+    /* stereo secondary: these keys go to the primary and are not handled here (Xtreme 5) */
+    static const uint8_t fwd[] = { [B_AURACAST] = 0, [B_VOL_UP] = 3, [B_VOL_DOWN] = 4, [B_PAIR] = 8, [B_PLAY] = 1 };
+    if (fwd[b] && lls_forward_key(fwd[b])) return;
     switch (b) {
     case B_AURACAST: party_set_auracast_enabled(!party_auracast_enabled()); break;
     case B_VOL_UP:   a2dp_in_button(A2DP_BTN_VOL_UP); break;

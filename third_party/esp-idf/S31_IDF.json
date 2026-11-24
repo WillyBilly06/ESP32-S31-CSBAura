@@ -1,7 +1,8 @@
 {
   "commit": "c43d665a96c0d90ea4740fa3ba12aaf89e48e568",
   "patches": [
-    "0010-controller-only-iso-rx.patch"
+    "0010-controller-only-iso-rx.patch",
+    "0011-btdm-task-stack-dma.patch"
   ],
   "version": "c43d665a96-s31"
 }

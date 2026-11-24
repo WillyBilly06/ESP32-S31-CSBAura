@@ -1698,6 +1698,13 @@ int auracast_host_stop(void)
     return 0;
 }
 
+bool auracast_pa_handle(uint8_t *handle)
+{
+    if (!s_adv_created || s_pub_state != AURACAST_STATE_ON) return false;
+    *handle = s_adv_handle;
+    return true;
+}
+
 bool auracast_hosting(void)
 {
     auracast_state_t st = s_pub_state;

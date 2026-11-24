@@ -78,18 +78,19 @@ set(platform_srcs
     ${B}/platform/freertos/btstack_run_loop_freertos.c
     ${B}/platform/embedded/hci_dump_embedded_stdout.c
     ${B}/3rd-party/micro-ecc/uECC.c
+    ${B}/3rd-party/rijndael/rijndael.c
 )
 
 idf_component_register(
     SRCS ${core_srcs} ${classic_srcs} ${ble_srcs} ${sbc_srcs} ${platform_srcs}
-         "hci_transport_s31_vhci.c" "btstack_tlv_esp32.c"
+         "hci_transport_s31_vhci.c" "btstack_tlv_esp32.c" "btstack_aes128_esp.c"
     INCLUDE_DIRS "include"
                  ${B}/src ${B}/src/classic ${B}/src/ble ${B}/src/le-audio
                  ${B}/platform/freertos ${B}/platform/embedded
                  ${B}/3rd-party/bluedroid/decoder/include
                  ${B}/3rd-party/bluedroid/encoder/include
-                 ${B}/3rd-party/micro-ecc ${B}/3rd-party/yxml ${B}/3rd-party/md5
-    REQUIRES bt nvs_flash freertos
+                 ${B}/3rd-party/micro-ecc ${B}/3rd-party/yxml ${B}/3rd-party/md5 ${B}/3rd-party/rijndael
+    REQUIRES bt nvs_flash freertos mbedtls
 )
 # third-party code: keep its warnings out of -Werror
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-error -Wno-unused-variable -Wno-unused-but-set-variable

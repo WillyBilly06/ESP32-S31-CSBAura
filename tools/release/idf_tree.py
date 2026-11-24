@@ -21,7 +21,7 @@ ROOT = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, HERE)
 import gitexport  # noqa: E402
 
-PATCHES = ["0010-controller-only-iso-rx.patch"]
+PATCHES = ["0010-controller-only-iso-rx.patch", "0011-btdm-task-stack-dma.patch"]
 SKIP = ("docs/", "examples/", ".github/", ".gitlab/")
 SKIP_FILES = {".gitmodules", ".gitlab-ci.yml"}
 # deep folders nothing builds from: under third_party/esp-idf they pass Windows' 260
@@ -59,22 +59,23 @@ def keep(path):
     return not path.startswith(SKIP) and not path.startswith(SKIP_DEEP) and path not in SKIP_FILES
 
 
-def copy_tree(idf, out):
-    """the patched tree into out; returns [executable paths]"""
+def _put(d, data):
+    os.makedirs(os.path.dirname(d), exist_ok=True)
+    with open(d, "wb") as fh:
+        fh.write(data)
+
+
+def copy_tree(idf, out, put=_put):
+    """the patched tree into out (put(path, bytes) writes one file); returns [executable paths]"""
     info, changed = check(idf)
     execs, n = [], 0
     for path, data, exe in gitexport.export(idf, keep, changed):
-        d = os.path.join(out, path)
-        os.makedirs(os.path.dirname(d), exist_ok=True)
-        with open(d, "wb") as fh:
-            fh.write(data)
+        put(os.path.join(out, path), data)
         if exe:
             execs.append(path)
         n += 1
-    with open(os.path.join(out, "version.txt"), "w", encoding="utf-8", newline="\n") as fh:
-        fh.write(info["version"] + "\n")
-    with open(os.path.join(out, "S31_IDF.json"), "w", encoding="utf-8", newline="\n") as fh:
-        fh.write(json.dumps(info, indent=2) + "\n")
+    put(os.path.join(out, "version.txt"), (info["version"] + "\n").encode("utf-8"))
+    put(os.path.join(out, "S31_IDF.json"), (json.dumps(info, indent=2) + "\n").encode("utf-8"))
     print(f"ESP-IDF {info['version']}: {n} files -> {out}")
     return execs
 

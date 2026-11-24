@@ -5,7 +5,8 @@ exactly the tree the S31 firmware is built with:
 
 - Commit: `idf-patches/IDF_COMMIT` (`c43d665a96`, `release/v6.1`, ESP32-S31 support), with its
   submodules.
-- Already applied: `idf-patches/0010-controller-only-iso-rx.patch`.
+- Already applied: `idf-patches/0010-controller-only-iso-rx.patch` and
+  `idf-patches/0011-btdm-task-stack-dma.patch`.
 - Left out: `docs/`, `examples/`, CI files and the git history. `version.txt` and
   `S31_IDF.json` were added; they name the version, commit and patch.
 

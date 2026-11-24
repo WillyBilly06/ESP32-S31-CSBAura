@@ -152,3 +152,7 @@ CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
 
 # LE Audio: a third advertising set (public address) and a third LE link
 CONFIG_BT_LE_MAX_CONNECTIONS=3
+
+# BR/EDR Connectionless Peripheral Broadcast (CPB / CSB): JBL stereo pair + PartyBoost
+CONFIG_BT_CTRL_BR_EDR_CPB_TX_EN=y
+CONFIG_BT_CTRL_BR_EDR_CPB_RX_EN=y

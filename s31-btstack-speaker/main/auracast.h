@@ -66,6 +66,8 @@ int auracast_host_stop(void);
 /* Any thread: true while hosting is requested and not stopped, i.e. state
  * STARTING or ON. */
 bool auracast_hosting(void);
+/* BT thread: the broadcast's advertising set (periodic advertising) while ON - for PAST */
+bool auracast_pa_handle(uint8_t *handle);
 /* end the BIG and create it again on the running periodic advertising: it lands at a new
  * place in time next to the other links (receivers re-sync from the same PA). -1: not on */
 int auracast_big_replace(void);

@@ -22,6 +22,7 @@
 #include "jbl_gatt.h"
 #include "jbl_util.h"
 #include "jbl_v5.h"
+#include "link_tune.h"
 #include "v5_eq.h"
 
 static const char *TAG = "JBL";
@@ -29,6 +30,8 @@ static const char *TAG = "JBL";
 static TaskHandle_t s_bt_task;
 static volatile uint16_t s_mac_crc;
 static volatile uint16_t s_party_info = JBL_PARTY_INFO_HOST;
+static volatile uint16_t s_stereo_pi;
+static volatile uint8_t s_stereo_gid;
 static volatile bool s_streaming;
 static volatile uint32_t s_name_word;              /* 0 = unknown, else 0x10000 | srcName1Crc */
 static bool s_working;
@@ -74,7 +77,8 @@ void jbl_run_on_bt(btstack_context_callback_registration_t *reg)
 static void beacon_state(jbl_beacon_state_t *st)
 {
     uint32_t nw = s_name_word;
-    st->party_info = s_party_info;
+    st->party_info = s_stereo_pi ? s_stereo_pi : s_party_info;
+    st->stereo_gid = s_stereo_pi ? s_stereo_gid : 0;
     st->name_known = (nw & 0x10000u) != 0;
     st->name_crc = (uint16_t)nw;
     st->streaming = s_streaming;
@@ -92,6 +96,40 @@ static void apply(void *ctx)
 
 /* ---- LE security: Just Works, SC + bond (as the Bluedroid build) ------------------- */
 
+/* LE Audio switch: a phone that still has its old LE bond reconnects, its encryption fails
+ * (LTK unknown - we forgot every bond) and it asks to pair again. Accepting that keeps the
+ * phone's old entry, with its old profile choice (LE Audio on / A2DP off), and after the
+ * switch that left it with no audio. Refusing it makes the phone drop the bond completely
+ * (as with a Classic re-pairing refused): it forgets the S31 and pairs from scratch. */
+#define STALE_MAX 4
+static hci_con_handle_t s_stale[STALE_MAX] = { HCI_CON_HANDLE_INVALID, HCI_CON_HANDLE_INVALID,
+                                               HCI_CON_HANDLE_INVALID, HCI_CON_HANDLE_INVALID };
+
+static bool stale_has(hci_con_handle_t con)
+{
+    for (int i = 0; i < STALE_MAX; i++) if (s_stale[i] == con) return true;
+    return false;
+}
+
+static void stale_set(hci_con_handle_t con, bool on)
+{
+    for (int i = 0; i < STALE_MAX; i++) {
+        if (on ? s_stale[i] == HCI_CON_HANDLE_INVALID : s_stale[i] == con) {
+            s_stale[i] = on ? con : HCI_CON_HANDLE_INVALID;
+            if (on) return;
+        }
+    }
+}
+
+static bool refuse_repair(hci_con_handle_t con)
+{
+    if (!stale_has(con) || !a2dp_in_pairing_is_switch()) return false;
+    ESP_LOGW(TAG, "LE Audio switch: LE re-pairing on con 0x%04x refused - the phone kept its old bond; "
+                  "it forgets the S31 and pairs again", con);
+    sm_bonding_decline(con);
+    return true;
+}
+
 static void sm_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size)
 {
     (void)channel;
@@ -101,9 +139,11 @@ static void sm_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, u
     }
     switch (hci_event_packet_get_type(packet)) {
     case SM_EVENT_JUST_WORKS_REQUEST:
+        if (refuse_repair(sm_event_just_works_request_get_handle(packet))) break;
         sm_just_works_confirm(sm_event_just_works_request_get_handle(packet));
         break;
     case SM_EVENT_NUMERIC_COMPARISON_REQUEST:
+        if (refuse_repair(sm_event_numeric_comparison_request_get_handle(packet))) break;
         sm_numeric_comparison_confirm(sm_event_numeric_comparison_request_get_handle(packet));
         break;
     case SM_EVENT_PAIRING_COMPLETE: {
@@ -134,6 +174,29 @@ static void sm_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, u
 
 /* ---- phone name (BR/EDR remote name request) ------------------------------------- */
 
+/* JBL One shows a speaker as "Connected" (to this phone) while the beacon carries the phone's
+ * srcName1Crc. The Xtreme 5 drops it when the phone leaves; we kept it, so the app still
+ * said "Connected" after the phone had disconnected. Checked 1 s after a disconnect (other
+ * handlers update their link counts first, and a quick reconnect does not flicker). */
+static btstack_timer_source_t s_name_check_timer;
+
+static void name_check_cb(btstack_timer_source_t *t)
+{
+    (void)t;
+    if (link_tune_classic_links() == 0 && !le_audio_phone_linked() && (s_name_word & 0x10000u)) {
+        ESP_LOGW(TAG, "no phone linked any more: srcName1Crc removed from the JBL beacon (app: not connected)");
+        jbl_set_phone_name(NULL);
+    }
+}
+
+static void name_check_later(void)
+{
+    btstack_run_loop_remove_timer(&s_name_check_timer);
+    btstack_run_loop_set_timer_handler(&s_name_check_timer, name_check_cb);
+    btstack_run_loop_set_timer(&s_name_check_timer, 1000);
+    btstack_run_loop_add_timer(&s_name_check_timer);
+}
+
 static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size)
 {
     (void)channel;
@@ -142,6 +205,18 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
         return;
     }
     switch (hci_event_packet_get_type(packet)) {
+    case HCI_EVENT_LE_META:
+        if (hci_event_le_meta_get_subevent_code(packet) == HCI_SUBEVENT_LE_LONG_TERM_KEY_REQUEST) {
+            hci_con_handle_t con = hci_subevent_le_long_term_key_request_get_connection_handle(packet);
+            if (a2dp_in_pairing_is_switch() && sm_le_device_index(con) < 0 && !stale_has(con)) {
+                stale_set(con, true);                 /* its old key is gone: it will ask to re-pair */
+            }
+        }
+        break;
+    case HCI_EVENT_DISCONNECTION_COMPLETE:
+        stale_set(hci_event_disconnection_complete_get_connection_handle(packet), false);
+        name_check_later();
+        break;
     case HCI_EVENT_CONNECTION_COMPLETE:
         if (JBL_AUTO_PHONE_NAME && hci_event_connection_complete_get_status(packet) == ERROR_CODE_SUCCESS &&
             hci_event_connection_complete_get_link_type(packet) == 0x01 /* ACL */) {
@@ -211,6 +286,7 @@ void jbl_on_hci_working(void)
         s_mac_crc = crc;
     }
     jbl_v5_set_local_addr(a);
+    jbl_v5_stereo_resume();
     ESP_LOGW(TAG, "JBL identity: BT MAC %s -> macAddressCrc 0x%04x (the user's Xtreme 5 is 0x10cd)",
              bd_addr_to_str(a), crc);
 
@@ -235,6 +311,13 @@ void jbl_set_party_info(uint16_t party_info)
         return;
     }
     s_party_info = party_info;
+    jbl_run_on_bt(&s_apply_reg);
+}
+
+void jbl_set_stereo_wait(uint16_t party_info, uint8_t gid)
+{
+    s_stereo_pi = party_info;
+    s_stereo_gid = gid;
     jbl_run_on_bt(&s_apply_reg);
 }
 

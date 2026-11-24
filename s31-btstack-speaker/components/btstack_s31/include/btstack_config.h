@@ -41,6 +41,12 @@
  * micro-ecc, compiled with its public symbols renamed (see the component's
  * CMakeLists) because the IDF bt component links its own, ABI-incompatible copy. */
 #define ENABLE_MICRO_ECC_FOR_LE_SECURE_CONNECTIONS
+/* AES on the host, not the controller's HCI LE Encrypt: BTstack does not check LE Encrypt's
+ * status, and on some pairings the S31 controller's answer was not a result - the LE SC
+ * Confirm went out as RAM bytes (00 00 00 00 2e 00 13 f8 2f 04 c0 00...) and the phone failed
+ * the pairing (0x05 / confirm value failed, "Couldn't pair"). btstack_aes128_calc() is ours
+ * (btstack_aes128_esp.c): the S31's AES peripheral, with BTstack's rijndael as the fallback. */
+#define HAVE_AES128
 #define ENABLE_LE_DATA_LENGTH_EXTENSION
 #define ENABLE_LE_EXTENDED_ADVERTISING
 #define ENABLE_LE_PERIODIC_ADVERTISING

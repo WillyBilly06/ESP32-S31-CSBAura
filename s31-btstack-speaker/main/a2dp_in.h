@@ -33,6 +33,12 @@ void a2dp_in_probe_log(const char *what);    /* DSP task: core + workspace speed
 /* BT thread: the phone is fully connected (A2DP media channel open / LE Audio in use):
  * a pairing mode started for a new phone ends */
 void a2dp_in_pairing_done(const char *why);
+/* end pairing mode now, whatever state it is in (BT thread) */
+void a2dp_in_pairing_cancel(const char *why);
+/* pairing mode was opened by an LE Audio switch (Auracast paused, not off) */
+bool a2dp_in_pairing_is_switch(void);
+/* forget every phone: Classic link keys + LE bonds (BT thread); returns LE bonds removed */
+int a2dp_in_forget_all(void);
 bool a2dp_in_ext_active(void);
 void a2dp_in_ext_push(const uint8_t *data, uint16_t len);
 void a2dp_in_ext_pcm(int16_t *lr, int frames, int rate);
@@ -45,7 +51,10 @@ void a2dp_in_log_stats(void);
 
 /* Any thread (button task): volume +-8/127 (phone slider follows via AVRCP),
  * play/pause (AVRCP to the phone), pairing (discoverable + connectable 3 min). */
-typedef enum { A2DP_BTN_VOL_UP = 0, A2DP_BTN_VOL_DOWN, A2DP_BTN_PLAY_PAUSE, A2DP_BTN_PAIRING } a2dp_btn_t;
+/* A2DP_BTN_PAIRING_SWITCH: LE Audio switched on/off in JBL One - as the Xtreme 5 the speaker
+ * forgets every phone (they pair again with the new bond set) and Auracast only pauses */
+typedef enum { A2DP_BTN_VOL_UP = 0, A2DP_BTN_VOL_DOWN, A2DP_BTN_PLAY_PAUSE, A2DP_BTN_PAIRING,
+               A2DP_BTN_PAIRING_SWITCH } a2dp_btn_t;
 void a2dp_in_button(a2dp_btn_t btn);
 
 /* Local speaker path: apply the phone (AVRCP) volume, ramped. One caller at a time. */
@@ -100,6 +109,10 @@ const char *a2dp_in_track_artist(void);
  * advert) only in pairing mode or with no phone at all - classic or LE Audio. As a JBL
  * speaker: a linked phone takes it out of pairing; the pairing button puts it back. */
 void a2dp_in_refresh_discoverable(void);
+/* BT thread: stereo pair secondary - drop every phone link, stay unconnectable while on */
+void a2dp_in_set_stereo_secondary(bool on);
+/* any thread (console "callback"): clear a failed call-back and call the last phone back now */
+void a2dp_in_callback_now(void);
 bool a2dp_in_pairing(void);
 
 /* BT thread: a phone just bonded over LE (its classic key derived, CTKD). Samsung pages

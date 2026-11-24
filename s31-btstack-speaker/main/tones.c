@@ -1,4 +1,5 @@
 /* Prompt tones from the "tones" flash partition (see tones.h). */
+#include "lls.h"
 #include "tones.h"
 
 #include <string.h>
@@ -54,6 +55,7 @@ void tones_setup(void)
 
 bool tones_play(const char *name)
 {
+    lls_on_local_tone(name);                      /* stereo primary: mirror pairing / max volume */
     if (s_map == NULL || !jbl_v5_feedback_tone_on()) {
         return false;
     }

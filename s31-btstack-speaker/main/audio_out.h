@@ -34,8 +34,15 @@ void audio_out_push(ao_owner_t owner, const int16_t *lr, int n);
 void audio_out_set_delay(ao_owner_t owner, uint32_t delay_ms);
 /* Any thread: sample rate for AO_LISTEN (BASE); host/local are always 48 kHz. */
 void audio_out_set_rate(uint32_t hz);
+/* any thread: local output plays 0 both channels, 1 left only, 2 right only (stereo pair;
+ * the broadcast stays stereo) */
+void audio_out_set_channel(uint8_t ch);
 
 ao_owner_t audio_out_owner(void);
+/* LOCAL output still priming its delay line: how much (ms) it is about to pull at once from
+ * the A2DP buffer. The A2DP reader keeps that much extra when it re-aligns, or the buffer sat
+ * that far below its target after an output switch (Auracast off: -40 .. -60 ms) */
+uint32_t audio_out_line_need_ms(void);
 void audio_out_log_stats(void);
 
 /* Any thread: play a mono 16-bit prompt (rate 8..48 kHz) on the line at a fixed

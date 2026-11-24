@@ -13,6 +13,7 @@ typedef enum {
     LA_ASE, LA_ASE_CP,                        /* ASCS */
     LA_VOL_STATE, LA_VOL_CP, LA_VOL_FLAGS,    /* VCS */
     LA_TMAP,                                  /* TMAS */
+    LA_BASS_CP, LA_BASS_RS,                   /* BASS: control point, receive state */
     LA_N
 } le_audio_attr_t;
 
@@ -38,8 +39,16 @@ bool le_audio_cis_counts(uint32_t *rx, uint32_t *lost);
 /* the LE link a phone uses for LE Audio (link_tune leaves its interval alone) */
 bool le_audio_owns_link(hci_con_handle_t con);
 
+/* BASS: a JBL One / phone assistant join ended or changed (jbl_v5_assist_result's
+ * action + status: 1 joined, 2 failed, 3 bad code, 4 code needed; action 0 = left) */
+void le_audio_bass_assist_result(uint8_t action, uint8_t status);
+
 /* any thread: an LE Audio phone is linked (the JBL beacon slows to 100 ms) */
 bool le_audio_phone_linked(void);
+/* BT thread, multipoint: ask the LE Audio phone to pause (Media Control Point) */
+void le_audio_media_pause(void);
+/* BT thread: the LE Audio phone's identity address (bond); false when not known */
+bool le_audio_phone_identity(uint8_t out[6]);
 
 /* any thread: the phone enabled its stream (CIS on the way) - a listen should
  * end now, the phone's CIS setup crawls while we receive a BIG */
@@ -55,3 +64,8 @@ void le_audio_note_pairing(hci_con_handle_t con);
 
 /* BT thread: "general discoverable" flag in the LE Audio advert (a2dp_in decides) */
 void le_audio_set_discoverable(bool on);
+/* LE Audio switch's pairing window: keep the public address connectable even with LE Audio off,
+ * so a phone with the old (now forgotten) LE bond reaches us, fails "key missing" and pairs again */
+void le_audio_set_reachable(bool on);
+/* BT thread: stereo pair secondary - no LE Audio advert (no phone reconnects) while on */
+void le_audio_set_quiet(bool on);

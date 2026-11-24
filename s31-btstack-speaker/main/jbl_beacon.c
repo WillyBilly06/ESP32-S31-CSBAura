@@ -38,7 +38,7 @@
 
 static const char *TAG = "JBL_BEACON";
 
-#define JBL_PID           0x2169
+#define JBL_PID           (s31_ident_model())   /* the model this board is (V5 family) */
 #define JBL_ADV_MASK      0x97C0
 #define JBL_MASK_SRCNAME  (1u << 14)
 #define JBL_BATTERY       0x50
@@ -109,7 +109,7 @@ static uint8_t build_adv(uint8_t *adv)
     p[i++] = misc & 0xFF;             p[i++] = misc >> 8;
     p[i++] = JBL_PARTY_METHOD;
     p[i++] = s_st.party_info & 0xFF;  p[i++] = s_st.party_info >> 8;
-    p[i++] = 0x00;                                                     /* stereoGroupId */
+    p[i++] = s_st.stereo_gid;                                          /* stereoGroupId */
     adv[0] = (uint8_t)(3 + i);
     adv[1] = BLUETOOTH_DATA_TYPE_SERVICE_DATA_16_BIT_UUID;
     adv[2] = 0xDF;
@@ -204,9 +204,7 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
                 s_beacon_con = gap_subevent_le_connection_complete_get_connection_handle(packet);
                 s_peer_cons++;
                 ESP_LOGW(TAG, ">>> PEER CONNECTED TO JBL BEACON: %s (con 0x%04x)", bd_addr_to_str(a), s_beacon_con);
-#if BEACON_REARM_WHILE_CONNECTED
-                rearm();
-#endif
+                if (BEACON_REARM_WHILE_CONNECTED || s_st.stereo_gid) rearm();   /* stereo setup: the partner looks for it */
             }
             break;
         default:
@@ -223,9 +221,7 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
                 s_beacon_con = hci_subevent_le_advertising_set_terminated_get_connection_handle(packet);
                 s_stopped_by_con = true;     /* re-armed when the peer leaves */
                 ESP_LOGI(TAG, "beacon paused: connection 0x%04x came in on it", s_beacon_con);
-#if BEACON_REARM_WHILE_CONNECTED
-                rearm();
-#endif
+                if (BEACON_REARM_WHILE_CONNECTED || s_st.stereo_gid) rearm();   /* stereo setup: the partner looks for it */
             } else {
                 ESP_LOGW(TAG, "beacon set terminated, status 0x%02x - re-arming",
                          hci_subevent_le_advertising_set_terminated_get_status(packet));
@@ -331,6 +327,7 @@ void jbl_beacon_update(const jbl_beacon_state_t *st)
     }
     bool interval_changed = st->streaming != s_st.streaming;
     s_st = *st;
+    if (s_st.stereo_gid && s_stopped_by_con) rearm();   /* stereo setup: back on air although connected */
 
     uint8_t adv[31];
     uint8_t len = build_adv(adv);

@@ -44,7 +44,7 @@ extern uint8_t _data_start[], _data_end[];
 #endif
 /* LE Audio input feeding the broadcast: CIS 15, BIS first copies 13 */
 #define BT_SCHED_CIS_LE_IN   15
-#define BT_SCHED_FIRST_LE_IN 15   /* 13 made no measurable difference to the CIS loss */
+#define BT_SCHED_FIRST_LE_IN 13   /* below the LE ACL's escalation cap (see BT_SCHED_IDLE_FIRST) */
 static bool s_le_input;
 
 /* ---- profiles ------------------------------------------------------------ */
@@ -58,12 +58,17 @@ typedef struct {
 
 /* Not streaming (phone absent, connected-idle, paused) - both modes.
  * ACL stays at the stock 2 so idle-link escalation (missed polls) can never
- * reach the BIS first copies at 15; repetitions sit above every adv (<=10). */
+ * reach the BIS first copies; repetitions sit above every adv (<=10).
+ * First copies 13, not 15: an LE ACL (the phone's JBL One / LE Audio link) starts at 8
+ * and escalates per skipped event to 14 at most. At 15 a link whose anchors sat on the
+ * first copies (its 30 ms interval = the ISO interval: they stay there) could never win:
+ * the phone's play command never arrived and the link timed out (0x08) 6 s later. At 13
+ * it wins after ~6 skipped events; the repetitions (IRC 4) carry the copy it takes. */
 #ifndef BT_SCHED_IDLE_ACL
 #define BT_SCHED_IDLE_ACL   2
 #endif
 #ifndef BT_SCHED_IDLE_FIRST
-#define BT_SCHED_IDLE_FIRST 15
+#define BT_SCHED_IDLE_FIRST 13
 #endif
 #ifndef BT_SCHED_IDLE_REP
 #define BT_SCHED_IDLE_REP   12
@@ -87,7 +92,10 @@ static const prio_profile_t s_stream[3] = {
     /* MASTER while streaming = idle (ACL 2, every BIS copy above it). Tested:
      * ACL 13 above the repetitions lost ~48 % of whole SDUs - the hardware does
      * not cut an ACL exchange already in progress, so it also eats first copies. */
-    [BT_SCHED_MODE_MASTER]         = { BT_SCHED_IDLE_ACL, BT_SCHED_IDLE_FIRST, BT_SCHED_IDLE_REP, BT_SCHED_IDLE_PTO, BT_SCHED_IDLE_FIRST },
+    /* first copies back at 15 while a Classic phone streams: its ACL (base 2) escalates with a
+     * full queue, and at 13 it took whole SDUs (4 "not sent: ctrl" per minute with a bursty
+     * phone). The LE ACL case that needed 13 is the idle / LE Audio one. */
+    [BT_SCHED_MODE_MASTER]         = { BT_SCHED_IDLE_ACL, 15, BT_SCHED_IDLE_REP, BT_SCHED_IDLE_PTO, 15 },
 };
 
 /* ---- table location / verification ---------------------------------------- */
@@ -264,7 +272,7 @@ void bt_sched_tune_le_input(bool on)
     if (s_le_input == on) return;
     s_le_input = on;
     ESP_LOGW(TAG, "LE Audio input %s: CIS %u, BIS first copies %s", on ? "on" : "off",
-             on ? BT_SCHED_CIS_LE_IN : BT_SCHED_CIS, on ? "13 (below the CIS)" : "back to the profile");
+             on ? BT_SCHED_CIS_LE_IN : BT_SCHED_CIS, on ? "13 (below the CIS and the LE ACL cap)" : "back to the profile");
     bt_sched_tune_streaming(s_streaming);
 }
 

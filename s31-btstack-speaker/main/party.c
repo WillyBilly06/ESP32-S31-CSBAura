@@ -43,6 +43,7 @@
 #include "auracast.h"
 #include "jbl.h"
 #include "le_audio.h"
+#include "ctrl_wrap.h"
 
 static const char *TAG = "PARTY";
 
@@ -85,6 +86,43 @@ static const char *TAG = "PARTY";
 
 /* ---- state ------------------------------------------------------------------ */
 typedef enum { R_HOST, R_HOST_STOPPING, R_LISTEN, R_LISTEN_STOPPING, R_OFF } role_t;
+/* stereo pair primary: our broadcast carries the secondary's audio, so it stays up without music */
+static volatile bool s_stereo_hold;
+/* stereo pair secondary: the primary hands us its broadcast (PAST) */
+static volatile bool s_past_expect;
+
+/* stereo pair: the broadcast runs under the hood without the Auracast button (no tone); the
+ * button state from before comes back when the pair ends */
+static volatile bool s_enabled;                   /* defined below (Auracast button) */
+static int8_t s_stereo_restore = -1;
+static uint32_t s_past_pa_reports, s_past_biginfo;
+static volatile uint32_t s_lost_par[2], s_lost_run, s_lost_run_max;   /* listen loss pattern */
+static uint32_t s_big_retry_at;                   /* stereo: BIG not ready yet (0x0C) - try again then */
+static int s_big_retries;
+
+/* the stereo pair is not Auracast (Xtreme 5 broadcast modes 3/4): the broadcast runs under the
+ * hood - the Auracast setting, its button and the app's Auracast switch stay as they are */
+static void stereo_party(bool on)
+{
+    (void)s_stereo_restore;
+    ESP_LOGW(TAG, "stereo pair broadcast %s (%s; Auracast setting untouched, now %s)", on ? "ON" : "off",
+             s_stereo_hold ? "primary: we host it" : s_past_expect ? "secondary: the primary's, by PAST" : "pair over",
+             s_enabled ? "on" : "off");
+}
+
+static inline bool stereo_on(void) { return s_stereo_hold || s_past_expect; }
+
+void party_set_stereo_primary(bool on)
+{
+    s_stereo_hold = on;
+    stereo_party(on);
+}
+
+void party_set_stereo_secondary(bool on)
+{
+    s_past_expect = on;
+    stereo_party(on);                                 /* listen needs the party on */
+}
 typedef enum { L_OFF, L_SCAN, L_PA_SYNC, L_W4_BASE, L_BIG_SYNC, L_STREAM } lstate_t;
 static const char *const role_names[] = { "HOST", "HOST_STOPPING", "LISTEN", "LISTEN_STOPPING", "OFF (Auracast off)" };
 #ifndef PARTY_BOOT_AURACAST
@@ -133,6 +171,12 @@ static void assist_end(const char *why)
     ESP_LOGW(TAG, "JBL One: left the broadcast (%s)", why);
     jbl_v5_assist_result(0, s_as.addr, s_as.type, 1);
 }
+
+/* the Auracast mode before a phone's "Listen to audio broadcast" (BASS): that listen is
+ * the phone's, for a while; when it ends we go back to what we were doing (JBL party,
+ * Broadcast to Others or off). A JBL One join keeps the Xtreme 5's behaviour: Auracast
+ * stays off after it. A user change meanwhile (button, app, pairing) wins. */
+static struct { bool valid, enabled, std; } s_before;
 
 /* standard Auracast broadcast (JBL One "Broadcast to Others") */
 static bool s_std_on;
@@ -265,7 +309,8 @@ static uint32_t st_master_vol_updates;
 static int master_base(void)                      /* master volume on our 0..127 scale */
 {
     int m = s_master_vol;
-    return m < 0 ? a2dp_in_volume() : (m * 127 + 50) / 100;
+    /* stereo secondary: silent until the primary's first volume (the Xtreme 5 "keepmute") */
+    return m < 0 ? (s_past_expect ? 0 : a2dp_in_volume()) : (m * 127 + 50) / 100;
 }
 
 static uint8_t listen_volume(void)
@@ -570,10 +615,13 @@ static void iso_rx(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint1
     if (ps != 0 || len == 0 || size < off + len || len > MAX_SDU) {
         it.len = 0;
         s_st.lost[b]++;
+        s_lost_par[it.seq & 1]++;                      /* BN 2: which payload of the event */
+        if (++s_lost_run > s_lost_run_max) s_lost_run_max = s_lost_run;
     } else {
         it.len = len;
         memcpy(it.data, packet + off, len);
         s_st.rx[b]++;
+        s_lost_run = 0;
     }
     if (s_have_seq[b] && (uint16_t)(it.seq - s_last_seq[b]) != 1) {
         s_st.gaps[b]++;
@@ -693,7 +741,10 @@ static void listen_reset(const char *why)
     s_master_vol = -1;
     s_num_bis = 0;
     memset(s_have_seq, 0, sizeof(s_have_seq));
-    if (s_role == R_LISTEN) {
+    if (s_role == R_LISTEN && s_past_expect) {
+        gap_stop_scan();                              /* the Xtreme 5 secondary does not scan: PA by PAST only */
+        set_ls(L_OFF, why);
+    } else if (s_role == R_LISTEN) {
         scan_start();
         set_ls(L_SCAN, why);
     } else if (s_as.scanning) {
@@ -727,7 +778,8 @@ static void try_big_sync(void)
     memset(&s_big_params, 0, sizeof(s_big_params));
     s_big_params.big_handle = BIG_SYNC_HANDLE;
     s_big_params.sync_handle = s_pa_handle;
-    s_big_params.big_sync_timeout_10ms = 200;
+    s_big_params.big_sync_timeout_10ms = s_past_expect ? 400 : 200;   /* stereo: 4 s, as the Xtreme 5 secondary */
+    /* MSE 0 (the controller picks; the Xtreme 5 does the same) - this controller refuses 0x1F with 0x12 */
     if (use_code) {
         s_big_params.encryption = 1;
         memcpy(s_big_params.broadcast_code, s_as.code, 16);
@@ -750,8 +802,49 @@ static void try_big_sync(void)
 
 static void assist_report(const uint8_t *packet);
 
+/* diagnosis (stereo pair RE): raw broadcast adverts and PA data of every Auracast source we
+ * see, each distinct one logged once */
+#ifndef RAW_DUMP
+#define RAW_DUMP 0                                   /* 1: log them (reverse engineering) */
+#endif
+__attribute__((unused)) static void hexline(const char *what, const uint8_t *a, const uint8_t *d, uint16_t n)
+{
+    char h[3 * 120 + 1];
+    int k = 0;
+    for (uint16_t i = 0; i < n && i < 120; i++) k += snprintf(h + k, sizeof(h) - (size_t)k, "%02x ", d[i]);
+    h[k] = 0;
+    ESP_LOGW(TAG, "RAW %s %s (%u B): %s", what, a ? bd_addr_to_str(a) : "", n, h);
+}
+
+static void raw_ext_adv(const uint8_t *packet)
+{
+#if RAW_DUMP
+    static uint32_t seen[48];
+    static int nseen;
+    uint8_t len = gap_event_extended_advertising_report_get_data_length(packet);
+    const uint8_t *data = gap_event_extended_advertising_report_get_data(packet);
+    if (gap_event_extended_advertising_report_get_periodic_advertising_interval(packet) == 0) return;
+    bd_addr_t a;
+    gap_event_extended_advertising_report_get_address(packet, a);
+    uint32_t h = 2166136261u;
+    for (int i = 0; i < 6; i++) h = (h ^ a[i]) * 16777619u;
+    for (int i = 0; i < len; i++) h = (h ^ data[i]) * 16777619u;
+    for (int i = 0; i < nseen; i++) if (seen[i] == h) return;
+    if (nseen < 48) seen[nseen++] = h;
+    char w[48];
+    snprintf(w, sizeof(w), "EXT ADV sid %u type %u PA %u rssi %d", gap_event_extended_advertising_report_get_advertising_sid(packet),
+             gap_event_extended_advertising_report_get_address_type(packet),
+             gap_event_extended_advertising_report_get_periodic_advertising_interval(packet),
+             (int8_t)gap_event_extended_advertising_report_get_rssi(packet));
+    hexline(w, a, data, len);
+#else
+    (void)packet;
+#endif
+}
+
 static void on_ext_adv(const uint8_t *packet)
 {
+    raw_ext_adv(packet);
     if (s_as.scanning) {
         assist_report(packet);
     }
@@ -843,6 +936,28 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
         break;
     case HCI_EVENT_LE_META:
         switch (hci_event_le_meta_get_subevent_code(packet)) {
+        case HCI_SUBEVENT_LE_PERIODIC_ADVERTISING_SYNC_TRANSFER_RECEIVED: {
+            uint8_t st = hci_subevent_le_periodic_advertising_sync_transfer_received_get_status(packet);
+            hci_con_handle_t sh = hci_subevent_le_periodic_advertising_sync_transfer_received_get_sync_handle(packet);
+            ESP_LOGW(TAG, "stereo: PAST received: status 0x%02x, sync handle 0x%04x%s", st, sh,
+                     s_past_expect ? "" : " (not expected)");
+            if (st != 0 || !s_past_expect) break;
+            if (s_pa_pending) { gap_periodic_advertising_create_sync_cancel(); s_pa_pending = false; }
+            if (s_pa_handle != HCI_CON_HANDLE_INVALID && s_pa_handle != sh) gap_periodic_advertising_terminate_sync(s_pa_handle);
+            s_pa_handle = sh;
+            s_past_pa_reports = s_past_biginfo = 0;
+            s_big_retries = 0;
+            s_big_retry_at = 0;
+            {   /* reports (and BIGInfo) on for this sync, explicitly */
+                static const hci_cmd_t pa_recv_enable = { 0x2059, "H1" };
+                uint8_t rc = hci_send_cmd(&pa_recv_enable, sh, 0x01);
+                ESP_LOGW(TAG, "stereo: PA receive enable on 0x%04x: 0x%02x", sh, rc);
+            }
+            s_have_base = s_have_biginfo = s_biginfo_enc = false;
+            if (s_ls == L_SCAN) gap_stop_scan();
+            set_ls(L_W4_BASE, "PA handed over by the stereo primary");
+            break;
+        }
         case HCI_SUBEVENT_LE_PERIODIC_ADVERTISING_SYNC_ESTABLISHMENT:
             if (!s_pa_pending) break;
             s_pa_pending = false;
@@ -860,6 +975,27 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
             set_ls(L_W4_BASE, "PA synced");
             break;
         case HCI_SUBEVENT_LE_PERIODIC_ADVERTISING_REPORT:
+#if RAW_DUMP
+            {   /* every PA change, at most 1 per second */
+                static uint32_t last_ms, last_h;
+                const uint8_t *d = hci_subevent_le_periodic_advertising_report_get_data(packet);
+                uint8_t n = hci_subevent_le_periodic_advertising_report_get_data_length(packet);
+                uint32_t h = 2166136261u;
+                for (int i = 0; i < n; i++) h = (h ^ d[i]) * 16777619u;
+                if (h != last_h && now_ms() - last_ms >= 1000) {
+                    last_h = h;
+                    last_ms = now_ms();
+                    hexline("PA", NULL, d, n);
+                }
+            }
+#endif
+            if (s_past_expect && hci_subevent_le_periodic_advertising_report_get_sync_handle(packet) == s_pa_handle &&
+                ++s_past_pa_reports <= 3) {
+                ESP_LOGW(TAG, "stereo: PA report %lu on 0x%04x: status %u, %u B, BASE %s", (unsigned long)s_past_pa_reports,
+                         s_pa_handle, hci_subevent_le_periodic_advertising_report_get_data_status(packet),
+                         hci_subevent_le_periodic_advertising_report_get_data_length(packet),
+                         s_have_base ? "parsed" : "not yet");
+            }
             if (hci_subevent_le_periodic_advertising_report_get_sync_handle(packet) == s_pa_handle &&
                 hci_subevent_le_periodic_advertising_report_get_data_status(packet) == 0) {
                 pa_master_volume(hci_subevent_le_periodic_advertising_report_get_data(packet),
@@ -871,10 +1007,32 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
                 parse_base(hci_subevent_le_periodic_advertising_report_get_data(packet),
                            hci_subevent_le_periodic_advertising_report_get_data_length(packet), &s_base)) {
                 s_have_base = true;
+                if (s_past_expect && !s_have_biginfo) {
+                    /* stereo pair: this controller reports no BIGInfo on a PA that came by PAST, but
+                     * it knows the BIG; the X5's stereo BIG is unencrypted (one BIS) - sync anyway */
+                    s_have_biginfo = true;
+                    s_biginfo_enc = false;
+                    ESP_LOGW(TAG, "stereo: BASE parsed (%u BIS) - BIG sync without a BIGInfo report", s_base.nbis);
+                }
                 try_big_sync();
             }
             break;
         case HCI_SUBEVENT_LE_BIGINFO_ADVERTISING_REPORT:
+#if RAW_DUMP
+            {
+                static uint32_t last_ms;
+                if (now_ms() - last_ms > 5000) {
+                    last_ms = now_ms();
+                    hexline("BIGINFO", NULL, packet + 2, packet[1]);
+                }
+            }
+#endif
+            if (s_past_expect && ++s_past_biginfo <= 3) {
+                ESP_LOGW(TAG, "stereo: BIGInfo on 0x%04x (ours 0x%04x): %u BIS, encrypted %u",
+                         hci_subevent_le_biginfo_advertising_report_get_sync_handle(packet), s_pa_handle,
+                         hci_subevent_le_biginfo_advertising_report_get_num_bis(packet),
+                         hci_subevent_le_biginfo_advertising_report_get_encryption(packet));
+            }
             if (s_ls == L_W4_BASE && !s_have_biginfo &&
                 hci_subevent_le_biginfo_advertising_report_get_sync_handle(packet) == s_pa_handle) {
                 s_have_biginfo = true;
@@ -915,6 +1073,13 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
             s_big_pending = false;
             if (gap_subevent_big_sync_created_get_status(packet) != 0) {
                 ESP_LOGW(TAG, "BIG sync failed 0x%02x", gap_subevent_big_sync_created_get_status(packet));
+                if (s_past_expect && gap_subevent_big_sync_created_get_status(packet) == 0x0C && s_big_retries < 12) {
+                    /* stereo: the controller hasn't read the BIGInfo off the handed-over PA yet */
+                    s_big_retries++;
+                    s_big_retry_at = now_ms() + 500;
+                    set_ls(L_W4_BASE, "BIG not ready yet, retrying");
+                    break;
+                }
                 if (s_as.target && !s_as.reported) {
                     s_as.reported = true;
                     s_as.target = false;
@@ -982,7 +1147,7 @@ static void listen_poll(void)
         if (now_ms() - s_last_sdu_ms > T_NO_SDU_MS) listen_reset("no audio received");
         break;
     case L_OFF:
-        if (now_ms() - s_state_ms >= TICK_MS) listen_reset("start listening");
+        if (!s_past_expect && now_ms() - s_state_ms >= TICK_MS) listen_reset("start listening");
         break;
     case L_SCAN:
         if (s_boot_hold && (a2dp_in_connected() || (int32_t)(s_scan_hold_until - now_ms()) <= 0)) {
@@ -1022,6 +1187,12 @@ static void cis_guard(void)
         waiting_on = false;
         return;
     }
+    /* multipoint: an A2DP phone took the speaker, the LE Audio phone is still closing its
+     * stream - its losses no longer reach anyone, re-placing the BIG would only cut it */
+    if (!a2dp_in_ext_active()) {
+        n = 0;
+        return;
+    }
     if (waiting_on) {                                 /* re-placing: wait for the new BIG */
         if (auracast_state() != AURACAST_STATE_ON) return;
         waiting_on = false;
@@ -1035,7 +1206,11 @@ static void cis_guard(void)
     n++;
     if (n < CIS_GUARD_WINDOW) return;
     uint32_t dlost = lost - lost_h[n % CIS_GUARD_WINDOW];         /* oldest sample in the window */
+    uint32_t drx = rx - rx_h[n % CIS_GUARD_WINDOW];
     if (dlost < CIS_GUARD_LOST || tries >= CIS_GUARD_TRIES) return;
+    /* nearly nothing received: the phone stopped sending (paused, its stream is closing) -
+     * not our BIG in the way. Re-placing the BIG then only cut every listener's audio. */
+    if (drx < dlost) return;
     tries++;
     ESP_LOGW(TAG, "phone's LE Audio lost %lu SDUs in 0.5 s next to our broadcast: re-placing the BIG (try %d/%d)",
              (unsigned long)dlost, tries, CIS_GUARD_TRIES);
@@ -1049,13 +1224,14 @@ static void cis_guard(void)
  * for BIG_HOLD_STABLE_MS; then it is created next to the stream. The advertising (party
  * listing) stays on. A link that never starts LE Audio (A2DP phone, JBL One over LE) ends the
  * hold after BIG_HOLD_IDLE_MS. Runs every tick, in every role. true while held. */
+static bool s_switching;                          /* an LE Audio switch is under way */
 #define BIG_HOLD_STABLE_MS 1000
-#define BIG_HOLD_IDLE_MS   10000
-#define BIG_HOLD_MAX_MS    20000
+#define BIG_HOLD_IDLE_MS   10000   /* quiet time: pairing, consent dialog, Classic setup restart it */
+#define BIG_HOLD_MAX_MS    45000
 static bool big_hold_for_cis(void)
 {
     static bool was_linked, done;
-    static uint32_t link_ms, clean_since, lost_seen;
+    static uint32_t link_ms, busy_ms, clean_since, lost_seen;
     uint32_t rx, lost, now = now_ms();
     bool linked = le_audio_enabled() && le_audio_phone_linked();
     bool streaming = le_audio_cis_counts(&rx, &lost);
@@ -1064,8 +1240,44 @@ static bool big_hold_for_cis(void)
         done = false;
         clean_since = 0;
     }
+
+    /* a NEW stream on the same link (the phone paused and plays again, or comes back from a
+     * broadcast): the hold was armed once per link and had ended long ago, so the BIG came
+     * up 0.1 s after the new CIS, the CIS lost SDUs and the BIG had to be re-placed (a gap
+     * for every listener). Re-arm it while our BIG is not on air yet. */
+    if (linked && done && le_audio_starting() && (auracast_state() != AURACAST_STATE_ON || auracast_big_held())) {
+        done = false;
+        clean_since = 0;
+        link_ms = now;
+    }
+    /* the phone is still busy setting itself up (the pairing consent dialog alone took 7 s:
+     * a 10 s window from the LE connect ran out just before it started LE Audio, the BIG
+     * came up in its way and the phone dropped the link) */
+    if (!linked || le_audio_starting() || a2dp_in_pairing() || a2dp_in_settling()) busy_ms = now;
     was_linked = linked;
-    bool hold = false;
+    /* an LE Audio switch: the phone is dropped, pairs again and comes back on LE Audio or
+     * A2DP - only the BIG pauses (the party stays listed), until the new stream is stable
+     * (LE, below) or A2DP plays, at most BIG_HOLD_MAX_MS */
+    static uint32_t switch_ms, a2dp_play_ms;
+    static bool saw_drop;
+    if (a2dp_in_pairing_is_switch() && !s_switching) {
+        s_switching = true;
+        switch_ms = now;
+        saw_drop = false;
+        ESP_LOGW(TAG, "LE Audio switch: broadcast stream paused until the phone is back");
+    }
+    if (s_switching) {
+        if (!linked && !a2dp_in_connected()) saw_drop = true;     /* the old links are gone */
+        if (a2dp_in_streaming()) { if (a2dp_play_ms == 0) a2dp_play_ms = now; } else a2dp_play_ms = 0;
+        bool a2dp_back = saw_drop && a2dp_play_ms != 0 && now - a2dp_play_ms >= BIG_HOLD_STABLE_MS && !linked;
+        bool le_back = saw_drop && linked && done;
+        if (a2dp_back || le_back || now - switch_ms > BIG_HOLD_MAX_MS) {
+            s_switching = false;
+            ESP_LOGW(TAG, "LE Audio switch done (%s) after %lu ms", a2dp_back ? "A2DP playing" :
+                     le_back ? "LE Audio stable" : "timeout", (unsigned long)(now - switch_ms));
+        }
+    }
+    bool hold = s_switching;
     if (linked && !done) {
         if (streaming) {
             if (clean_since == 0 || lost != lost_seen) { clean_since = now; lost_seen = lost; }
@@ -1073,7 +1285,7 @@ static bool big_hold_for_cis(void)
             clean_since = 0;
         }
         bool stable = streaming && clean_since != 0 && now - clean_since >= BIG_HOLD_STABLE_MS;
-        bool idle = !streaming && !le_audio_starting() && now - link_ms > BIG_HOLD_IDLE_MS;
+        bool idle = !streaming && now - busy_ms > BIG_HOLD_IDLE_MS;
         bool too_long = now - link_ms > BIG_HOLD_MAX_MS;
         if (stable || idle || too_long) {
             done = true;
@@ -1090,8 +1302,80 @@ static bool big_hold_for_cis(void)
     return hold;
 }
 
+/* the controller's last BIGInfo and its verdict (ctrl_wrap.c), decoded on change */
+static void biginfo_log(void)
+{
+    static uint32_t seen;
+    static uint8_t last[23];
+    static int last_rc = 1;
+    uint32_t ch = g_ctrl_biginfo.changes;
+    if (ch == seen) return;
+    seen = ch;
+    uint8_t r[58];
+    uint8_t n = g_ctrl_biginfo.len;
+    if (n > sizeof(r)) n = sizeof(r);
+    memcpy(r, (const void *)g_ctrl_biginfo.raw, n);
+    /* the payload count and channel map change every PA event: log the timing fields only */
+    int key = g_ctrl_biginfo.rc * 100 + g_ctrl_biginfo.rule;
+    if (n >= sizeof(last) && key == last_rc && memcmp(r, last, sizeof(last)) == 0) return;
+    if (n >= sizeof(last)) memcpy(last, r, sizeof(last));
+    last_rc = key;
+    char hex[3 * 58 + 1];
+    for (int i = 0; i < n; i++) sprintf(hex + 3 * i, "%02x ", r[i]);
+    hex[3 * n] = 0;
+    ESP_LOGW(TAG, "ctrl BIGInfo #%" PRIu32 " (%" PRIu32 " calls, %" PRIu32 " fixed, %" PRIu32 " bypassed): rule %d -> rc %d, %u B: %s",
+             ch, g_ctrl_biginfo.calls, g_ctrl_biginfo.fixed, g_ctrl_biginfo.bypassed, g_ctrl_biginfo.rule,
+             g_ctrl_biginfo.rc, n, hex);
+    const uint8_t *b = r;
+    if (n >= 35 && b[1] == 0x2C) { b += 2; n -= 2; }  /* AD header in front */
+    if (n < 33) return;
+    uint32_t w0 = little_endian_read_32(b, 0), w1 = little_endian_read_32(b, 4), w2 = little_endian_read_32(b, 8);
+    uint32_t w4 = little_endian_read_32(b, 17);
+    ESP_LOGW(TAG, "  offset %u (units %s) ISO_Interval %u (%u us) Num_BIS %u NSE %u BN %u Sub_Interval %u us PTO %u",
+             (unsigned)(w0 & 0x3FFF), (w0 >> 14) & 1 ? "300us" : "30us", (unsigned)((w0 >> 15) & 0xFFF),
+             (unsigned)(((w0 >> 15) & 0xFFF) * 1250), (unsigned)(w0 >> 27), (unsigned)(w1 & 0x1F),
+             (unsigned)((w1 >> 5) & 7), (unsigned)((w1 >> 8) & 0xFFFFF), (unsigned)(w1 >> 28));
+    ESP_LOGW(TAG, "  BIS_Spacing %u us IRC %u Max_PDU %u SDU_Interval %u us Max_SDU %u PHY %u framing %u seedAA %08" PRIx32,
+             (unsigned)(w2 & 0xFFFFF), (unsigned)((w2 >> 20) & 0xF), (unsigned)(w2 >> 24),
+             (unsigned)(w4 & 0xFFFFF), (unsigned)(w4 >> 20), (unsigned)(b[27] >> 5), (unsigned)(b[32] >> 7),
+             little_endian_read_32(b, 13));
+}
+
+/* pairing mode holds our broadcast until the new phone is connected - not the stereo pair's
+ * (a real Xtreme 5 primary keeps the pair playing while it pairs a phone) */
+static bool pairing_holds_host(void)
+{
+    return a2dp_in_pairing() && !a2dp_in_pairing_is_switch() && !s_std_on && !s_stereo_hold;
+}
+
+/* the Xtreme 5: any Auracast mode (party button, JBL One join, Broadcast to Others) closes the
+ * stereo pair (0x13) - linked or still searching - and the pair is made again when it ends */
+static void stereo_vs_auracast(void)
+{
+    static bool was;
+    bool on = s_enabled || s_std_on || s_as.target;
+    if (on && !was) {
+        if (jbl_v5_stereo_suspend(true)) {
+            ESP_LOGW(TAG, "Auracast on: the stereo pair waits for it to end");
+            s_stereo_hold = s_past_expect = false;    /* the party takes the radio now */
+        }
+    } else if (!on && was && jbl_v5_stereo_suspended()) {
+        jbl_v5_stereo_suspend(false);
+    }
+    was = on;
+}
+
 static void tick(btstack_timer_source_t *ts)
 {
+    biginfo_log();
+    stereo_vs_auracast();
+    if (s_big_retry_at && (int32_t)(now_ms() - s_big_retry_at) >= 0) {
+        s_big_retry_at = 0;
+        if (s_ls == L_W4_BASE && s_past_expect) {
+            ESP_LOGW(TAG, "stereo: BIG sync retry %d", s_big_retries);
+            try_big_sync();
+        }
+    }
     bool playing = (a2dp_in_streaming() || le_audio_starting()) && !s_as.target;   /* a JBL One join wins over the phone */
     s_idle_ms = playing ? 0 : s_idle_ms + TICK_MS;
     if (s_as.scanning && (int32_t)(s_as.scan_until - now_ms()) <= 0) {
@@ -1115,16 +1399,22 @@ static void tick(btstack_timer_source_t *ts)
     }
     bool jbl_listen = s_role == R_LISTEN || s_role == R_LISTEN_STOPPING;
     if (s_role != R_OFF && !s_as.target &&
-        ((!s_enabled && !s_std_on) || (s_std_on && jbl_listen))) {   /* Auracast off / standard: no JBL receive */
+        ((!s_enabled && !s_std_on && !stereo_on()) || (s_std_on && jbl_listen) ||
+         (s_past_expect && (s_role == R_HOST || s_role == R_HOST_STOPPING)))) {   /* Auracast off / standard: no JBL receive; stereo secondary never hosts */
         if (s_role == R_LISTEN || s_role == R_LISTEN_STOPPING) {
-            set_role(R_OFF, "Auracast turned off");
+            set_role(R_OFF, stereo_on() ? "stereo pair role change" : "Auracast turned off");
             listen_reset("Auracast off");
         } else {
             auracast_host_stop();
-            set_role(R_OFF, "Auracast turned off");
+            set_role(R_OFF, s_past_expect ? "stereo secondary: we do not host" : "Auracast turned off");
         }
         jbl_assist_set_paused(true);                  /* no party: don't pull speakers in */
         jbl_set_party_info(JBL_PARTY_INFO_OFF);
+    }
+    {   /* Auracast turned on during pairing mode: pairing ends (as the Xtreme 5) */
+        static bool was_enabled;
+        if (s_enabled && !was_enabled && a2dp_in_pairing()) a2dp_in_pairing_cancel("Auracast turned on");
+        was_enabled = s_enabled;
     }
     big_hold_for_cis();                               /* before any host start below */
     switch (s_role) {
@@ -1144,13 +1434,20 @@ static void tick(btstack_timer_source_t *ts)
             set_role(R_HOST, rc == 0 ? "standard broadcast on" : "standard broadcast on (start error)");
             break;
         }
-        if (s_enabled && auracast_state() == AURACAST_STATE_OFF) {
+        if (s_past_expect) {                              /* stereo secondary: wait for the hand-off */
+            jbl_assist_set_paused(true);
+            set_role(R_LISTEN, "stereo secondary: the primary's broadcast");
+            set_ls(L_OFF, "waiting for the stereo primary's PAST");
+            break;
+        }
+        if ((s_enabled || s_stereo_hold) && auracast_state() == AURACAST_STATE_OFF) {
             auracast_set_standard(false, NULL, NULL);
             int rc = auracast_host_start();               /* back on: host first */
             s_idle_ms = 0;
-            jbl_assist_set_paused(false);
-            jbl_set_party_info(JBL_PARTY_INFO_HOST);
-            set_role(R_HOST, rc == 0 ? "Auracast turned on" : "Auracast turned on (host start error)");
+            jbl_assist_set_paused(s_stereo_hold);         /* stereo: pull no party speakers in */
+            if (!s_stereo_hold) jbl_set_party_info(JBL_PARTY_INFO_HOST);
+            set_role(R_HOST, s_stereo_hold ? (rc == 0 ? "stereo primary: hosting the pair's broadcast" : "stereo primary (host start error)")
+                                           : (rc == 0 ? "Auracast turned on" : "Auracast turned on (host start error)"));
         }
         break;
     case R_HOST:
@@ -1171,17 +1468,17 @@ static void tick(btstack_timer_source_t *ts)
         if (s_as.target) {
             auracast_host_stop();                         /* JBL One join: our broadcast ends now */
             set_role(R_HOST_STOPPING, "JBL One: join a broadcast");
-        } else if (!playing && s_idle_ms >= PARTY_IDLE_TO_LISTEN_MS && !s_std_on) {
+        } else if (!playing && s_idle_ms >= PARTY_IDLE_TO_LISTEN_MS && !s_std_on && !s_switching && !s_stereo_hold) {
             auracast_host_stop();
             set_role(R_HOST_STOPPING, "no audio for 1.5 s");
-        } else if (a2dp_in_pairing() && !s_std_on) {
+        } else if (pairing_holds_host()) {
             /* pairing: the phone pairs and connects first, the party comes back after */
             auracast_host_stop();
             set_role(R_HOST_STOPPING, "pairing mode - broadcast held until the phone is connected");
         }
         break;
     case R_HOST_STOPPING:
-        if (playing) {
+        if (playing && !pairing_holds_host()) {      /* (playing during pairing: flapped every 100 ms) */
             auracast_host_start();
             set_role(R_HOST, "audio again");
         } else if (auracast_state() == AURACAST_STATE_OFF) {
@@ -1299,8 +1596,19 @@ void party_on_hci_working(void)
 
 bool party_auracast_enabled(void) { return s_enabled; }
 
+void party_auracast_off_for_pairing(void)
+{
+    s_before.valid = false;
+    if (!s_enabled && !s_std_on) return;
+    ESP_LOGW(TAG, "Auracast OFF (pairing mode)");
+    s_enabled = false;                                /* no exit tone: the pairing tone plays */
+    s_std_on = false;
+    jbl_v5_on_party_changed();
+}
+
 void party_set_auracast_enabled(bool on)
 {
+    s_before.valid = false;
     if (on && (s_std_on || s_as.target)) {           /* back to the JBL party: standard modes end */
         s_std_on = false;
         assist_end("JBL party turned on");
@@ -1320,6 +1628,11 @@ bool party_assist_active(void) { return s_as.target; }
 bool party_listening(void)
 {
     return s_role == R_LISTEN || s_role == R_LISTEN_STOPPING;
+}
+
+bool party_listen_streaming(void)
+{
+    return s_ls == L_STREAM;
 }
 
 static void assist_report(const uint8_t *packet)
@@ -1386,8 +1699,15 @@ void party_assist_scan(bool on, uint8_t seconds)
     jbl_v5_assist_scan_state(false);
 }
 
-void party_assist_join(const uint8_t addr[6], uint8_t addr_type, const uint8_t *code)
+static void assist_join(const uint8_t addr[6], uint8_t addr_type, const uint8_t *code, bool restore)
 {
+    if (restore && !s_before.valid) {
+        s_before.valid = true;
+        s_before.enabled = s_enabled;
+        s_before.std = s_std_on;
+    } else if (!restore) {
+        s_before.valid = false;
+    }
     party_assist_scan(false, 0);
     s_as.has_code = code != NULL;
     memset(s_as.code, 0, sizeof(s_as.code));
@@ -1408,12 +1728,33 @@ void party_assist_join(const uint8_t addr[6], uint8_t addr_type, const uint8_t *
     if (party_listening()) listen_reset("JBL One: join a broadcast");
 }
 
+void party_assist_join(const uint8_t addr[6], uint8_t addr_type, const uint8_t *code)
+{
+    assist_join(addr, addr_type, code, false);
+}
+
+void party_bass_join(const uint8_t addr[6], uint8_t addr_type, const uint8_t *code)
+{
+    assist_join(addr, addr_type, code, true);
+}
+
 void party_assist_leave(void)
 {
-    if (!s_as.target) return;
-    s_as.target = s_as.joined = s_as.was_joined = false;
-    ESP_LOGW(TAG, "JBL One: left the broadcast");
-    if (party_listening()) listen_reset("JBL One: left the broadcast");
+    if (s_as.target) {
+        s_as.target = s_as.joined = s_as.was_joined = false;
+        ESP_LOGW(TAG, "JBL One: left the broadcast");
+        if (party_listening()) listen_reset("JBL One: left the broadcast");
+    }
+    if (s_before.valid) {
+        s_before.valid = false;
+        if (s_before.enabled != s_enabled || s_before.std != s_std_on) {
+            s_enabled = s_before.enabled;
+            s_std_on = s_before.std;
+            ESP_LOGW(TAG, "phone's broadcast listening ended: back to %s",
+                     s_std_on ? "Broadcast to Others" : s_enabled ? "the JBL party" : "Auracast off");
+            jbl_v5_on_party_changed();
+        }
+    }
 }
 
 void party_assist_get(party_assist_t *o)
@@ -1429,6 +1770,10 @@ void party_assist_get(party_assist_t *o)
         o->name[sizeof(o->name) - 1] = 0;
         o->encrypted = s_biginfo_enc;
         o->kbps = s_dcfg.dt_us ? (uint16_t)((uint32_t)s_dcfg.opf * 8000u / s_dcfg.dt_us) : 0;
+        for (int i = 0; i < s_big_params.num_bis; i++) {
+            if (s_big_params.bis_indices[i] >= 1 && s_big_params.bis_indices[i] <= 31)
+                o->bis_mask |= 1u << (s_big_params.bis_indices[i] - 1);
+        }
     }
 }
 
@@ -1450,6 +1795,7 @@ void party_set_standard_broadcast(bool on, const char *name, const uint8_t *code
         }
         return;
     }
+    s_before.valid = false;
     s_std_on = on;
     ESP_LOGW(TAG, "JBL One: Broadcast to Others %s%s%s%s", on ? "ON - standard Auracast '" : "OFF",
              on ? s_std_name : "", on ? "'" : "", on && s_std_has_code ? " (encrypted)" : "");
@@ -1490,6 +1836,9 @@ void party_log_stats(void)
                  (unsigned long)(s_st.rx[1] - l_rx[1]), (unsigned long)(s_st.lost[1] - l_lost[1]), (unsigned long)s_st.gaps[1],
                  (unsigned long)(s_st.decoded - l_dec), (unsigned long)(s_st.plc - l_plc), (unsigned long)s_st.errors,
                  (unsigned long)(s_st.qdrops - l_qd), (unsigned long)s_st.i2s_late);
+        ESP_LOGW(TAG, "LISTEN loss: even seq %lu, odd seq %lu, longest run %lu",
+                 (unsigned long)s_lost_par[0], (unsigned long)s_lost_par[1], (unsigned long)s_lost_run_max);
+        s_lost_par[0] = s_lost_par[1] = s_lost_run_max = 0;
     } else {
         ESP_LOGI(TAG, "role %s, listen %s | switches to listen %lu, to host %lu, syncs %lu",
                  role_names[s_role], lstate_names[s_ls], (unsigned long)s_st.switches_listen,

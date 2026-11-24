@@ -11,6 +11,10 @@
  *   v1: 40 crc16     CRC-16/ARC of bytes 0..39, little-endian
  *   v2: 40 id[6]     this speaker's Bluetooth address (all 0: the chip's own MAC)
  *       46 crc16     CRC-16/ARC of bytes 0..45, little-endian
+ *   v3: as v2, then 46 model PID (LE, the JBL product it is - jbl_models.h) and
+ *       48 crc16     CRC-16/ARC of bytes 0..47
+ * NVS "s31"/"model" (u16) + "model_color" (u8), set by the console "model" command, win
+ * over the partition (testing models without flashing).
  *
  * The identity (Classic + LE address, beacon address, macCrc, serial, Broadcast_ID) comes
  * from the chip's factory MAC, so every board is its own Xtreme 5 and keeps its pairings
@@ -30,9 +34,10 @@
 static const char *TAG = "IDENT";
 
 #define CFG_MAGIC "S31C"
-#define CFG_READ  48
+#define CFG_READ  64                      /* v3 is 50 B (crc at 48..49) */
 
 static uint8_t s_color = S31_COLOR_BLACK;
+static uint16_t s_model = S31_MODEL_DEFAULT;
 static char s_name[33];
 static char s_serial[12];
 static uint32_t s_std_id = 0x5a31c3u;
@@ -57,8 +62,8 @@ static bool cfg_read(uint8_t id_out[6])
     if (p == NULL) return false;
     uint8_t b[CFG_READ];
     if (esp_partition_read(p, 0, b, sizeof(b)) != ESP_OK) return false;
-    if (memcmp(b, CFG_MAGIC, 4) != 0 || (b[4] != 1 && b[4] != 2)) return false;
-    int body = b[4] == 1 ? 40 : 46;
+    if (memcmp(b, CFG_MAGIC, 4) != 0 || b[4] < 1 || b[4] > 3) return false;
+    int body = b[4] == 1 ? 40 : b[4] == 2 ? 46 : 48;
     uint16_t crc = (uint16_t)(b[body] | (b[body + 1] << 8));
     if (crc != crc16_arc(b, body)) {
         ESP_LOGE(TAG, "s31cfg partition CRC mismatch - using defaults");
@@ -68,9 +73,12 @@ static bool cfg_read(uint8_t id_out[6])
     uint8_t n = b[7] > 32 ? 32 : b[7];
     memcpy(s_name, b + 8, n);
     s_name[n] = 0;
-    if (b[4] == 2) memcpy(id_out, b + 40, 6);
+    if (b[4] >= 2) memcpy(id_out, b + 40, 6);
+    if (b[4] >= 3 && (b[46] | (b[47] << 8)) != 0) s_model = (uint16_t)(b[46] | (b[47] << 8));
     return true;
 }
+
+static void model_override(void);
 
 static bool id_usable(const uint8_t id[6])
 {
@@ -107,10 +115,12 @@ static void nvs_follow_identity(const uint8_t id[6])
 
 void s31_ident_init(void)
 {
+    /* NVS model override: after the partition (see model_override) */
     if (s_done) return;
     s_done = true;
     uint8_t id[6];
     bool cfg = cfg_read(id);
+    model_override();
     /* The Bluetooth address stays the chip's factory MAC (unique per chip). Setting another
      * one (esp_iface_mac_addr_set) is accepted by the ESP32-S31 controller, but its BR/EDR
      * authentication then fails on every reconnect: phones pair once and never reconnect,
@@ -132,6 +142,36 @@ void s31_ident_init(void)
 }
 
 uint8_t s31_ident_color(void) { return s_color; }
+uint16_t s31_ident_model(void) { return s_model; }
+
+static void model_override(void)
+{
+    nvs_handle_t h;
+    if (nvs_open("s31", NVS_READONLY, &h) != ESP_OK) return;
+    uint16_t m;
+    uint8_t c;
+    if (nvs_get_u16(h, "model", &m) == ESP_OK && m) {
+        s_model = m;
+        if (nvs_get_u8(h, "model_color", &c) == ESP_OK) s_color = c;
+        ESP_LOGW(TAG, "model 0x%04x, color 0x%02x from NVS (console 'model' command)", s_model, s_color);
+    }
+    nvs_close(h);
+}
+
+void s31_ident_set_model(uint16_t pid, uint8_t color)
+{
+    nvs_handle_t h;
+    if (nvs_open("s31", NVS_READWRITE, &h) != ESP_OK) return;
+    if (pid) {
+        nvs_set_u16(h, "model", pid);
+        nvs_set_u8(h, "model_color", color);
+    } else {
+        nvs_erase_key(h, "model");
+        nvs_erase_key(h, "model_color");
+    }
+    nvs_commit(h);
+    nvs_close(h);
+}
 const char *s31_ident_name(void) { return s_name; }
 const char *s31_ident_serial(void) { return s_serial; }
 uint32_t s31_ident_std_broadcast_id(void) { return s_std_id; }

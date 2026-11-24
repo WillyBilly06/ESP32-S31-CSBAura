@@ -27,7 +27,9 @@
 #include "jbl_assist.h"
 #include "jbl_gatt.h"
 #include "jbl_gatt_db.h"
+#include "jbl_gatt_db_no_le_audio.h"
 #include "jbl_v5.h"
+#include "lls.h"
 #include "le_audio.h"
 #include "hci_transport_s31_vhci.h"
 
@@ -289,6 +291,11 @@ uint16_t jbl_gatt_v5_notify_handle(void)
     return H_COM_NTF;
 }
 
+uint16_t jbl_gatt_cnl_notify_handle(void)
+{
+    return H_CNL_NTF;
+}
+
 uint16_t jbl_gatt_mtu(hci_con_handle_t con)
 {
     return att_server_get_mtu(con);
@@ -303,12 +310,14 @@ static const uint16_t s_la_val[LA_N] = {
     [LA_ASE] = LA_H(SINK_ASE), [LA_ASE_CP] = LA_H(ASE_CONTROL_POINT),
     [LA_VOL_STATE] = LA_H(VOLUME_STATE), [LA_VOL_CP] = LA_H(VOLUME_CONTROL_POINT),
     [LA_VOL_FLAGS] = LA_H(VOLUME_FLAGS), [LA_TMAP] = LA_H(TMAP_ROLE),
+    [LA_BASS_CP] = LA_H(BROADCAST_AUDIO_SCAN_CONTROL_POINT), [LA_BASS_RS] = LA_H(BROADCAST_RECEIVE_STATE),
 };
 static const uint16_t s_la_ccc[LA_N] = {
     [LA_PAC] = LA_C(SINK_PAC), [LA_LOC] = LA_C(SINK_AUDIO_LOCATIONS),
     [LA_AVAIL] = LA_C(AVAILABLE_AUDIO_CONTEXTS), [LA_SUPP] = LA_C(SUPPORTED_AUDIO_CONTEXTS),
     [LA_ASE] = LA_C(SINK_ASE), [LA_ASE_CP] = LA_C(ASE_CONTROL_POINT),
     [LA_VOL_STATE] = LA_C(VOLUME_STATE), [LA_VOL_FLAGS] = LA_C(VOLUME_FLAGS),
+    [LA_BASS_RS] = LA_C(BROADCAST_RECEIVE_STATE),
 };
 
 static int la_find(uint16_t handle, bool *ccc)
@@ -415,6 +424,9 @@ static int att_write_cb(hci_con_handle_t con, uint16_t handle, uint16_t mode, ui
             return le_audio_att_write(con, (le_audio_attr_t)la, la_ccc, buf, len);
         }
     }
+    if (handle == H_CNL_WR) {
+        lls_on_cnl_write(con, buf, len);        /* stereo partner -> us */
+    }
     if (handle == H_COM_WR) {
         if (!jbl_v5_is_link(con)) jbl_v5_link_up(con);
         s_rx_v5++;
@@ -429,6 +441,9 @@ static int att_write_cb(hci_con_handle_t con, uint16_t handle, uint16_t mode, ui
         }
         if (l != NULL && len >= 2) {
             l->cccd[ci] = little_endian_read_16(buf, 0);
+        }
+        if (ci == CCCD_CNL && len >= 2) {
+            lls_on_cnl_cccd(con, little_endian_read_16(buf, 0));   /* stereo partner subscribing */
         }
         if (ci == CCCD_COM && len >= 2 && (buf[0] & 1) && !jbl_v5_is_link(con)) {
             jbl_v5_link_up(con);                /* JBL One subscribed on this link */
@@ -635,6 +650,19 @@ static void att_client_pdu(uint8_t packet_type, uint16_t channel, uint8_t *packe
     confirm_try(NULL);
 }
 
+/* LE Audio off: the database without the LE Audio services (same handles for the rest) */
+static bool s_db_le_audio;
+static bool s_att_up;
+
+void jbl_gatt_set_le_audio(bool on)
+{
+    if (on == s_db_le_audio) return;
+    s_db_le_audio = on;
+    if (!s_att_up) return;
+    att_set_db(on ? profile_data : profile_data_no_le_audio);
+    ESP_LOGW(TAG, "GATT database %s the LE Audio services", on ? "with" : "without");
+}
+
 void jbl_gatt_setup(void)
 {
     for (int i = 0; i < MAX_LINKS; i++) {
@@ -653,7 +681,8 @@ void jbl_gatt_setup(void)
         s_tx_tmp = s_tx_storage + TX_RING_SIZE;
     }
 
-    att_server_init(profile_data, &att_read_cb, &att_write_cb);
+    att_server_init(s_db_le_audio ? profile_data : profile_data_no_le_audio, &att_read_cb, &att_write_cb);
+    s_att_up = true;
     att_server_register_packet_handler(&att_event_handler);
     s_gatt_client_pdu = att_dispatch_get_client_handler();  /* gatt_client_init() ran first (jbl.c) */
     att_dispatch_register_client(&att_client_pdu);          /* BR/EDR indications, the rest chained on */
@@ -661,9 +690,11 @@ void jbl_gatt_setup(void)
     sdp_setup();
 
     ESP_LOGW(TAG, "GATT excelpoint.cnl: notify 0x%04x, write 0x%04x | excelpoint.com: notify 0x%04x, "
-             "write 0x%04x | DIS 0x%04x | LE + BR/EDR (%u B database)",
+             "write 0x%04x | DIS 0x%04x | LE + BR/EDR (%u B database, LE Audio services %s)",
              H_CNL_NTF, H_CNL_WR, H_COM_NTF, H_COM_WR,
-             ATT_SERVICE_ORG_BLUETOOTH_SERVICE_DEVICE_INFORMATION_START_HANDLE, (unsigned)sizeof(profile_data));
+             ATT_SERVICE_ORG_BLUETOOTH_SERVICE_DEVICE_INFORMATION_START_HANDLE,
+             (unsigned)(s_db_le_audio ? sizeof(profile_data) : sizeof(profile_data_no_le_audio)),
+             s_db_le_audio ? "in" : "out");
 }
 
 void jbl_gatt_log_stats(void)

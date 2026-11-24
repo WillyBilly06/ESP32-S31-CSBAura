@@ -16,6 +16,7 @@
 #include "classic/btstack_link_key_db_tlv.h"
 #include "hci_transport_s31_vhci.h"
 #include "hci_dump.h"
+#include "console_cmd.h"
 #include "hci_dump_embedded_stdout.h"
 
 #include "esp_bt.h"
@@ -31,6 +32,8 @@
 #include "a2dp_in.h"
 #include "auracast.h"
 #include "jbl.h"
+#include "csb.h"
+#include "lls.h"
 #include "jbl_v5.h"
 #include "s31_ident.h"
 #include "link_tune.h"
@@ -132,6 +135,8 @@ static void stats_task(void *arg)
         auracast_log_stats();
         party_log_stats();
         le_audio_log_stats();
+        csb_log_stats();
+        lls_log_stats();
         audio_out_log_stats();
         /* slow beacon (100 ms) while streaming OR listening: at 20 ms it collides with the master's 20 ms BIG */
         /* slow beacon (100 ms) only while a BIG needs the air: broadcasting or listening.
@@ -180,12 +185,63 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
         a2dp_in_on_hci_working();
         auracast_on_hci_working();
         jbl_on_hci_working();
+        csb_on_hci_working();
         /* no broadcast at boot: nothing plays yet, and the radio is better spent
          * paging the last phone (party starts LISTEN once it is connected) */
         party_on_hci_working();
         le_audio_on_hci_working();
     }
 }
+
+/* LE pairing (SMP, L2CAP CID 6) messages on the console: which side asks for what and who
+ * fails - everything else of the packet log stays off */
+static const hci_dump_t *s_dump_std;
+static void smp_dump_packet(uint8_t type, uint8_t in, uint8_t *p, uint16_t len)
+{
+    /* link encryption around a pairing: LTK request, our reply, the result */
+    if (type == HCI_COMMAND_DATA_PACKET && len >= 3) {
+        uint16_t op = little_endian_read_16(p, 0);
+        if (op == HCI_OPCODE_HCI_LE_LONG_TERM_KEY_REQUEST_REPLY && len >= 21)
+            ESP_LOGW("SMP", "LTK reply con 0x%04x", little_endian_read_16(p, 3));   /* no key bytes in logs */
+        else if (op == HCI_OPCODE_HCI_LE_LONG_TERM_KEY_NEGATIVE_REPLY)
+            ESP_LOGW("SMP", "LTK negative reply con 0x%04x", little_endian_read_16(p, 3));
+        return;
+    }
+    if (type == HCI_EVENT_PACKET && len >= 2) {
+        uint8_t ev = p[0];
+        if (ev == HCI_EVENT_LE_META && len >= 15 && p[2] == HCI_SUBEVENT_LE_LONG_TERM_KEY_REQUEST)
+            ESP_LOGW("SMP", "controller asks for the LTK, con 0x%04x ediv 0x%04x", little_endian_read_16(p, 3),
+                     little_endian_read_16(p, 13));
+        else if ((ev == HCI_EVENT_ENCRYPTION_CHANGE || ev == HCI_EVENT_ENCRYPTION_CHANGE_V2) && len >= 6)
+            ESP_LOGW("SMP", "encryption change con 0x%04x: status 0x%02x, %s", little_endian_read_16(p, 3), p[2],
+                     p[5] ? "on" : "off");
+        else if (ev == HCI_EVENT_ENCRYPTION_KEY_REFRESH_COMPLETE && len >= 5)
+            ESP_LOGW("SMP", "key refresh con 0x%04x: status 0x%02x", little_endian_read_16(p, 3), p[2]);
+        else if (ev == HCI_EVENT_COMMAND_COMPLETE && len >= 6) {
+            uint16_t op = little_endian_read_16(p, 3);
+            if (op == HCI_OPCODE_HCI_LE_LONG_TERM_KEY_REQUEST_REPLY || op == HCI_OPCODE_HCI_LE_ENCRYPT)
+                ESP_LOGW("SMP", "cmd 0x%04x done: status 0x%02x", op, p[5]);
+        }
+        return;
+    }
+    if (type != HCI_ACL_DATA_PACKET || len < 9 || little_endian_read_16(p, 6) != 0x0006) return;
+    static const char *names[] = { "?", "PairingRequest", "PairingResponse", "Confirm", "Random", "PairingFailed",
+                                   "EncryptionInfo", "CentralIdent", "IdentityInfo", "IdentityAddr", "SigningInfo",
+                                   "SecurityRequest", "PublicKey", "DHKeyCheck", "Keypress" };
+    uint8_t code = p[8];
+    char hex[40] = { 0 };
+    int n = len - 9 > 12 ? 12 : len - 9;
+    /* keys and pairing secrets (Confirm, Random, LTK, EDIV/Rand, IRK, CSRK, public key, DHKey
+     * check) never go to the log: their name only */
+    if (code == 3 || code == 4 || code == 6 || code == 7 || code == 8 || code == 10 || code == 12 || code == 13) n = 0;
+    for (int i = 0; i < n; i++) snprintf(hex + i * 3, 4, "%02x ", p[9 + i]);
+    ESP_LOGW("SMP", "%s %s (0x%02x) %s", in ? "phone ->" : "-> phone", code < 15 ? names[code] : "?", code, hex);
+}
+static void smp_dump_message(int level, const char *fmt, va_list ap)
+{
+    if (s_dump_std && s_dump_std->log_message) s_dump_std->log_message(level, fmt, ap);
+}
+static const hci_dump_t s_smp_dump = { NULL, smp_dump_packet, smp_dump_message };
 
 static void btstack_task(void *arg)
 {
@@ -194,9 +250,12 @@ static void btstack_task(void *arg)
     btstack_run_loop_init(btstack_run_loop_freertos_get_instance());
     hci_init(hci_transport_s31_vhci_get_instance(), NULL);
     /* BTstack log_error lines on the console (no packet dump) */
-    hci_dump_init(hci_dump_embedded_stdout_get_instance());
-    hci_dump_enable_packet_log(false);
 #ifdef S31_HCI_DUMP
+    hci_dump_init(hci_dump_embedded_stdout_get_instance());
+    hci_dump_enable_packet_log(true);
+#else
+    s_dump_std = hci_dump_embedded_stdout_get_instance();
+    hci_dump_init(&s_smp_dump);                   /* log_error lines + the LE pairing messages */
     hci_dump_enable_packet_log(true);
 #endif
 
@@ -220,7 +279,10 @@ static void btstack_task(void *arg)
         auracast_setup();
         party_setup();
         le_audio_setup();
+        csb_setup();
+        lls_setup();
         buttons_setup();
+        console_cmd_setup();
         gap_set_security_level(LEVEL_0);     /* incoming ATT-over-BR/EDR (JBL One): the phone authenticates */
         jbl_setup();
         gap_set_security_level(LEVEL_2);     /* channels we open */
@@ -244,5 +306,6 @@ void app_main(void)
     s31_ident_init();                        /* this board's serial, color, Broadcast_ID */
     /* core 1 = Bluetooth core: the BTstack run loop sits below the controller (23) */
     xTaskCreatePinnedToCore(btstack_task, "btstack", 8192, NULL, configMAX_PRIORITIES - 5, NULL, 1);
-    xTaskCreatePinnedToCore(stats_task, "stats", 4096, NULL, 2, NULL, 1);
+    /* the 2 s stats lines: stack in PSRAM (internal RAM is what BT and the audio DMA need) */
+    xTaskCreatePinnedToCoreWithCaps(stats_task, "stats", 4096, NULL, 2, NULL, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 }

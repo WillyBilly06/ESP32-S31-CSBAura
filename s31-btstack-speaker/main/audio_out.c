@@ -140,11 +140,25 @@ void audio_out_end(ao_owner_t owner)
 
 ao_owner_t audio_out_owner(void) { return s_owner; }
 
+uint32_t audio_out_line_need_ms(void)
+{
+    if (s_owner != AO_LOCAL || s_primed) return 0;
+    uint32_t want = s_delay_frames + CHUNK, fill = ring_fill(&s_ring);
+    return fill >= want ? 0 : (want - fill) * 1000u / (s_rate ? s_rate : OUT_RATE);
+}
+
 void audio_out_set_rate(uint32_t hz)
 {
     if (hz == 8000 || hz == 16000 || hz == 24000 || hz == 32000 || hz == 44100 || hz == 48000) {
         s_rate = hz;
     }
+}
+
+static volatile uint8_t s_channel;               /* 0 both, 1 left, 2 right */
+
+void audio_out_set_channel(uint8_t ch)
+{
+    s_channel = ch > 2 ? 0 : ch;
 }
 
 void audio_out_push(ao_owner_t owner, const int16_t *lr, int n)
@@ -157,6 +171,18 @@ void audio_out_push(ao_owner_t owner, const int16_t *lr, int n)
         memcpy(vol_buf, lr, (size_t)n * 4);       /* phone volume: here, not on the broadcast */
         a2dp_in_apply_volume(vol_buf, n);         /* EQ: in the writer (HOST: in the encoder path) */
         lr = vol_buf;
+    }
+    uint8_t ch = s_channel;
+    if (ch && n <= 480) {                         /* stereo pair: this speaker's channel on both outputs */
+        if (lr != vol_buf) {
+            memcpy(vol_buf, lr, (size_t)n * 4);
+            lr = vol_buf;
+        }
+        for (int i = 0; i < n; i++) {
+            int16_t v = vol_buf[2 * i + (ch == 2)];
+            vol_buf[2 * i] = v;
+            vol_buf[2 * i + 1] = v;
+        }
     }
     uint32_t space = ring_space(&s_ring);
     if ((uint32_t)n > space) {                    /* producer ahead (should not happen): keep the newest */

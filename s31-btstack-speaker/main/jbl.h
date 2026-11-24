@@ -42,6 +42,9 @@ void jbl_on_hci_working(void);
 
 /* Any thread. Beacon partyInfo (JBL_PARTY_INFO_*). Default HOST. */
 void jbl_set_party_info(uint16_t party_info);
+/* Any thread. Stereo pair setup: partyInfo + stereoGroupId as a real speaker waiting for its
+ * partner advertises them (party_info 0 = back to normal) */
+void jbl_set_stereo_wait(uint16_t party_info, uint8_t gid);
 
 /* Any thread. Phone music streaming: beacon 100 ms (else 20 ms) and the
  * assistant's LE scan is paused, so A2DP keeps its airtime. */

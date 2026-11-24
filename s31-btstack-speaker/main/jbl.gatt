@@ -25,12 +25,14 @@ CHARACTERISTIC, GAP_DEVICE_NAME, READ | DYNAMIC,
 // Appearance 0x0885 (Audio Sink: speaker)
 CHARACTERISTIC, GAP_APPEARANCE, READ | DYNAMIC,
 
-// ---- "excelpoint.cnl" 65786365-6c70-6f69-6e74-2e636e6c0000 (copied from the Xtreme 5)
+// ---- "excelpoint.cnl" 65786365-6c70-6f69-6e74-2e636e6c0000, in the Xtreme 5's order: the
+// write characteristic FIRST. A real Xtreme 5 primary (stereo pair) stops its discovery at the
+// first NOTIFY characteristic, so with ...0001 first it never finds ...0002 and can't send.
 PRIMARY_SERVICE, 65786365-6c70-6f69-6e74-2e636e6c0000
-//   ...0001 speaker -> peer (read + notify); Bluedroid served one 0x00 byte
-CHARACTERISTIC, 65786365-6c70-6f69-6e74-2e636e6c0001, READ | NOTIFY | DYNAMIC,
 //   ...0002 peer -> speaker (write, write without response)
 CHARACTERISTIC, 65786365-6c70-6f69-6e74-2e636e6c0002, WRITE | WRITE_WITHOUT_RESPONSE | DYNAMIC,
+//   ...0001 speaker -> peer (read + notify); Bluedroid served one 0x00 byte
+CHARACTERISTIC, 65786365-6c70-6f69-6e74-2e636e6c0001, READ | NOTIFY | DYNAMIC,
 
 // ---- "excelpoint.com" 65786365-6c70-6f69-6e74-2e636f6d0000: JBL V5 control channel
 PRIMARY_SERVICE, 65786365-6c70-6f69-6e74-2e636f6d0000
@@ -67,3 +69,10 @@ CHARACTERISTIC, ORG_BLUETOOTH_CHARACTERISTIC_VOLUME_FLAGS, READ | NOTIFY | READ_
 PRIMARY_SERVICE, ORG_BLUETOOTH_SERVICE_COMMON_AUDIO_SERVICE
 PRIMARY_SERVICE, ORT_BLUETOOTH_SERVICE_TMAS_SERVICE
 CHARACTERISTIC, ORG_BLUETOOTH_CHARACTERISTIC_TMAP_ROLE, READ | READ_ENCRYPTED | DYNAMIC,
+// Broadcast Audio Scan Service (BASS, scan delegator): the phone's "Listen to audio
+// broadcast" - it finds an Auracast broadcast and tells us which one to join (Add Source,
+// Broadcast Code); one receive state. le_audio.c serves both, on top of the JBL One
+// assistant join (party_assist_join).
+PRIMARY_SERVICE, ORG_BLUETOOTH_SERVICE_BROADCAST_AUDIO_SCAN_SERVICE
+CHARACTERISTIC, ORG_BLUETOOTH_CHARACTERISTIC_BROADCAST_AUDIO_SCAN_CONTROL_POINT, WRITE | WRITE_WITHOUT_RESPONSE | WRITE_ENCRYPTED | DYNAMIC,
+CHARACTERISTIC, ORG_BLUETOOTH_CHARACTERISTIC_BROADCAST_RECEIVE_STATE, READ | NOTIFY | READ_ENCRYPTED | DYNAMIC,

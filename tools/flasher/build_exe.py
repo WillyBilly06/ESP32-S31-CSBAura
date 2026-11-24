@@ -37,5 +37,14 @@ cmd = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--onefile", "--windo
        "--paths", sp, "--collect-all", "esptool", "--hidden-import", "serial.tools.list_ports",
        "--distpath", os.path.join(here, "dist"), "--workpath", work, "--specpath", work,
        os.path.join(here, "s31_flasher.py")]
+# --collect-all imports esptool in the Python running PyInstaller: without the IDF environment
+# on its path it collects nothing, and the exe has esptool's code but not its flasher stubs
+# ("Flasher stub data is missing for ESP32-S31", slow ROM-loader flashing)
+env = dict(os.environ, PYTHONPATH=os.pathsep.join([sp] + ([os.environ["PYTHONPATH"]] if os.environ.get("PYTHONPATH") else [])))
 print(" ".join(cmd))
-sys.exit(subprocess.call(cmd))
+rc = subprocess.call(cmd, env=env)
+if rc == 0:
+    toc = os.path.join(work, "S31Flasher", "Analysis-00.toc")
+    if os.path.isfile(toc) and "esp32s31.json" not in open(toc, encoding="utf-8", errors="replace").read():
+        sys.exit("built, but without esptool's ESP32-S31 flasher stub - check the IDF environment")
+sys.exit(rc)

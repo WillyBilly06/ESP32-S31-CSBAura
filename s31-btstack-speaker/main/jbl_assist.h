@@ -26,6 +26,8 @@ void jbl_assist_start(uint16_t own_mac_crc, const bd_addr_t own_addr);
 
 /* Phone music streaming: the LE scan pauses (A2DP airtime). */
 void jbl_assist_set_streaming(bool streaming);
+/* stereo pair RE: connect to the partner (its Classic MAC, MSB first) and log what it says */
+void jbl_assist_stereo_probe(const uint8_t mac[6]);
 
 /* True for the assistant's own (central) LE link to a speaker. */
 bool jbl_assist_is_link(hci_con_handle_t con);

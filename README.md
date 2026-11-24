@@ -119,8 +119,10 @@ The flasher only automates these steps. To do them by hand:
 
 You need ESP-IDF **v6.1** with ESP32-S31 support. Use exactly commit `c43d665a96` of
 `release/v6.1` (see `idf-patches/IDF_COMMIT`), with
-[`idf-patches/0010-controller-only-iso-rx.patch`](idf-patches) applied. That patch is
-required: without it, a controller-only build drops every received ISO packet. See
+[`idf-patches/0010-controller-only-iso-rx.patch`](idf-patches) and
+`idf-patches/0011-btdm-task-stack-dma.patch` applied. Both are required: without 0010 a
+controller-only build drops every received ISO packet, without 0011 LE link encryption fails
+(no LE pairing, no LE Audio). See
 [`idf-patches/README.md`](idf-patches/README.md).
 
 **Easiest:** use the one in this repository. It is already patched; only its tools need
@@ -139,6 +141,7 @@ cd esp-idf-s31
 git checkout $(cat <repo>/idf-patches/IDF_COMMIT)
 git submodule update --init --recursive --depth 1
 git apply <repo>/idf-patches/0010-controller-only-iso-rx.patch
+git apply <repo>/idf-patches/0011-btdm-task-stack-dma.patch
 ./install.sh esp32s31 && . ./export.sh
 ```
 

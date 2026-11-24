@@ -23,7 +23,15 @@ bool party_host_failed(void);
 bool party_host_held(void);
 bool party_auracast_enabled(void); /* any thread: Auracast button state (default on) */
 void party_set_auracast_enabled(bool on); /* any thread; applied on the next 100 ms tick */
-void party_log_stats(void);        /* any thread, every 2 s */
+/* pairing mode started (button or LE Audio switch): Auracast off, no exit tone (BT thread) */
+void party_auracast_off_for_pairing(void);
+void party_log_stats(void);
+/* any thread: stereo pair primary - keep hosting the broadcast even without music */
+void party_set_stereo_primary(bool on);
+/* any thread: stereo pair secondary - take the primary's broadcast handed over by PAST */
+void party_set_stereo_secondary(bool on);
+/* any thread: listening and the broadcast's audio is flowing */
+bool party_listen_streaming(void);        /* any thread, every 2 s */
 /* BT thread: S31 volume buttons while listening. Steps our own output (0..127);
  * the next master volume change takes over again. Returns false when not listening. */
 bool party_listen_volume_step(int delta);
@@ -43,10 +51,13 @@ typedef struct {
     uint8_t addr[6], addr_type;
     char name[33];
     uint16_t kbps;
+    uint32_t bis_mask;                 /* joined: BIS indices synced (bit i-1 = BIS index i) */
 } party_assist_t;
 void party_assist_scan(bool on, uint8_t seconds);
 /* code: 16-byte broadcast code for an encrypted broadcast, NULL = open */
 void party_assist_join(const uint8_t addr[6], uint8_t addr_type, const uint8_t *code);
+/* the phone's "Listen to audio broadcast" (BASS): party_assist_leave() restores the mode */
+void party_bass_join(const uint8_t addr[6], uint8_t addr_type, const uint8_t *code);
 void party_assist_leave(void);
 void party_assist_get(party_assist_t *out);
 

@@ -22,9 +22,13 @@ extern "C" {
 #define JBL_GATT_TX_OVERHEAD  6u
 
 void jbl_gatt_setup(void);
+/* LE Audio on/off: serve the database with / without PACS, ASCS, VCS, CAS and TMAS */
+void jbl_gatt_set_le_audio(bool on);
 
 /* excelpoint.com ...0001 value handle (V5 replies / notifications). */
 uint16_t jbl_gatt_v5_notify_handle(void);
+/* excelpoint.cnl ...0001 (stereo partner link, lls.c) */
+uint16_t jbl_gatt_cnl_notify_handle(void);
 
 /* ATT MTU of a connection, 0 if it has no ATT bearer. */
 uint16_t jbl_gatt_mtu(hci_con_handle_t con);

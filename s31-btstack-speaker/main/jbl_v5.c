@@ -49,6 +49,10 @@
 #include "jbl_v5.h"
 #include "s31_ident.h"
 #include "party.h"
+#include "csb.h"
+#include "lls.h"
+#include "audio_out.h"
+#include "jbl_assist.h"
 #include "tones.h"
 #include "power.h"
 #include "v5_eq.h"
@@ -516,7 +520,7 @@ static bool feat_value(uint16_t id, uint8_t *v, uint16_t *n)
         m = m > 3 ? (uint16_t)(m - 3) : 20;
         v[0] = m & 0xFF; v[1] = m >> 8; *n = 2; return true;
     }
-    case 0x0004: v[0] = 0x69; v[1] = 0x21; *n = 2; return true;               /* ProductID 2169 */
+    case 0x0004: v[0] = s31_ident_model() & 0xFF; v[1] = s31_ident_model() >> 8; *n = 2; return true;   /* ProductID */
     case 0x0005: v[0] = 0x00; v[1] = s31_ident_color(); *n = 2; return true;  /* ColorID (set when flashing) */
     case 0x0006: *n = (uint16_t)str_copy(v, cfg.name, V5_NAME_MAX); return true;
     case 0x0008: *n = (uint16_t)str_copy(v, s31_ident_serial(), 32); return true;   /* SerialNumber (per board) */
@@ -569,9 +573,11 @@ static bool feat_value(uint16_t id, uint8_t *v, uint16_t *n)
         return true;
     case 0x0B89: memset(v, 0, 6); *n = 6; return true;
     case 0x0B8A: *n = (uint16_t)str_copy(v, cfg.bcast_name, 32); return true;
-    case 0x2C00: v[0] = 0x00; *n = 1; return true;
-    case 0x2C01: v[0] = 0x00; *n = 1; return true;
-    case 0x2C02: v[0] = role ? 0x02 : 0x00; *n = 1; return true;              /* connected while in a party */
+    /* the fw image reads 0x80 / 4 here (0x10549a8), but JBL One only showed the stereo card
+     * with these (2026-11-24: with 0x80 / 4 the app never switched to the group) */
+    case 0x2C00: v[0] = cfg.lls ? 0x40 : 0x00; *n = 1; return true;           /* b6 Auracast stereo */
+    case 0x2C01: v[0] = cfg.lls ? 0x02 : role ? 0x01 : 0x00; *n = 1; return true;   /* 2 AuracastStereo, 1 party */
+    case 0x2C02: v[0] = (role || cfg.lls) ? 0x02 : 0x00; *n = 1; return true; /* connected while in a party */
     case 0x2C03: v[0] = cfg.lls ? cfg.stereo_role : role; *n = 1; return true; /* 0 normal, 1 secondary, 2 primary */
     case 0x2C04: v[0] = cfg.party_channel; *n = 1; return true;
     case 0x2C05: *n = (uint16_t)str_copy(v, cfg.stereo_name, 23); return true;
@@ -760,6 +766,255 @@ static void notify_features(hci_con_handle_t con, const uint16_t *ids, int count
         send_frame(con, 3, p, off);
         s_notifies++;
     }
+}
+
+void jbl_v5_notify(uint16_t id);
+
+static void stereo_resume_cb(btstack_timer_source_t *ts)
+{
+    (void)ts;
+    jbl_v5_stereo_resume();
+}
+
+static void stereo_linked(bool linked)
+{
+    bool was = cfg.lls != 0;
+    cfg.lls = linked ? 1 : 0;
+    if (!linked && was) {   /* the link dropped, the pair is still stored: search again, no timeout (X5) */
+        static btstack_timer_source_t t;
+        btstack_run_loop_remove_timer(&t);
+        btstack_run_loop_set_timer_handler(&t, stereo_resume_cb);
+        btstack_run_loop_set_timer(&t, 1000);
+        btstack_run_loop_add_timer(&t);
+    }
+    ESP_LOGW(TAG, "stereo pair: partner link %s - 0x2C80 = %u", linked ? "UP" : "down", cfg.lls);
+    if (linked) {
+        /* beacon as a linked stereo speaker: group Stereo, Connected, our role, our channel; the
+         * group id byte stays (JBL One groups the two cards by it) */
+        uint16_t pi = (uint16_t)(0x4000u | 0x1000u | (cfg.stereo_role == 2 ? 0x0400u : 0x0200u) |
+                                 ((cfg.party_channel & 3u) << 7) | 0x0040u);
+        jbl_set_stereo_wait(pi, (uint8_t)cfg.stereo_id[3]);
+        /* the primary splits: it plays its own channel and broadcasts the secondary's as one BIS */
+        audio_out_set_channel(cfg.stereo_role == 2 ? cfg.party_channel : 0);
+        party_set_stereo_primary(cfg.stereo_role == 2);
+        ESP_LOGW(TAG, "stereo pair: beacon partyInfo 0x%04x, playing the %s channel%s", pi,
+                 cfg.party_channel == 2 ? "RIGHT" : "LEFT", cfg.stereo_role == 2 ? ", broadcast on" : "");
+    } else {
+        jbl_set_stereo_wait(0, 0);
+        audio_out_set_channel(0);
+        party_set_stereo_primary(false);
+    }
+    jbl_v5_notify(0x2C80);
+    jbl_v5_notify(0x2C01);
+    jbl_v5_notify(0x2C00);
+}
+
+/* the pair is over: settings, beacon, channel, broadcast hold back to normal */
+static void stereo_clear(void)
+{
+    cfg.lls = 0;
+    cfg.stereo_role = 0;
+    cfg.party_channel = 0;
+    cfg.stereo_name[0] = cfg.stereo_id[0] = 0;
+    memset(cfg.partner, 0, 6);
+    stereo_linked(false);
+}
+
+void jbl_v5_stereo_partner_ungrouped(void)
+{
+    stereo_clear();
+    lls_stop();
+    ESP_LOGW(TAG, "stereo pair: ungrouped by the partner");
+}
+
+void jbl_v5_stereo_partner_channel(uint8_t ch)
+{
+    cfg.party_channel = ch;
+    stereo_linked(true);
+}
+
+static volatile bool s_stereo_suspended;        /* Auracast party on: the pair waits (Xtreme 5) */
+
+void jbl_v5_stereo_resume(void)
+{
+    static const uint8_t zero[6] = { 0 };
+    if (s_stereo_suspended) return;
+    if ((cfg.stereo_role != 1 && cfg.stereo_role != 2) || memcmp(cfg.partner, zero, 6) == 0 || lls_linked()) return;
+    lls_group_t g = { .channel = cfg.party_channel };
+    memcpy(g.gid, cfg.stereo_id, 4);
+    snprintf(g.name, sizeof(g.name), "%s", cfg.stereo_name);
+    cfg.lls = 0;
+    ESP_LOGW(TAG, "stereo pair: resuming the stored pair (%s, channel %s, partner %02x:%02x:%02x:%02x:%02x:%02x)",
+             cfg.stereo_role == 2 ? "PRIMARY" : "SECONDARY", cfg.party_channel == 2 ? "RIGHT" : "LEFT",
+             cfg.partner[0], cfg.partner[1], cfg.partner[2], cfg.partner[3], cfg.partner[4], cfg.partner[5]);
+    lls_start(cfg.stereo_role, cfg.partner, &g, LLS_FOREVER, stereo_linked);
+}
+
+/* ---- Auracast party while paired: the Xtreme 5 drops the pair (0x13) and makes it again after ---- */
+static btstack_context_callback_registration_t s_susp_reg;
+static volatile bool s_susp_want;
+
+static void suspend_on_bt(void *ctx)
+{
+    (void)ctx;
+    bool on = s_susp_want;
+    if (on == s_stereo_suspended) return;
+    if (on) {
+        if (cfg.stereo_role == 0) return;
+        s_stereo_suspended = true;
+        ESP_LOGW(TAG, "stereo pair: on hold for the Auracast party (link closed, comes back after)");
+        lls_stop();
+        cfg.lls = 0;
+        stereo_linked(false);
+    } else {
+        s_stereo_suspended = false;
+        ESP_LOGW(TAG, "stereo pair: Auracast party over - making the pair again");
+        jbl_v5_stereo_resume();
+    }
+}
+
+bool jbl_v5_stereo_suspend(bool on)
+{
+    if (on && cfg.stereo_role == 0) return false;
+    if (!on && !s_stereo_suspended) return false;
+    s_susp_want = on;
+    s_susp_reg.callback = suspend_on_bt;
+    btstack_run_loop_execute_on_main_thread(&s_susp_reg);
+    return true;
+}
+
+bool jbl_v5_stereo_suspended(void) { return s_stereo_suspended; }
+
+/* ---- stereo pair: lights (AA 43), tone setting (AA 60), EQ (AA 93) -------------------------
+ * re/fw_jbl/REPORT_X5_STEREO_BEHAVIOR.md. App 0x0D40 theme values -> the X5's local theme ids
+ * (fw table 0x115E0F4) -> AA 43 wire codes (0x115E0D4). */
+static bool light_custom(void)                    /* a custom colour is set (0x0D80, not FF FF FF / 0) */
+{
+    const uint8_t *c = cfg.rgb_loop + 1;
+    return !(c[0] == 0xFF && c[1] == 0xFF && c[2] == 0xFF) && !(c[0] == 0 && c[1] == 0 && c[2] == 0);
+}
+
+static void eq_report_later(hci_con_handle_t con);
+
+static const uint8_t s_theme_app[6] = { 0x81, 0x88, 0x89, 0x8A, 0x8B, 0x8C };
+static const uint8_t s_theme_local[6] = { 36, 32, 31, 33, 34, 35 };
+static const uint8_t s_theme_wire[6] = { 0x01, 0x02, 0x03, 0x04, 0x05, 0x06 };
+
+void jbl_v5_light_record(uint8_t r[15])
+{
+    int t = 0;
+    for (int i = 0; i < 6; i++) if (s_theme_app[i] == cfg.light_show) t = i;
+    memset(r, 0, 15);
+    r[0] = s_theme_wire[t];
+    r[4] = (cfg.light_bright & 0x80) ? 1 : 0;              /* light show on (0x0D41 b7) */
+    r[6] = cfg.light_bright & 0x7F;                       /* brightness */
+    if (light_custom()) memcpy(r + 8, cfg.rgb_loop + 1, 3);
+    else memset(r + 8, 0xFF, 3);
+    r[12] = s_theme_local[t];
+    r[13] = 0xB9;                                         /* "from a primary" */
+    r[14] = light_custom() ? 1 : 0;
+}
+
+void jbl_v5_light_from_partner(const uint8_t r[15])
+{
+    uint8_t show = cfg.light_show, bright = cfg.light_bright;
+    for (int i = 0; i < 6; i++) if (s_theme_local[i] == r[12]) show = s_theme_app[i];
+    bright = (uint8_t)((r[4] ? 0x80 : 0x00) | (r[6] & 0x7F));
+    bool col = false;
+    if (r[13] == 0xB9 && r[14] && !(r[8] == 0 && r[9] == 0 && r[10] == 0)) {
+        col = memcmp(cfg.rgb_loop + 1, r + 8, 3) != 0;
+        memcpy(cfg.rgb_loop + 1, r + 8, 3);
+        cfg.rgb_loop[0] = 0x01;
+    }
+    bool chg = show != cfg.light_show || bright != cfg.light_bright || col;
+    if (!chg) return;
+    ESP_LOGW(TAG, "stereo pair: the primary's light: theme 0x%02x, %s, brightness %u%s", show, r[4] ? "on" : "off",
+             r[6] & 0x7F, col ? ", custom colour" : "");
+    if (show != cfg.light_show) { cfg.light_show = show; jbl_v5_notify(0x0D40); }
+    if (bright != cfg.light_bright) { cfg.light_bright = bright; jbl_v5_notify(0x0D41); }
+    if (col) jbl_v5_notify(0x0D80);
+    persist_later(false);
+}
+
+void jbl_v5_feedback_tone_from_partner(bool on)
+{
+    uint8_t v = (uint8_t)(on ? (cfg.feedback_tone | 0x80) : (cfg.feedback_tone & 0x7F));
+    if (v == cfg.feedback_tone) return;
+    cfg.feedback_tone = v;
+    ESP_LOGW(TAG, "stereo pair: prompt tones %s (the primary's setting)", on ? "on" : "off");
+    jbl_v5_notify(0x0C40);
+    persist_later(false);
+}
+
+/* AA 93 / 92 payload (115 B): 01 <eq id> <n> n x {f32 freq, f32 gain, f32 Q, u8 type, 3 pad} */
+static const uint8_t s_tws_eq_type[5] = { 0x11, 0x0B, 0x10, 0x06, 0x02 };   /* app type 0..4 (fw 0x104f458) */
+
+void jbl_v5_eq_tws_build(uint8_t p[115])
+{
+    if (s_eqc.ver != EQC_VER) eqc_standard(0x80, NULL);
+    memset(p, 0, 115);
+    uint8_t nb = s_eqc.count > V5_EQ_BANDS ? V5_EQ_BANDS : s_eqc.count;
+    p[0] = 0x01;
+    p[1] = s_eqc.cat;
+    p[2] = nb;
+    for (int i = 0; i < nb; i++) {
+        uint8_t *b = p + 3 + 16 * i;
+        memcpy(b, &s_eqc.b[i].f, 4);
+        memcpy(b + 4, &s_eqc.b[i].g, 4);
+        memcpy(b + 8, &s_eqc.b[i].q, 4);
+        b[12] = s_tws_eq_type[s_eqc.b[i].type <= 4 ? s_eqc.b[i].type : 0];
+    }
+}
+
+void jbl_v5_eq_tws_apply(const uint8_t *p, uint16_t n)
+{
+    if (n < 3 || p[0] != 0x01) return;
+    uint8_t nb = p[2];
+    if (nb > V5_EQ_BANDS || n < 3u + 16u * nb) return;
+    eq_canon_t c = s_eqc;
+    c.ver = EQC_VER;
+    c.cat = p[1];
+    c.count = nb;
+    for (int i = 0; i < nb; i++) {
+        const uint8_t *b = p + 3 + 16 * i;
+        float f, g, q;
+        memcpy(&f, b, 4);
+        memcpy(&g, b + 4, 4);
+        memcpy(&q, b + 8, 4);
+        uint8_t t = 0;
+        for (uint8_t k = 0; k < 5; k++) if (s_tws_eq_type[k] == b[12]) t = k;
+        if (!(f >= 20.0f && f <= 20000.0f) || !(g > -30.0f && g < 30.0f) || !(q > 0.05f && q < 20.0f)) {
+            ESP_LOGW(TAG, "stereo pair: the primary's EQ band %d out of range - ignored", i);
+            return;
+        }
+        c.b[i].type = t;
+        c.b[i].f = f;
+        c.b[i].g = g;
+        c.b[i].q = q;
+    }
+    s_eqc = c;
+    eqc_apply();
+    eqc_to_portable();
+    persist_later(true);
+    eq_report_later(s_cur_con);
+    ESP_LOGW(TAG, "stereo pair: EQ from the primary: category 0x%02x, %u bands", c.cat, nb);
+}
+
+void jbl_v5_stereo_ungroup_local(void)
+{
+    if (cfg.stereo_role == 0) return;
+    lls_ungroup();
+    stereo_clear();
+    ESP_LOGW(TAG, "stereo pair: ungrouped (the secondary's ungroup key)");
+    jbl_v5_notify(0x2C80);
+}
+
+static void stereo_wait_end(btstack_timer_source_t *ts)
+{
+    (void)ts;
+    if (cfg.lls) return;                        /* linked: stereo_linked owns the beacon now */
+    jbl_set_stereo_wait(0, 0);
+    ESP_LOGW(TAG, "stereo pair: setup window over, beacon back to normal");
 }
 
 void jbl_v5_notify(uint16_t id)
@@ -1070,6 +1325,49 @@ static void handle_get(hci_con_handle_t con, const uint8_t *pl, uint16_t len)
     send_frame(con, 1, out, off);
 }
 
+static void handle_set(hci_con_handle_t con, const uint8_t *pl, uint16_t len);
+
+void jbl_v5_debug_set(uint16_t id, const uint8_t *v, uint16_t n)
+{
+    uint8_t pl[4 + 16];
+    if (n > 16) n = 16;
+    pl[0] = (uint8_t)id; pl[1] = (uint8_t)(id >> 8); pl[2] = (uint8_t)n; pl[3] = 0;
+    memcpy(pl + 4, v, n);
+    hci_con_handle_t keep = s_cur_con;
+    handle_set(keep, pl, (uint16_t)(4 + n));      /* the reply goes to the app link if one is up */
+}
+
+
+/* After an EQ change the speaker reports its EQ back (EqInfo, then the portable form), as
+ * the app's EqInfoQuery would get it. Without it the app's idea of the device EQ stayed at
+ * what it read on connect: switching Vocal -> JBL Signature sent nothing (the app thought
+ * Signature was still set) and Vocal stayed on. 300 ms after the last Set, so a slider drag
+ * (a Set every ~100 ms) is not answered mid-drag. */
+static btstack_timer_source_t s_eq_report_timer;
+static hci_con_handle_t s_eq_report_con = HCI_CON_HANDLE_INVALID;
+
+static void eq_report_cb(btstack_timer_source_t *t)
+{
+    (void)t;
+    hci_con_handle_t con = s_eq_report_con;
+    s_eq_report_con = HCI_CON_HANDLE_INVALID;
+    if (con == HCI_CON_HANDLE_INVALID || gap_get_connection_type(con) == GAP_CONNECTION_INVALID) return;
+    hci_con_handle_t prev = s_cur_con;
+    s_cur_con = con;                                   /* header order as that link uses */
+    notify_features(con, (const uint16_t[]){ 0x0E7E }, 1);    /* EqInfo last (see the EqInfoQuery reply) */
+    notify_features(con, (const uint16_t[]){ 0x0E02 }, 1);
+    s_cur_con = prev;
+}
+
+static void eq_report_later(hci_con_handle_t con)
+{
+    s_eq_report_con = con;
+    btstack_run_loop_remove_timer(&s_eq_report_timer);
+    btstack_run_loop_set_timer_handler(&s_eq_report_timer, eq_report_cb);
+    btstack_run_loop_set_timer(&s_eq_report_timer, 300);
+    btstack_run_loop_add_timer(&s_eq_report_timer);
+}
+
 static void handle_set(hci_con_handle_t con, const uint8_t *pl, uint16_t len)
 {
     s_cur_con = con;
@@ -1146,6 +1444,7 @@ static void handle_set(hci_con_handle_t con, const uint8_t *pl, uint16_t len)
             if (n) {
                 cfg.feedback_tone = v[0];
                 if (!(v[0] & 0x80)) tones_stop();
+                if (cfg.lls && cfg.stereo_role == 2) lls_send_tone_setting();
             }
             break;
         case 0x0012:
@@ -1169,7 +1468,7 @@ static void handle_set(hci_con_handle_t con, const uint8_t *pl, uint16_t len)
                 if (on != was) {
                     /* as the Xtreme 5: LE Audio switched on or off -> pairing mode, so the
                      * phone can pair again with the new bond set (CTKD on, Classic only off) */
-                    a2dp_in_button(A2DP_BTN_PAIRING);
+                    a2dp_in_button(A2DP_BTN_PAIRING_SWITCH);
                 }
             }
             break;
@@ -1185,40 +1484,69 @@ static void handle_set(hci_con_handle_t con, const uint8_t *pl, uint16_t len)
         case 0x2007: if (n) cfg.mood = v[0]; break;
         case 0x200B: if (n) cfg.vocal_removal = v[0]; break;
         case 0x30C2: if (n >= 4) memcpy(&cfg.pitch, v, 4); break;
-        case 0x0D00: if (n && v[0] != 0x1F) cfg.light_status = v[0] & 0xCF; POST(0x0D00); break;
-        case 0x0D40: if (n) cfg.light_show = v[0]; POST(0x0D40); break;
-        case 0x0D41: if (n) cfg.light_bright = v[0]; POST(0x0D41); break;
+        case 0x0D00: if (n && v[0] != 0x1F) cfg.light_status = v[0] & 0xCF; POST(0x0D00); lls_light_changed(); break;
+        case 0x0D40: if (n) cfg.light_show = v[0]; POST(0x0D40); lls_light_changed(); break;
+        case 0x0D41: if (n) cfg.light_bright = v[0]; POST(0x0D41); lls_light_changed(); break;
         case 0x0D42: if (n) cfg.light_temp = v[0]; POST(0x0D42); break;
         case 0x0D43: if (n) cfg.light_speed = v[0]; POST(0x0D43); break;
         case 0x0D45: if (n) cfg.bass_light = v[0]; POST(0x0D45); break;
         case 0x0D46: if (n && v[0]) cfg.light_preset = v[0]; POST(0x0D46); break;
         case 0x0D47: if (n >= 3) memcpy(cfg.light_rgb, v, 3); POST(0x0D47); break;
-        case 0x0D80: if (n >= 4) memcpy(cfg.rgb_loop, v, 4); POST(0x0D80); break;
+        case 0x0D80: if (n >= 4) memcpy(cfg.rgb_loop, v, 4); POST(0x0D80); lls_light_changed(); break;
         case 0x2C03: if (n) cfg.stereo_role = v[0]; break;                   /* stereo: our role */
-        case 0x2C04: if (n) cfg.party_channel = v[0]; break;                  /* 1 left, 2 right */
+        case 0x2C04:                                                          /* 1 left, 2 right */
+            if (n) {
+                cfg.party_channel = v[0];
+                if (cfg.lls) {
+                    stereo_linked(true);                /* paired: new channel now (output, beacon) */
+                    if (cfg.stereo_role == 2) lls_send_channel(v[0]);   /* the partner takes the other */
+                }
+            }
+            break;
         case 0x2C05: { size_t k = n > 23 ? 23 : n; memcpy(cfg.stereo_name, v, k); cfg.stereo_name[k] = 0; break; }
         case 0x2C06: { size_t k = n > 8 ? 8 : n; memcpy(cfg.stereo_id, v, k); cfg.stereo_id[k] = 0; break; }
         case 0x2C81:                                                          /* stereo partner: link up */
             if (n >= 6) {
                 memcpy(cfg.partner, v, 6);
-                cfg.lls = 1;
                 ESP_LOGW(TAG, "stereo pair: partner %02x:%02x:%02x:%02x:%02x:%02x, role %u, channel %s, group '%s' %s",
                          v[0], v[1], v[2], v[3], v[4], v[5], cfg.stereo_role,
                          cfg.party_channel == 1 ? "LEFT" : cfg.party_channel == 2 ? "RIGHT" : "?", cfg.stereo_name,
                          cfg.stereo_id);
                 tones_play("indicate");
-                POST(0x2C80);                                                 /* the app waits 15 s for it */
             }
             break;
         case 0x2C07:                                                          /* 1 create, 0 ungroup */
             if (n && v[0] == 0) {
-                cfg.lls = 0;
-                cfg.stereo_role = 0;
-                cfg.party_channel = 0;
-                cfg.stereo_name[0] = cfg.stereo_id[0] = 0;
-                memset(cfg.partner, 0, 6);
+                lls_ungroup();                          /* tell the partner first (AA 13, group id 0) */
+                stereo_clear();                         /* beacon, channel and broadcast hold back to normal */
                 ESP_LOGW(TAG, "stereo pair: ungrouped");
                 POST(0x2C80);
+            } else if (n && v[0] == 1) {
+                /* The app waits up to 15 s for 0x2C80 = 1 (the speaker-to-speaker stereo link).
+                 * lls.c looks for the partner link (transport still being worked out);
+                 * 0x2C80 = 1 only once that link is really up. */
+                cfg.lls = 0;
+                {
+                    lls_group_t g = { .channel = cfg.party_channel };
+                    memcpy(g.gid, cfg.stereo_id, 4);            /* the speaker keeps the first 4 chars */
+                    snprintf(g.name, sizeof(g.name), "%s", cfg.stereo_name);
+                    lls_start(cfg.stereo_role == 2 ? 2 : 1, cfg.partner, &g, 20, stereo_linked);
+                }
+                {   /* advertise as a real speaker waiting for its partner: its channel + stereoGroupId
+                     * (the real one sent 0x00c0 / 0x0140 and the 4th char of its 4-char group id) */
+                    uint16_t pi = (uint16_t)(((cfg.party_channel & 3u) << 7) | 0x40u);
+                    uint8_t gid = (uint8_t)cfg.stereo_id[3];
+                    jbl_set_stereo_wait(pi, gid);
+                    ESP_LOGW(TAG, "stereo pair: beacon partyInfo 0x%04x, stereoGroupId 0x%02x for 30 s", pi, gid);
+                    static btstack_timer_source_t t;
+                    btstack_run_loop_remove_timer(&t);
+                    btstack_run_loop_set_timer_handler(&t, stereo_wait_end);
+                    btstack_run_loop_set_timer(&t, 30000);
+                    btstack_run_loop_add_timer(&t);
+                }
+                ESP_LOGW(TAG, "stereo pair: create (%s, channel %s) - making the LE partner link",
+                         cfg.stereo_role == 2 ? "PRIMARY" : "SECONDARY",
+                         cfg.party_channel == 1 ? "LEFT" : cfg.party_channel == 2 ? "RIGHT" : "?");
             }
             break;
         /* live controls */
@@ -1343,11 +1671,13 @@ static void handle_set(hci_con_handle_t con, const uint8_t *pl, uint16_t len)
         i += 4 + n;
     }
     if (eq_query) {
-        /* both forms, EqInfo first (it must be the frame's first record). Not after a
-         * Set: the app knows what it sent, and a reply in the wrong header order
-         * dropped the iOS app's link. */
-        notify_features(con, (const uint16_t[]){ 0x0E02 }, 1);
+        /* both forms, each in its own frame - the portable one FIRST, EqInfo LAST: JBL One
+         * rebuilds its preset list from whichever arrives, with that form's ids, and Xtreme
+         * 5 (2169) EQ Sets go the EqInfo way. EqInfo last leaves EqInfo ids (JBL_SIGNATURE);
+         * portable last left "SIGNATURE", which the EqInfo lookup does not find - tapping
+         * JBL Signature then sent nothing (Vocal / Energetic / Chill have equal names). */
         notify_features(con, (const uint16_t[]){ 0x0E7E }, 1);
+        notify_features(con, (const uint16_t[]){ 0x0E02 }, 1);
     }
     for (int k = 0; k < npost; k++) {
         notify_features(con, &post[k], 1);
@@ -1365,6 +1695,8 @@ static void handle_set(hci_con_handle_t con, const uint8_t *pl, uint16_t len)
     }
     if (eq_changed) {
         persist_later(true);
+        eq_report_later(con);
+        lls_send_eq();                                /* stereo primary: the partner plays the same EQ */
     }
     if (cfg_changed) {
         persist_later(false);
@@ -1399,6 +1731,35 @@ void jbl_v5_on_write(hci_con_handle_t con, const uint8_t *d, uint16_t len)
         static uint32_t s_fwd;
         static const uint8_t no_partner[2] = { 0x01, 0x80 };      /* status 0x8001 */
         uint16_t fcmd = d[2] | (d[3] << 8);
+        if (d[0] == 0x01 && lls_linked() && cfg.stereo_role == 2) {
+            /* as a real X5 primary: Gets from the partner cache (its AA 12), no status word;
+             * Sets dropped except identify (0x2011 = 0x81) */
+            uint16_t plen = (uint16_t)(d[6] | (d[7] << 8));
+            const uint8_t *p = d + 8;
+            if (plen > len - 8) plen = len - 8;
+            if (fcmd == 1 || fcmd == 3) {
+                static uint8_t out[96];
+                uint16_t o = 0;
+                for (uint16_t i = 0; i + 1 < plen && o + 4 + 32 <= sizeof(out); i += 2) {
+                    uint16_t id = (uint16_t)(p[i] | (p[i + 1] << 8));
+                    uint16_t vn = 0;
+                    if (!lls_partner_get(id, out + o + 4, &vn) || vn == 0) continue;
+                    out[o] = id & 0xFF; out[o + 1] = id >> 8; out[o + 2] = vn & 0xFF; out[o + 3] = vn >> 8;
+                    o += 4 + vn;
+                }
+                s_tx_ident = 0x01;
+                send_frame(con, fcmd, out, o);
+                s_tx_ident = 0;
+            } else if (fcmd == 2) {
+                for (uint32_t i = 0; i + 4 <= plen;) {
+                    uint16_t id = (uint16_t)(p[i] | (p[i + 1] << 8)), vl = (uint16_t)(p[i + 2] | (p[i + 3] << 8));
+                    if (id == 0x2011 && vl >= 1 && i + 4 < plen && p[i + 4] == 0x81) lls_partner_identify();
+                    if (4u + vl > plen - i) break;           /* (a 16-bit index wrapped: endless loop) */
+                    i += 4u + vl;
+                }
+            }
+            return;
+        }
         if (s_fwd++ < 3) {
             ESP_LOGW(TAG, "app %s cmd 0x%04x - no %s, answered with an error status", d[0] == 1 ? "Forward" : "SubWoofer",
                      fcmd, d[0] == 1 ? "stereo partner" : "subwoofer");
@@ -1542,6 +1903,7 @@ void jbl_v5_assist_found(const bd_addr_t addr, uint8_t addr_type, uint8_t flags,
 
 void jbl_v5_assist_result(uint8_t action, const bd_addr_t addr, uint8_t addr_type, uint8_t status)
 {
+    le_audio_bass_assist_result(action, status);         /* the phone's "Listen to audio broadcast" */
     if (!s_linked) return;
     uint8_t r[9], p[2 + 4 + 9];
     r[0] = action;

@@ -97,6 +97,11 @@ static bool s_started;
 static volatile bool s_paused;                    /* party LISTEN: no scan, no joins */
 static bool s_streaming;                          /* phone music: no scan */
 static bool s_pending_join;
+/* stereo pair RE: connect to the partner speaker, read its party settings, keep the link
+ * and log everything it sends (jbl_assist_stereo_probe) */
+static uint16_t s_stereo_crc[2];
+static uint32_t s_stereo_until;
+static bool s_stereo_probe;                       /* the link in use is the stereo probe */
 static state_t s_state = ST_IDLE;
 static uint32_t s_state_since;
 static hci_con_handle_t s_con = HCI_CON_HANDLE_INVALID;
@@ -502,6 +507,12 @@ static void on_adv_report(const bd_addr_t addr, bd_addr_type_t addr_type, bool c
     }
     const uint32_t now = btstack_run_loop_get_time_ms();
     if (sp->pi != pi) {
+        {
+            char rh[3 * 40 + 1];
+            hexs(b, dl > 40 ? 40 : dl, rh, sizeof(rh));
+            ESP_LOGW(TAG, "beacon of 0x%04x at %s (type %u%s): %s", crc, bd_addr_to_str(addr), addr_type,
+                     connectable ? ", connectable" : "", rh);
+        }
         bool receiving = PI_ON(pi) && PI_ROLE(pi) == 1 && PI_CONN(pi) == 2;
         ESP_LOGW(TAG, "JBL %04x (macCrc 0x%04x) is now: %s [0x%04x]%s", pid, crc, pi_str(pi), pi,
                  receiving ? "  <- receiving a master's Auracast" : "");
@@ -523,6 +534,22 @@ static void on_adv_report(const bd_addr_t addr, bd_addr_type_t addr_type, bool c
             ESP_LOGW(TAG, ">>> speaker 0x%04x left 'looking for master' on its own%s", crc,
                      receiving ? " - NATIVE JOIN!" : "");
         }
+    }
+    if (s_stereo_until && (crc == s_stereo_crc[0] || crc == s_stereo_crc[1]) && connectable &&
+        (int32_t)(s_stereo_until - now) > 0 && s_con == HCI_CON_HANDLE_INVALID &&
+        s_state != ST_CONNECTING && s_state != ST_STOPPING) {
+        s_stereo_until = 0;
+        s_stereo_probe = true;
+        s_cur_crc = crc;
+        s_pending_join = false;
+        memcpy(s_peer, addr, sizeof(bd_addr_t));
+        s_peer_type = addr_type;
+        ESP_LOGW(TAG, ">>> STEREO: connecting to the partner 0x%04x at %s (type %u)", crc, bd_addr_to_str(addr), addr_type);
+        set_state(ST_STOPPING);
+        gap_stop_scan();
+        if (gap_connect(s_peer, s_peer_type) == ERROR_CODE_SUCCESS) set_state(ST_CONNECTING);
+        else { s_stereo_probe = false; set_state(ST_IDLE); }
+        return;
     }
     if (!ASSIST_CONNECT || s_state != ST_SCANNING || s_paused || !sp->want || !connectable ||
         !time_reached(now, sp->want_at)) {
@@ -859,6 +886,24 @@ static void tick(btstack_timer_source_t *ts)
     btstack_run_loop_add_timer(ts);
     broadcast_identity_pickup();
 
+    if (s_stereo_probe) {                         /* keep the partner link ~30 s, whatever the party does */
+        if (s_state == ST_CONNECTING && state_age() > 15000) {
+            gap_connect_cancel();
+            s_stereo_probe = false;
+            set_state(ST_IDLE);
+        } else if (s_state == ST_DONE && state_age() > 30000 && !s_close_sent) {
+            s_close_sent = true;
+            ESP_LOGW(TAG, "STEREO: closing the partner link");
+            link_close();
+        } else if (s_state == ST_PROBING && state_age() > 2500) {
+            s_close_sent = false;
+            set_state(ST_DONE);
+        }
+        if (s_con == HCI_CON_HANDLE_INVALID && s_state != ST_CONNECTING && s_state != ST_CONNECTED) {
+            s_stereo_probe = false;
+        }
+        return;
+    }
     if (s_paused) {
         pause_step();
         return;
@@ -992,6 +1037,17 @@ void jbl_assist_set_broadcast(const char *name, const uint8_t addr[6], uint8_t a
     }
     s_bc_pending = true;
     taskEXIT_CRITICAL(&s_bc_mux);
+}
+
+void jbl_assist_stereo_probe(const uint8_t mac[6])
+{
+    uint8_t r[6];
+    for (int i = 0; i < 6; i++) r[i] = mac[5 - i];
+    s_stereo_crc[0] = jbl_crc16_arc(mac, 6);
+    s_stereo_crc[1] = jbl_crc16_arc(r, 6);
+    s_stereo_until = btstack_run_loop_get_time_ms() + 25000;
+    ESP_LOGW(TAG, "STEREO: will connect to the partner (macCrc 0x%04x / 0x%04x) when its beacon shows",
+             s_stereo_crc[0], s_stereo_crc[1]);
 }
 
 void jbl_assist_set_streaming(bool streaming)
