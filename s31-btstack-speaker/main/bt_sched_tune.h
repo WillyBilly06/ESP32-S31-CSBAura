@@ -71,6 +71,9 @@ void bt_sched_tune_apply_custom(uint8_t acl, uint8_t first, uint8_t rep, uint8_t
  * 13 so the LE links can win their slots too. Off: CIS 14, BIS first 15. */
 void bt_sched_tune_le_input(bool on);
 
+/* BR/EDR scheduler priority {default, increment per skip} of activity idx (1..17, not the ACL). */
+bool bt_sched_tune_set_pti(uint8_t idx, uint8_t dft, uint8_t inc, const char *why);
+
 #ifdef __cplusplus
 }
 #endif

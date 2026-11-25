@@ -1136,6 +1136,7 @@ typedef struct {
 #ifdef ENABLE_CLASSIC
     /* callback for reject classic connection */
     int (*gap_classic_accept_callback)(bd_addr_t addr, hci_link_type_t link_type);
+    uint8_t gap_classic_accept_decline_reason;
 #endif
 
     // hardware error callback

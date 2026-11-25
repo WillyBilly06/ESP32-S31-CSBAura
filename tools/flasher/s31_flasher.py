@@ -545,7 +545,9 @@ def setup_btstack(project, log):
     log("BTstack ready.\n")
 
 
-def build(project, idf, log):
+def build(project, idf, log, dev=False):
+    """dev=False: the release firmware (errors-only log, no serial console commands);
+    dev=True: the development firmware (S31_DEV=1). Passed on every build: CMake caches it."""
     ensure_ready(project, idf, log)
     proj = project_file(project, PROJECT_SUBDIR)
     log(f"Building {proj} with ESP-IDF {idf}...\n")
@@ -576,7 +578,9 @@ def build(project, idf, log):
     if os.path.isdir(bdir) and old != srcs:
         log("Source files changed since the last build: reconfiguring\n")
         os.utime(os.path.join(main_dir, "CMakeLists.txt"), None)
-    stream(in_idf_env(idf, "idf.py --ccache build"), log, cwd=proj, env=idf_env(idf))
+    if dev:
+        log("Development firmware: serial console commands and full logs (S31_DEV=1)\n")
+    stream(in_idf_env(idf, f"idf.py --ccache -DS31_DEV={1 if dev else 0} build"), log, cwd=proj, env=idf_env(idf))
     try:
         with open(stamp, "w", encoding="utf-8") as f:
             f.write(srcs)
@@ -1178,6 +1182,8 @@ def main():
     ap.add_argument("--new-identity", action="store_true",
                     help="a new speaker: a fresh Bluetooth address (phones pair it as new); default: the board "
                          "keeps the identity it has (--erase: the chip's own)")
+    ap.add_argument("--dev", action="store_true",
+                    help="for maintainers: build the development firmware (serial console commands, full logs)")
     a = ap.parse_args()
     if a.list_models:
         for m in MODELS:
@@ -1204,7 +1210,7 @@ def main():
         if not a.port:
             return
     if not a.color_only and not a.no_build:
-        build(project, idf, cli_log)
+        build(project, idf, cli_log, dev=a.dev)
     flash(project, a.port, color_from_args(a, model), a.name, a.erase, a.color_only, cli_log, model[0],
           new_id=a.new_identity)
 

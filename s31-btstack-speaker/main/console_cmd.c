@@ -170,6 +170,13 @@ static void run_cmd(void *ctx)
         } else {
             ESP_LOGW(TAG, "usage: prio <acl> <bis first> <bis rep> <bis pre-tx>");
         }
+    } else if (!strncmp(c, "pti ", 4)) {                /* pti <idx> <dft> <inc>: BR/EDR activity priority */
+        unsigned v[3];
+        if (sscanf(c + 4, "%u %u %u", &v[0], &v[1], &v[2]) == 3) {
+            bt_sched_tune_set_pti((uint8_t)v[0], (uint8_t)v[1], (uint8_t)v[2], "console");
+        } else {
+            ESP_LOGW(TAG, "usage: pti <idx> <dft> <inc> (4 ACL handshake, 12 page, 13 page scan)");
+        }
     } else if (!strcmp(c, "lereach on") || !strcmp(c, "lereach off")) {
         le_audio_set_reachable(c[9] == 'n');
     } else if (!strncmp(c, "avrcpwait ", 10)) {

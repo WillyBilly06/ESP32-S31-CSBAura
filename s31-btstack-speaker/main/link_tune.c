@@ -64,6 +64,7 @@ static btstack_packet_callback_registration_t s_reg;
 static struct {
     hci_con_handle_t h;
     uint16_t applied;                             /* poll slots set, 0 = redo */
+    uint16_t types;                               /* packet types set (0 = not yet) */
     bool had_a2dp;                                /* A2DP ran on it (and may be gone now) */
     bool ready;                                   /* encrypted (or 4 s up): our tuning may start */
     uint32_t up_ms;
@@ -147,13 +148,33 @@ void link_tune_refresh(const char *why)
     poll_apply(why);
 }
 
+/* The standby phone (not the playing one) never streams to us: no 5-slot packets on its link.
+ * A 5-slot exchange (~3.7 ms) cannot be cut by the radio once started and took BIS slots of
+ * the broadcast while that phone set up its profiles (~30 SDUs per connect). It gets every
+ * packet type back when it becomes the playing phone. */
+#define PKT_NO_5SLOT(t) (uint16_t)(((t) & ~0xC000u) | 0x3000u)    /* -DM5 -DH5, 2-DH5/3-DH5 "may not" */
+static uint16_t pkt_types_wanted(int i)
+{
+    hci_con_handle_t audio = a2dp_in_con_handle();
+    bool standby = link_count() > 1 && audio != HCI_CON_HANDLE_INVALID && s_links[i].h != audio;
+    return standby ? PKT_NO_5SLOT(s_pkt_types) : s_pkt_types;
+}
+
+static void pkt_types_apply(int i, const char *why)
+{
+    uint16_t t = pkt_types_wanted(i);
+    if (t == s_links[i].types || !hci_can_send_command_packet_now()) return;
+    char buf[96];
+    s_links[i].types = t;
+    hci_send_cmd(&hci_change_connection_packet_type, s_links[i].h, t);
+    ESP_LOGW(TAG, "ACL 0x%04x: packet types 0x%04x (%s) - %s", s_links[i].h, t, pkt_types_str(t, buf, sizeof(buf)), why);
+}
+
 static void link_ready(int i, const char *why)
 {
-    char buf[96];
     s_links[i].ready = true;
-    hci_send_cmd(&hci_change_connection_packet_type, s_links[i].h, s_pkt_types);
-    ESP_LOGW(TAG, "ACL 0x%04x: packet types 0x%04x (%s)", s_links[i].h, s_pkt_types,
-             pkt_types_str(s_pkt_types, buf, sizeof(buf)));
+    s_links[i].types = 0;
+    pkt_types_apply(i, why);
     poll_apply(why);
 }
 
@@ -197,6 +218,7 @@ static void poll_apply(const char *why)
             link_ready(i, "link up 4 s, not encrypted");   /* calls poll_apply again: done */
             return;
         }
+        pkt_types_apply(i, link_count() > 1 ? "multipoint" : why);
         if (sniff_apply(i)) continue;
         uint16_t want = poll_wanted(h);
         if (want == s_links[i].applied) continue;
@@ -294,6 +316,7 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
                 s_links[i].ready = false;
                 s_links[i].up_ms = btstack_run_loop_get_time_ms();
                 s_links[i].sniff_req = false;
+                s_links[i].types = 0;
                 s_links[i].mode = 0;
                 s_links[i].sniff_fails = 0;
                 s_links[i].sniff_hold_until = 0;

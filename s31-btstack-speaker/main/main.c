@@ -98,6 +98,7 @@ static void stats_task(void *arg)
             log_heap();
             continue;
         }
+#if S31_DEV
         {   /* who uses each core (run-time stats, delta over this 2 s window) */
             static TaskStatus_t st[40];
             static uint32_t last_rt[40];
@@ -131,6 +132,7 @@ static void stats_task(void *arg)
                 ESP_LOGW(TAG, "stack free (min ever, B): %s", line);
             }
         }
+#endif
         a2dp_in_log_stats();
         auracast_log_stats();
         party_log_stats();
@@ -282,7 +284,9 @@ static void btstack_task(void *arg)
         csb_setup();
         lls_setup();
         buttons_setup();
-        console_cmd_setup();
+#if S31_DEV
+        console_cmd_setup();                 /* serial commands: development builds only */
+#endif
         gap_set_security_level(LEVEL_0);     /* incoming ATT-over-BR/EDR (JBL One): the phone authenticates */
         jbl_setup();
         gap_set_security_level(LEVEL_2);     /* channels we open */
@@ -294,6 +298,11 @@ static void btstack_task(void *arg)
 
 void app_main(void)
 {
+#if S31_DEV
+    esp_log_level_set("*", ESP_LOG_INFO);    /* development: every line (default level is WARN) */
+#else
+    esp_log_level_set("*", ESP_LOG_ERROR);   /* release: errors only (the arguments still run) */
+#endif
     /* LMP opcode 54 (LMP_page_scan_mode_req, deprecated) from phones: the closed
      * controller rejects it and continues - logged at ERROR on every connect */
     esp_log_level_set("OLM_LMP", ESP_LOG_NONE);

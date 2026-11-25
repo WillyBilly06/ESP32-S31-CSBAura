@@ -12,7 +12,9 @@
 #define HAVE_MALLOC
 
 /* ---- logging ------------------------------------------------------------- */
+#if S31_DEV                     /* BTstack error log: development builds only */
 #define ENABLE_LOG_ERROR
+#endif
 #define ENABLE_PRINTF_HEXDUMP
 
 /* ---- BR/EDR: A2DP sink (+ AVRCP), GATT over BR/EDR for JBL One ----------- */

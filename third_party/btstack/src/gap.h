@@ -531,6 +531,12 @@ void gap_set_minimal_service_security_level(gap_security_level_t security_level)
  */
 void gap_register_classic_connection_filter(int (*accept_callback)(bd_addr_t addr, hci_link_type_t link_type));
 
+/**
+ * @brief Reason the classic connection filter declines with (default 0x0E, rejected due to security reasons)
+ * @param reason HCI error code, e.g. ERROR_CODE_CONNECTION_REJECTED_DUE_TO_LIMITED_RESOURCES
+ */
+void gap_set_classic_connection_filter_decline_reason(uint8_t reason);
+
 /* Configure Secure Simple Pairing */
 
 /**

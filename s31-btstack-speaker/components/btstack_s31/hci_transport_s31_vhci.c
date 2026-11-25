@@ -67,7 +67,7 @@ static int host_recv_pkt_cb(uint8_t *data, uint16_t len)
 {
     if (len > 0 && data[0] < 6) {
         s_rx_type[data[0]]++;
-        if (data[0] == 5 && s_rx_type[5] <= 3) {
+        if (S31_DEV && data[0] == 5 && s_rx_type[5] <= 3) {   /* first ISO packets: development log */
             esp_rom_printf("VHCI ISO rx #%u len %u: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
                            (unsigned)s_rx_type[5], len, data[1], data[2], data[3], data[4], data[5], data[6],
                            data[7], data[8], data[9], data[10], data[11], data[12]);

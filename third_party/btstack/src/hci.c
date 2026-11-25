@@ -4718,7 +4718,8 @@ static void event_handler(uint8_t *packet, uint16_t size){
 
             if (hci_stack->gap_classic_accept_callback != NULL){
                 if ((*hci_stack->gap_classic_accept_callback)(addr, link_type) == 0){
-                    hci_stack->decline_reason = ERROR_CODE_CONNECTION_REJECTED_DUE_TO_SECURITY_REASONS;
+                    hci_stack->decline_reason = hci_stack->gap_classic_accept_decline_reason ?
+                        hci_stack->gap_classic_accept_decline_reason : ERROR_CODE_CONNECTION_REJECTED_DUE_TO_SECURITY_REASONS;
                     bd_addr_copy(hci_stack->decline_addr, addr);
                     break;
                 }
@@ -10718,6 +10719,10 @@ HCI_STATE hci_get_state(void){
 }
 
 #ifdef ENABLE_CLASSIC
+void gap_set_classic_connection_filter_decline_reason(uint8_t reason){
+    hci_stack->gap_classic_accept_decline_reason = reason;
+}
+
 void gap_register_classic_connection_filter(int (*accept_callback)(bd_addr_t addr, hci_link_type_t link_type)){
     hci_stack->gap_classic_accept_callback = accept_callback;
 }

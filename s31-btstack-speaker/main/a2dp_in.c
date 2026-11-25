@@ -45,13 +45,15 @@ static const char *TAG = "A2DP";
 
 #define OUT_RATE        48000
 #define PKT_MAX         (AVDTP_L2CAP_MTU + 16)
-#define PKT_Q_LEN       24                    /* ~550 ms of 8-frame packets */
-#define RING_MS         500                   /* max S31-added delay: beyond it the OLDEST audio is dropped */
+#define PKT_Q_LEN       48                    /* ~1.1 s of 8-frame packets (PSRAM) */
+#define RING_MS         900                   /* max S31-added delay: beyond it the OLDEST audio is dropped (PSRAM) */
 /* Average PCM fill (= added latency). While the S31 broadcasts, phones deliver in
  * bursts (~75 ms peak to peak against the encoder's 30 ms reads), with 60-77 ms
  * late packets and stretches ~3 % below realtime on top: 130 ms ran dry a few
  * times a minute, and every underrun costs a re-prime (silence) + a splice.
- * The delay report tells the phone (video lip sync). */
+ * The delay report tells the phone (video lip sync). Latency stays low: radio stalls are
+ * fixed at their cause (BR/EDR master role, standby sniff, second-phone call-back), not by a
+ * deeper buffer. The ring / queue (PSRAM) are only headroom, not added delay. */
 #define A2DP_TARGET_MS  180
 /* LE Audio: SDUs come on the controller's fixed ISO schedule, no phone bursts -
  * one ISO interval + 20 ms is enough (set per stream, a2dp_in_ext_start) */
@@ -1237,6 +1239,7 @@ void a2dp_in_refresh_discoverable(void)
 static void callback_now(void *ctx);
 static void prev_phone_soon(uint32_t ms);
 static void prev_phone_result(const uint8_t *addr, uint8_t status);
+static int classic_accept_filter(bd_addr_t addr, hci_link_type_t type);
 
 /* Pairing mode dropped every phone. When it ends they come back: with no phone connected
  * the last one is called back (then the one before it); after a new phone paired, the one
@@ -2065,8 +2068,8 @@ static void a2dp_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet,
             alt_clear();
             if (s_a2dp_started) active_started("A2DP audio (other phone) playing");
             else if (was_held && s_avrcp_cid) {    /* we paused it to hold it: it plays now */
-                ESP_LOGW(TAG, "multipoint: held phone gets the speaker - Play -> 0x%02x",
-                         avrcp_controller_play(s_avrcp_cid));
+                uint8_t ps = avrcp_controller_play(s_avrcp_cid);
+                ESP_LOGW(TAG, "multipoint: held phone gets the speaker - Play -> 0x%02x", ps);
             }
         } else {
             active_stopped();
@@ -2295,8 +2298,9 @@ static void avrcp_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet
                 s_alt.held_ms = btstack_run_loop_get_time_ms();
                 char held_s[18];
                 strcpy(held_s, bd_addr_to_str(s_alt.addr));
+                uint8_t st = avrcp_controller_pause(s_alt.avrcp_cid);
                 ESP_LOGW(TAG, "multipoint: %s plays while %s does - HELD (paused -> 0x%02x)", held_s,
-                         bd_addr_to_str(s_peer), avrcp_controller_pause(s_alt.avrcp_cid));
+                         bd_addr_to_str(s_peer), st);
             }
         }
         else if (packet[2] == AVRCP_SUBEVENT_NOTIFICATION_VOLUME_CHANGED) {
@@ -2521,18 +2525,22 @@ void a2dp_in_setup(void)
                                 DEVICE_ID_VENDOR_ID_SOURCE_BLUETOOTH, BLUETOOTH_COMPANY_ID_BLUEKITCHEN_GMBH, 1, 1);
     sdp_register_service(s_sdp_did);
 
-    /* As the Xtreme 5 (fw 0x10A3090 / 0x10A5550): a phone's connection is accepted staying
-     * SLAVE (accepting with a role switch was refused by our controller, 0x0C, and the phone's
-     * connect failed), role switches are allowed. No sniff (the Xtreme 5 sniffs when idle;
-     * here sniff anchors starve against the BIG). Once the link is up and we do not broadcast,
-     * we still ask for MASTER (role_check_soon): the S31 then schedules the phone around a
-     * later broadcast.
-     * Links we open (power-up call-backs) stay MASTER: no role switch offered in Create
-     * Connection, and the phone's later role switch request refused (link policy 0). As the
-     * phones' slave next to a broadcast (it cannot switch back while the BIG runs) the S31 sat
-     * in two piconets plus the BIG: 100-160 ms delivery gaps and underflows with two phones. */
+    /* The S31 is BR/EDR MASTER on every phone link, so it schedules the phones around the
+     * BIG. As a phone's slave next to a broadcast (the controller cannot switch roles while the
+     * BIG runs) it sat in two piconets plus the BIG: 100-160 ms delivery gaps and underflows
+     * with two phones, and a second phone connecting by itself cost the playing one 60-70 ms
+     * gaps and the broadcast ~24 SDUs.
+     *   - links we open (power-up call-backs): no role switch offered in Create Connection;
+     *   - a phone's connection: accepted with a role switch to master. If the controller
+     *     refuses that (0x0C, seen right after a phone's LE pairing) it is accepted again
+     *     staying slave (accept_retry) and role_check_soon asks for master later;
+     *   - the phone's later role switch requests are refused (link policy 0).
+     * No sniff on the playing phone's link (sniff anchors starve against the BIG); the standby
+     * phone's link sniffs (link_tune.c). */
     gap_set_default_link_policy_settings(0);
     gap_set_allow_role_switch(false);
+    gap_register_classic_connection_filter(classic_accept_filter);
+    gap_set_classic_connection_filter_decline_reason(ERROR_CODE_CONNECTION_REJECTED_DUE_TO_LIMITED_RESOURCES);
     hci_set_master_slave_policy(HCI_ROLE_SLAVE);
     /* the Xtreme 5's page timeout (5.12 s, fw init 0xC18) and supervision timeout on links
      * where it is master (5 s, fw 0x1090904): a failed page or a lost phone is known sooner */
@@ -2746,11 +2754,48 @@ static btstack_timer_source_t s_prev_timer;
 #define PREV_TRIES 4
 static uint8_t s_prev_tries;
 static bool s_prev_calling;
+/* A bonded phone connecting by itself while another phone STREAMS is declined (0x0D, limited
+ * resources) and called back at once, so its link is ours to schedule (MASTER). Accepted, the
+ * S31 is that phone's slave and the controller cannot switch roles next to the BIG: the
+ * connection setup cost the playing phone 400-480 ms delivery gaps, underflows and the broadcast
+ * 120-250 SDUs on every such connect (4 of 4, 2026-11-25). Accepting with a role switch instead
+ * upset the scheduler (BIG events skipped, the playing phone's link timed out); raising the
+ * playing phone's priority during the setup cost the broadcast 300-400 SDUs. Declined with
+ * BTstack's default reason 0x0E (security) an Android phone stopped paging the S31 at all
+ * (btstack-patches/0005). If our call-back cannot reach it, its next connection is accepted. */
+static bool s_declined_calling;                   /* s_prev_phone is a phone we declined */
+static bool s_decline_fallback;                   /* that call-back failed: accept it next time */
+static bd_addr_t s_declined;
+static int classic_accept_filter(bd_addr_t addr, hci_link_type_t type)
+{
+    if (type != HCI_LINK_TYPE_ACL) return 1;
+    if (s_pairing || s_stereo_sec || !s_connected || s_alt.used) return 1;
+    if (!s_a2dp_started) return 1;                /* no phone audio to protect: accept */
+    if (bd_addr_cmp(addr, s_peer) == 0) return 1;
+    link_key_t key;
+    link_key_type_t kt;
+    if (!gap_get_link_key_for_bd_addr(addr, key, &kt)) return 1;               /* a new phone */
+    if (s_decline_fallback && bd_addr_cmp(addr, s_declined) == 0) {
+        s_decline_fallback = false;
+        ESP_LOGW(TAG, "multipoint: %s connects - accepted (our call-back did not reach it)", bd_addr_to_str(addr));
+        return 1;
+    }
+    if (s_declined_calling && bd_addr_cmp(addr, s_declined) == 0) return 0;     /* we are about to page it */
+    ESP_LOGW(TAG, "multipoint: %s connects while a phone plays - declined, calling it back as master",
+             bd_addr_to_str(addr));
+    bd_addr_copy(s_declined, addr);
+    bd_addr_copy(s_prev_phone, addr);
+    s_prev_valid = true;
+    s_declined_calling = true;
+    prev_phone_soon(1500);                        /* after the phone's own quick retries */
+    return 0;
+}
+
 static void prev_phone_cb(btstack_timer_source_t *ts)
 {
     (void)ts;
     if (!s_prev_valid || s_pairing || s_stereo_sec || s_alt.used) return;
-    if (bd_addr_cmp(s_prev_phone, s_last_phone) == 0) return;
+    if (!s_declined_calling && bd_addr_cmp(s_prev_phone, s_last_phone) == 0) return;
     if (s_connected && bd_addr_cmp(s_prev_phone, s_peer) == 0) return;
     if (hci_connection_for_bd_addr_and_type(s_prev_phone, BD_ADDR_TYPE_ACL) != NULL) return;   /* it came itself */
     static uint8_t waits;
@@ -2793,17 +2838,26 @@ static void prev_phone_result(const uint8_t *addr, uint8_t status)
     gap_set_page_timeout(0x2000);
     if (status == ERROR_CODE_SUCCESS) {
         s_prev_tries = 0;
+        s_declined_calling = false;
         return;
     }
-    if (status == ERROR_CODE_PAGE_TIMEOUT && s_prev_tries < PREV_TRIES) {
-        ESP_LOGW(TAG, "power-up: the phone before it did not answer the page - again in 2 s");
+    if ((status == ERROR_CODE_PAGE_TIMEOUT || status == ERROR_CODE_ACL_CONNECTION_ALREADY_EXISTS ||
+         status == ERROR_CODE_CONNECTION_ACCEPT_TIMEOUT_EXCEEDED) &&
+        s_prev_tries < PREV_TRIES) {
+        bool busy = status == ERROR_CODE_ACL_CONNECTION_ALREADY_EXISTS;   /* its own page still runs */
+        ESP_LOGW(TAG, "power-up: the phone before it %s - again in %u ms",
+                 busy ? "is paging us right now" : "did not answer the page", busy ? 1000u : 2000u);
         btstack_run_loop_remove_timer(&s_prev_timer);
         btstack_run_loop_set_timer_handler(&s_prev_timer, prev_phone_cb);
-        btstack_run_loop_set_timer(&s_prev_timer, 2000);
+        btstack_run_loop_set_timer(&s_prev_timer, busy ? 1000 : 2000);
         btstack_run_loop_add_timer(&s_prev_timer);
     } else {
         ESP_LOGW(TAG, "power-up: calling back the phone before it failed (0x%02x, try %u) - it can connect itself",
                  status, s_prev_tries);
+        if (s_declined_calling) {
+            s_declined_calling = false;
+            s_decline_fallback = true;                /* its next connection is accepted */
+        }
     }
 }
 

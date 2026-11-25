@@ -47,6 +47,7 @@ extern uint8_t _data_start[], _data_end[];
 #define BT_SCHED_FIRST_LE_IN 13   /* below the LE ACL's escalation cap (see BT_SCHED_IDLE_FIRST) */
 static bool s_le_input;
 
+
 /* ---- profiles ------------------------------------------------------------ */
 typedef struct {
     uint8_t acl;      /* BR/EDR ACL base priority (pti table dft[0]) */
@@ -106,6 +107,8 @@ static const uint8_t s_pti_sig[PTI_ENTRIES * 2] = {
     4, 1, 2, 1, 10, 1, 3, 1, 11, 1, 6, 1, 6, 1, 4, 1, 4, 1,
 };
 
+static uint8_t s_pti_want[PTI_ENTRIES * 2];   /* what the table must hold (stock + our changes) */
+static bool s_pti_want_init;
 static uint8_t *s_pti;                 /* located BR/EDR table, NULL until verified */
 static bool s_pti_failed;              /* do not rescan after a failed scan */
 static uint8_t s_pti_stock_acl;
@@ -115,7 +118,11 @@ static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
 
 static bool pti_matches(const uint8_t *p)
 {
-    if (p[0] == 0 || p[0] > 15 || memcmp(p + 1, s_pti_sig + 1, sizeof(s_pti_sig) - 1) != 0) {
+    if (!s_pti_want_init) {
+        memcpy(s_pti_want, s_pti_sig, sizeof(s_pti_want));
+        s_pti_want_init = true;
+    }
+    if (p[0] == 0 || p[0] > 15 || memcmp(p + 1, s_pti_want + 1, sizeof(s_pti_want) - 1) != 0) {
         return false;
     }
     /* Must be the very array the controller's getters read. */
@@ -203,10 +210,11 @@ static void apply(const prio_profile_t *pr, const char *why)
     uint8_t old_acl = 0, old_iso[4] = {0};
     bool acl_ok = false, iso_ok = false;
 
+    uint8_t acl = pr->acl;
     portENTER_CRITICAL(&s_lock);
     if (pti != NULL) {
         old_acl = pti[0];
-        pti[0] = pr->acl;
+        pti[0] = acl;
     }
     uint8_t first = s_le_input && pr->first > BT_SCHED_FIRST_LE_IN ? BT_SCHED_FIRST_LE_IN : pr->first;
     uint8_t cis = s_le_input ? BT_SCHED_CIS_LE_IN : BT_SCHED_CIS;
@@ -227,7 +235,7 @@ static void apply(const prio_profile_t *pr, const char *why)
     }
 
     if (pti != NULL) {
-        acl_ok = r_olc_sched_pti_dft_get(0) == pr->acl;
+        acl_ok = r_olc_sched_pti_dft_get(0) == acl;
         if (!acl_ok) {
             ESP_LOGE(TAG, "ACL write did not stick (getter %u) - restoring %u", r_olc_sched_pti_dft_get(0), old_acl);
             pti[0] = old_acl;
@@ -236,14 +244,16 @@ static void apply(const prio_profile_t *pr, const char *why)
     if (iso != NULL) {
         iso_ok = iso[33] == first && iso[34] == pr->rep && iso[35] == pr->pto && iso[36] == pr->ctrl;
     }
-    bool changed = (acl_ok && old_acl != pr->acl) || (iso_ok && memcmp(old_iso, iso + 33, 4) != 0);
+    bool changed = (acl_ok && old_acl != acl) || (iso_ok && memcmp(old_iso, iso + 33, 4) != 0);
     if (changed || !acl_ok || !iso_ok) {
         ESP_LOGW(TAG, "%s [%s]: ACL %u->%s%u | BIS first %u->%u rep %u->%u pto %u->%u ctrl %u->%u%s", why,
                  s_mode == BT_SCHED_MODE_A2DP_FIRST ? "A2DP_FIRST" : s_mode == BT_SCHED_MODE_MASTER ? "MASTER" : "AURACAST_FIRST", old_acl,
-                 acl_ok ? "" : "FAILED ", pr->acl, old_iso[0], first, old_iso[1], pr->rep, old_iso[2],
+                 acl_ok ? "" : "FAILED ", acl, old_iso[0], first, old_iso[1], pr->rep, old_iso[2],
                  pr->pto, old_iso[3], pr->ctrl, iso_ok ? "" : " (ISO FAILED)");
     }
 }
+
+bool bt_sched_tune_set_pti(uint8_t idx, uint8_t dft, uint8_t inc, const char *why);
 
 /* ---- public API ------------------------------------------------------------ */
 void bt_sched_tune_init(void)
@@ -282,3 +292,23 @@ void bt_sched_tune_apply_custom(uint8_t acl, uint8_t first, uint8_t rep, uint8_t
     const prio_profile_t pr = { acl, first, rep, pto, first };
     apply(&pr, why);
 }
+
+/* BR/EDR scheduler priority of one activity (re/controller_sched.md: 0 ACL, 1 role switch,
+ * 2 sniff, 4 ACL handshake (LMP setup), 10 inquiry, 11 inquiry scan, 12 page, 13 page scan ...). */
+bool bt_sched_tune_set_pti(uint8_t idx, uint8_t dft, uint8_t inc, const char *why)
+{
+    if (idx >= PTI_ENTRIES || idx == 0 || dft == 0 || dft > 15 || inc > 15) return false;   /* ACL: profiles */
+    uint8_t *pti = pti_find();
+    if (pti == NULL) return false;
+    uint8_t od = pti[2 * idx], oi = pti[2 * idx + 1];
+    portENTER_CRITICAL(&s_lock);
+    pti[2 * idx] = dft;
+    pti[2 * idx + 1] = inc;
+    s_pti_want[2 * idx] = dft;
+    s_pti_want[2 * idx + 1] = inc;
+    portEXIT_CRITICAL(&s_lock);
+    bool ok = r_olc_sched_pti_dft_get(idx) == dft && r_olc_sched_pti_inc_get(idx) == inc;
+    ESP_LOGW(TAG, "%s: BR/EDR pti[%u] %u/%u -> %u/%u%s", why, idx, od, oi, dft, inc, ok ? "" : " (FAILED)");
+    return ok;
+}
+
