@@ -1068,8 +1068,16 @@ static int s_role_tries;
 static hci_con_handle_t s_role_con = HCI_CON_HANDLE_INVALID;
 static bd_addr_t s_role_addr;
 
+static bool s_role_master_test_off;               /* console 'rolemaster 0': leave the phone master */
+void a2dp_in_test_role_master(bool on)
+{
+    s_role_master_test_off = !on;
+    ESP_LOGW(TAG, "role: %s", on ? "the S31 asks for MASTER (default)" : "the phone may stay MASTER (test)");
+}
+
 static void role_retry(btstack_timer_source_t *ts)
 {
+    if (s_role_master_test_off) return;
     if (s_role_con == HCI_CON_HANDLE_INVALID || gap_get_connection_type(s_role_con) != GAP_CONNECTION_ACL ||
         gap_get_role(s_role_con) == HCI_ROLE_MASTER) {
         return;

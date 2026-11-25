@@ -46,6 +46,8 @@ void jbl_beacon_set_app_connected(bool on);
 void jbl_beacon_force_interval_ms(unsigned ms);
 /* Test knob (console beacon_props): advertising event properties (0x13 ADV_IND, 0x10 ADV_NONCONN_IND). */
 void jbl_beacon_test_props(uint8_t props);
+/* test: HCI LE Scan Request Received events on the beacon set on / off */
+void jbl_beacon_test_scanreq_events(bool on);
 
 #ifdef __cplusplus
 }

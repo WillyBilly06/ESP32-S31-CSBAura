@@ -486,6 +486,21 @@ static uint32_t s_jscan_until;
 static btstack_timer_source_t s_jscan_timer;
 static struct { bd_addr_t a; uint8_t len; uint8_t d[24]; } s_jscan[JSCAN_MAX];
 static uint8_t s_jscan_n;
+static bool s_jscan_active;                       /* jscan ... rsp: active scan, log scan responses */
+static uint8_t s_jscan_rsp_logged;                /* bit i: speaker i's scan response logged */
+
+static void jscan_rsp(const bd_addr_t addr, const uint8_t *data, uint8_t len)
+{
+    for (int i = 0; i < s_jscan_n; i++) {
+        if (bd_addr_cmp(s_jscan[i].a, addr) != 0 || (s_jscan_rsp_logged & (1u << i))) continue;
+        s_jscan_rsp_logged |= (uint8_t)(1u << i);
+        char hex[3 * 31 + 1];
+        int o = 0;
+        for (int k = 0; k < len && k < 31; k++) o += snprintf(hex + o, sizeof(hex) - (size_t)o, "%02x ", data[k]);
+        hex[o] = 0;
+        ESP_LOGW(TAG, "jscan: %s scan response (%u B): %s", bd_addr_to_str(addr), len, hex);
+    }
+}
 
 static void jscan_report(const bd_addr_t addr, bool connectable, const uint8_t *data, uint8_t len)
 {
@@ -520,18 +535,26 @@ static void jscan_end(btstack_timer_source_t *ts)
 {
     (void)ts;
     s_jscan_until = 0;
-    if (s_state != ST_SCANNING) gap_stop_scan();
+    if (s_state != ST_SCANNING || s_jscan_active) gap_stop_scan();
+    if (s_jscan_active && s_state == ST_SCANNING) {    /* back to the assistant's passive scan */
+        gap_set_scan_params(0 /* passive */, SCAN_INTERVAL, SCAN_WINDOW, 0);
+        gap_start_scan();
+    }
+    s_jscan_active = false;
     ESP_LOGW(TAG, "jscan: done, %u JBL speaker(s) heard", s_jscan_n);
 }
 
 static btstack_context_callback_registration_t s_jscan_reg;
 static void jscan_start(void *ctx)
 {
-    uint32_t ms = (uint32_t)(uintptr_t)ctx;
+    uint32_t ms = (uint32_t)(uintptr_t)ctx & 0x7FFFFFFFu;
+    s_jscan_active = ((uintptr_t)ctx & 0x80000000u) != 0;
     s_jscan_n = 0;
+    s_jscan_rsp_logged = 0;
     s_jscan_until = btstack_run_loop_get_time_ms() + ms;
-    if (s_state != ST_SCANNING) {
-        gap_set_scan_params(0 /* passive */, 0x60, 0x30, 0);
+    if (s_state != ST_SCANNING || s_jscan_active) {
+        if (s_state == ST_SCANNING) gap_stop_scan();
+        gap_set_scan_params(s_jscan_active ? 1 : 0, 0x60, 0x30, 0);
         gap_start_scan();
     }
     btstack_run_loop_remove_timer(&s_jscan_timer);
@@ -806,6 +829,8 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
         bd_addr_t a;
         gap_event_advertising_report_get_address(packet, a);
         uint8_t type = gap_event_advertising_report_get_advertising_event_type(packet);
+        if (s_jscan_until && s_jscan_active && type == 4) jscan_rsp(a, gap_event_advertising_report_get_data(packet),
+                                                                    gap_event_advertising_report_get_data_length(packet));
         if (s_jscan_until) jscan_report(a, type == 0 || type == 1, gap_event_advertising_report_get_data(packet),
                                         gap_event_advertising_report_get_data_length(packet));
         on_adv_report(a, (bd_addr_type_t)gap_event_advertising_report_get_address_type(packet),
@@ -818,6 +843,9 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
         bd_addr_t a;
         gap_event_extended_advertising_report_get_address(packet, a);
         uint16_t type = gap_event_extended_advertising_report_get_advertising_event_type(packet);
+        if (s_jscan_until && s_jscan_active && (type & 0x08))
+            jscan_rsp(a, gap_event_extended_advertising_report_get_data(packet),
+                      gap_event_extended_advertising_report_get_data_length(packet));
         if (s_jscan_until) jscan_report(a, (type & 0x01) != 0, gap_event_extended_advertising_report_get_data(packet),
                                         gap_event_extended_advertising_report_get_data_length(packet));
         on_adv_report(a, (bd_addr_type_t)gap_event_extended_advertising_report_get_address_type(packet),

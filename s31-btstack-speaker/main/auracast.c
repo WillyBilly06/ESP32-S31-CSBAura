@@ -21,6 +21,7 @@
  * numbers advance per BIS for every SDU handed to the controller.
  */
 #include "auracast.h"
+#include "link_tune.h"
 #include "s31_ident.h"
 
 #include <errno.h>
@@ -1165,6 +1166,11 @@ static void notify(auracast_state_t st, uint8_t status)
 
 static int begin_start(void);
 static void big_create(void);
+#define AURA_WAKE_STEP_MS 150
+#define AURA_WAKE_TRIES   10                      /* 1.5 s at most */
+static btstack_timer_source_t s_wake_timer;
+static uint8_t s_wake_tries;
+static void big_after_wake(btstack_timer_source_t *ts);
 static bool s_replacing;               /* BIG ended to be created again: keep the advertising */
 static bool s_pausing;                 /* BIG ended to stay off for a while: keep the advertising */
 static bool s_big_hold;                /* no BIG while a phone connects LE Audio (auracast_set_big_hold) */
@@ -1325,6 +1331,33 @@ static void on_pa_enable_complete(uint8_t status)
         notify(AURACAST_STATE_ON, 0);
         return;
     }
+    if (link_tune_any_sniff()) {
+        /* A phone link in sniff when the BIG starts was lost (0x08) 4 s later: the BIG took the
+         * anchors its sniff exit needed (the RedMagic, as the stereo pair was made, 2026-11-25).
+         * The links leave sniff first (auracast_state() is ON now: link_tune ends idle sniff). */
+        ESP_LOGW(TAG, "advertising on: phone links leave sniff first, then the BIG");
+        set_phase(PH_BIG_PAUSED);
+        notify(AURACAST_STATE_ON, 0);
+        s_wake_tries = 0;
+        link_tune_wake();
+        btstack_run_loop_remove_timer(&s_wake_timer);
+        btstack_run_loop_set_timer_handler(&s_wake_timer, big_after_wake);
+        btstack_run_loop_set_timer(&s_wake_timer, AURA_WAKE_STEP_MS);
+        btstack_run_loop_add_timer(&s_wake_timer);
+        return;
+    }
+    big_create();
+}
+
+static void big_after_wake(btstack_timer_source_t *ts)
+{
+    if (s_phase != PH_BIG_PAUSED || !s_want_on || s_big_hold) return;
+    if (link_tune_any_sniff() && ++s_wake_tries < AURA_WAKE_TRIES) {
+        btstack_run_loop_set_timer(ts, AURA_WAKE_STEP_MS);
+        btstack_run_loop_add_timer(ts);
+        return;
+    }
+    ESP_LOGW(TAG, "%s - creating the BIG", s_wake_tries >= AURA_WAKE_TRIES ? "a phone link is still in sniff" : "phone links active");
     big_create();
 }
 

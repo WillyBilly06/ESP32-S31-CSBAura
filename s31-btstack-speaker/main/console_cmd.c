@@ -25,6 +25,7 @@
  */
 #include "bt_sched_tune.h"
 #include "console_cmd.h"
+#include "link_tune.h"
 #include "hci_transport_s31_vhci.h"
 
 #include <ctype.h>
@@ -189,7 +190,8 @@ static void run_cmd(void *ctx)
         a2dp_in_set_avrcp_wait((uint32_t)strtoul(c + 10, NULL, 10));
     } else if (!strcmp(c, "jscan") || !strncmp(c, "jscan ", 6)) {
         uint32_t ms = c[5] ? (uint32_t)strtoul(c + 6, NULL, 10) : 6000;
-        jbl_assist_jscan(ms < 500 ? 500 : (ms > 60000 ? 60000 : ms));
+        ms = ms < 500 ? 500 : (ms > 60000 ? 60000 : ms);
+        jbl_assist_jscan(ms | (strstr(c, " rsp") ? 0x80000000u : 0));   /* "jscan <ms> rsp": active, scan responses */
     } else if (!strcmp(c, "callback")) {
         a2dp_in_callback_now();
     } else if (!strcmp(c, "forget")) {
@@ -268,6 +270,17 @@ static void run_cmd(void *ctx)
     } else if (!strncmp(c, "beacons", 7)) {
         int sec = atoi(c + 7);
         lls_beacon_dump((uint16_t)(sec > 0 ? sec : 15));
+    } else if (!strncmp(c, "rolemaster ", 11)) {        /* rolemaster 0|1: ask the phone for MASTER */
+        a2dp_in_test_role_master(atoi(c + 11) != 0);
+    } else if (!strncmp(c, "sniffidle ", 10)) {         /* sniffidle <min> <max> <attempt> <timeout> (slots) */
+        unsigned v[4];
+        if (sscanf(c + 10, "%u %u %u %u", &v[0], &v[1], &v[2], &v[3]) == 4) {
+            link_tune_test_idle_sniff((uint16_t)v[0], (uint16_t)v[1], (uint16_t)v[2], (uint16_t)v[3]);
+        }
+    } else if (!strncmp(c, "pollslots ", 10)) {         /* pollslots <n>: streaming poll (0 = automatic) */
+        link_tune_test_poll((uint16_t)atoi(c + 10));
+    } else if (!strncmp(c, "beacon_scanreq ", 15)) {   /* beacon_scanreq 0|1: scan request events */
+        jbl_beacon_test_scanreq_events(atoi(c + 15) != 0);
     } else if (!strncmp(c, "beacon_props ", 13)) {
         jbl_beacon_test_props((uint8_t)strtoul(c + 13, NULL, 16));
     } else if (!strncmp(c, "beacon_ms", 9)) {

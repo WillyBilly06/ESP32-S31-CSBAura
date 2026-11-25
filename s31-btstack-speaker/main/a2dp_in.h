@@ -133,3 +133,5 @@ void a2dp_in_call_after_le_pairing(const uint8_t identity[6]);
 #endif
 /* test cycle phase of the last frame read: 0 up-sweep, 1 gap, 2 down-sweep, 3 gap */
 int a2dp_in_test_phase(void);
+/* test: false = do not ask the phone for the MASTER role */
+void a2dp_in_test_role_master(bool on);

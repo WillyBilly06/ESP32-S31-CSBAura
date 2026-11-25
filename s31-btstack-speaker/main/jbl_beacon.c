@@ -31,6 +31,10 @@
 
 #include "esp_log.h"
 
+#include "a2dp_in.h"
+#include "auracast.h"
+#include "le_audio.h"
+#include "lls.h"
 #include "jbl.h"
 #include "jbl_beacon.h"
 #include "jbl_v5.h"
@@ -141,9 +145,11 @@ void jbl_beacon_name_changed(void)
 static uint16_t s_force_units;                     /* console 'beacon_ms': 0 = automatic */
 static uint32_t s_scan_reqs, s_scan_reqs_logged;   /* every scan request on the beacon */
 
+static bool s_mix_fast;                            /* mixing next to our BIG: 20 ms (see mix_tick) */
 static uint16_t interval_units(bool streaming)
 {
     if (s_force_units) return s_force_units;
+    if (s_mix_fast) return BEACON_IDLE_UNITS;
     return streaming ? BEACON_STREAM_UNITS : BEACON_IDLE_UNITS;
 }
 
@@ -156,11 +162,75 @@ static void apply_interval(void)
     ESP_LOGI(TAG, "JBL beacon interval now %u ms", (unsigned)(interval_units(s_st.streaming) * 5 / 8));
 }
 
+/* While a phone streams A2DP to us, that phone hears almost none of the beacon's scan responses:
+ * our own BR/EDR link to it wins the controller's arbitration (adv priority 1-10, hard-coded)
+ * over the SCAN_RSP. Android reports a scannable advert only with its scan response, so JBL One
+ * saw the S31 0.3-0.5 times/s (the Xtreme 5 1.4-1.7) and showed it "Unavailable". Non-scannable
+ * adverts need no reply: 2.7/s under the same load (2026-11-25). Non-scannable is also
+ * non-connectable, and the iOS app connects to the beacon over LE: the beacon stays ADV_IND
+ * BEACON_MIX_CONN of every BEACON_MIX_PERIOD ticks. Only while a phone streams to us or our broadcast
+ * runs (its BIS slots crowd the scan responses the same way: a stereo pair idle was seen 0.4-0.6/s,
+ * the partner 1.4), and not while a
+ * stereo pair is being made (the partner connects to the beacon then); a LINKED pair mixes too: as
+ * primary we open the partner link ourselves, and a stereo pair playing was seen 0.03 times/s
+ * (the partner 1.0) - the slow stereo card in JBL One. */
+#define PROPS_ADV_IND        0x13
+#define PROPS_NONCONN        0x10
+#define BEACON_MIX_TICK_MS   500
+#define BEACON_MIX_PERIOD    8                     /* ticks: 4 s */
+#define BEACON_MIX_CONN      1                     /* of them ADV_IND: 0.5 s */
+static uint8_t s_props_forced;                     /* console 'beacon_props': 0 = automatic */
+static btstack_timer_source_t s_mix_timer;
+static uint8_t s_mix_tick;
+static bool s_mixing;
+
+static void props_apply(uint8_t props)
+{
+    if (s_params.advertising_event_properties == props) return;
+    s_params.advertising_event_properties = props;
+    if (s_started) gap_extended_advertising_set_params(s_handle, &s_params);   /* a stopped set stays stopped */
+}
+
+static void mix_tick(btstack_timer_source_t *ts)
+{
+    bool busy = a2dp_in_streaming() || auracast_state() != AURACAST_STATE_OFF;   /* a phone streams / a BIG runs */
+    bool mix = !s_props_forced && s_started && busy && (!s_st.stereo_gid || lls_linked());
+    /* Hosting a BIG the beacon was at 100 ms: a stereo pair was seen 0.2-0.3 times/s, at 20 ms (mostly
+     * non-scannable) 1.0/s - with 0 SDUs not sent and 0 A2DP underruns either way, the phone link's
+     * 60 ms delivery gaps as many at 20 ms as at 100 ms (2026-11-25). Not for an LE Audio phone (its
+     * CIS setup wants the air). */
+    bool fast = mix && auracast_state() != AURACAST_STATE_OFF && !le_audio_phone_linked();
+    if (fast != s_mix_fast && !s_stopped_by_con) {
+        s_mix_fast = fast;
+        apply_interval();
+    }
+    if (mix != s_mixing) {
+        s_mixing = mix;
+        s_mix_tick = 0;
+        ESP_LOGI(TAG, "beacon %s", mix ? "mostly non-scannable while a phone streams or a broadcast runs (ADV_IND 0.5 s of 4 s)"
+                                       : "ADV_IND (connectable, scannable)");
+    }
+    if (!s_props_forced) {
+        uint8_t want = (mix && (s_mix_tick % BEACON_MIX_PERIOD) >= BEACON_MIX_CONN) ? PROPS_NONCONN : PROPS_ADV_IND;
+        if (!s_stopped_by_con) props_apply(want);
+    }
+    s_mix_tick++;
+    btstack_run_loop_set_timer(ts, BEACON_MIX_TICK_MS);
+    btstack_run_loop_add_timer(ts);
+}
+
 void jbl_beacon_test_props(uint8_t props)
 {
-    s_params.advertising_event_properties = props;
+    s_props_forced = props;
+    props_apply(props ? props : PROPS_ADV_IND);
+    ESP_LOGW(TAG, "beacon PDU properties now 0x%02x%s", s_params.advertising_event_properties, props ? " (fixed, test)" : "");
+}
+
+void jbl_beacon_test_scanreq_events(bool on)
+{
+    s_params.scan_request_notification_enable = on ? 1 : 0;
     if (s_started) apply_interval();
-    ESP_LOGW(TAG, "beacon PDU properties now 0x%02x", props);
+    ESP_LOGW(TAG, "beacon scan request events %s", on ? "on" : "off");
 }
 
 void jbl_beacon_force_interval_ms(unsigned ms)
@@ -334,6 +404,9 @@ void jbl_beacon_start(uint16_t mac_crc, const jbl_beacon_state_t *st)
     gap_extended_advertising_set_scan_response_data(s_handle, s_rsp_len, s_rsp);
     gap_extended_advertising_start(s_handle, 0, 0);
     log_payload();
+    btstack_run_loop_set_timer_handler(&s_mix_timer, mix_tick);
+    btstack_run_loop_set_timer(&s_mix_timer, BEACON_MIX_TICK_MS);
+    btstack_run_loop_add_timer(&s_mix_timer);
 }
 
 void jbl_beacon_set_app_connected(bool on)
@@ -355,6 +428,7 @@ void jbl_beacon_update(const jbl_beacon_state_t *st)
     }
     bool interval_changed = st->streaming != s_st.streaming;
     s_st = *st;
+    if (s_st.stereo_gid && !lls_linked() && !s_props_forced) props_apply(PROPS_ADV_IND);   /* stereo setup: the partner connects */
     if (s_st.stereo_gid && s_stopped_by_con) rearm();   /* stereo setup: back on air although connected */
 
     uint8_t adv[31];

@@ -68,7 +68,11 @@ static struct {
     bool had_a2dp;                                /* A2DP ran on it (and may be gone now) */
     bool ready;                                   /* encrypted (or 4 s up): our tuning may start */
     uint32_t up_ms;
-    bool sniff_req;                               /* we asked for sniff (standby phone) */
+    bool sniff_req;                               /* we asked for sniff */
+    bool sniff_long;                              /* ... the standby phone's long one (else the idle one) */
+    bool sniff_allowed;                           /* its link policy allows sniff (we set it to ask for sniff) */
+    bool own_sniff_exit;                          /* we asked the phone to leave a sniff it entered itself */
+    bool exit_pending;                            /* we asked to leave sniff, Mode Change not seen yet */
     uint8_t mode;                                 /* 0 active, 2 sniff (HCI Mode Change) */
     uint8_t sniff_fails;
     uint32_t sniff_hold_until;                    /* no new sniff request before this */
@@ -92,6 +96,16 @@ static struct {
 #define SNIFF_HOLD_MS       1000
 #define SNIFF_HOLD_LONG_MS  4000                  /* it left again within 3 s of entering */
 #define SNIFF_MAX_FAILS     3
+/* A phone linked while no phone plays sniffs too, at ~0.1 s (JBL One stays quick: the phone
+ * leaves sniff itself to send). In active mode even an idle link (50 ms best-effort poll) left
+ * the JBL beacon's scan responses little room: JBL One saw the S31 0.6-0.9 times/s against
+ * 5-6/s with no phone linked and the Xtreme 5's 1.3-1.5 (2026-11-25), and showed it late or
+ * "Unavailable". Not before the link has settled (pairing, SDP, the V5 handshake). */
+#define SNIFF_IDLE_MIN_SLOTS 160                  /* 100 ms */
+#define SNIFF_IDLE_MAX_SLOTS 200                  /* 125 ms */
+#define SNIFF_IDLE_AFTER_MS  8000
+static uint16_t s_idle_min = SNIFF_IDLE_MIN_SLOTS, s_idle_max = SNIFF_IDLE_MAX_SLOTS, s_idle_att = SNIFF_ATTEMPT,
+                s_idle_to = SNIFF_TIMEOUT;
 
 /* Our tuning (packet types, QoS poll) waits until a new link is encrypted: sent right at
  * the connect, on top of a phone's Secure Connections pairing, it overflowed the
@@ -113,10 +127,18 @@ static int link_count(void)
 
 int link_tune_classic_links(void) { return link_count(); }
 
+static uint16_t s_poll_test;                     /* console 'pollslots': 0 = automatic */
 static uint16_t poll_wanted(hci_con_handle_t h)
 {
     hci_con_handle_t audio = a2dp_in_con_handle();
     if (link_count() > 1 && audio != HCI_CON_HANDLE_INVALID && h != audio) return POLL_SLOTS_OTHER;
+    /* The audio phone between songs (linked, nothing playing): the guaranteed 7.5 ms poll is for
+     * its stream only. Held while idle, it left the JBL beacon's scan responses no room: JBL One
+     * saw the S31 0.4-0.7 times/s against the Xtreme 5's 1.5 (6 /s with no phone linked) and showed
+     * it "Unavailable" (2026-11-25). Its stream start (active_started) asks for the fast poll at once. */
+    /* not next to a broadcast: there an idle phone kept its guaranteed hosting poll in every multipoint
+     * test, while idle sniff at 125 ms timed the S26 out (0x08) during a call-back next to the stereo BIG */
+    if (h == audio && !a2dp_in_streaming() && auracast_state() == AURACAST_STATE_OFF) return POLL_SLOTS_OTHER;
     if (h != audio) {
         for (int i = 0; i < MAX_ACL; i++) {
             /* the phone dropped A2DP but kept the link (switching to LE Audio): at a
@@ -132,7 +154,27 @@ static uint16_t poll_wanted(hci_con_handle_t h)
          * guaranteed polls took the air the CIS (and the BIG) need */
         return POLL_SLOTS_OTHER;
     }
+    if (s_poll_test) return s_poll_test;
     return auracast_state() == AURACAST_STATE_OFF ? POLL_SLOTS_IDLE : POLL_SLOTS_HOSTING;
+}
+
+void link_tune_test_idle_sniff(uint16_t mn, uint16_t mx, uint16_t att, uint16_t to)
+{
+    s_idle_min = mn; s_idle_max = mx; s_idle_att = att; s_idle_to = to;
+    for (int i = 0; i < MAX_ACL; i++) {                 /* idle-sniffing links: out, back in with these */
+        if (s_links[i].h != HCI_CON_HANDLE_INVALID && s_links[i].sniff_req && !s_links[i].sniff_long) {
+            s_links[i].sniff_req = false;
+            if (s_links[i].mode == 2) { gap_sniff_mode_exit(s_links[i].h); s_links[i].exit_pending = true; }
+        }
+    }
+    ESP_LOGW(TAG, "idle sniff now %u-%u slots, attempt %u, timeout %u", mn, mx, att, to);
+}
+
+void link_tune_test_poll(uint16_t slots)
+{
+    s_poll_test = slots;
+    for (int i = 0; i < MAX_ACL; i++) s_links[i].applied = 0;
+    ESP_LOGW(TAG, "streaming poll %s", slots ? "fixed (test)" : "automatic");
 }
 
 static void poll_apply(const char *why);
@@ -178,32 +220,69 @@ static void link_ready(int i, const char *why)
     poll_apply(why);
 }
 
-static bool sniff_wanted(int i)
+/* 0: active, 1: idle sniff (no phone plays), 2: standby sniff (the other phone streams) */
+static int sniff_wanted(int i)
 {
+    uint32_t now = btstack_run_loop_get_time_ms();
+    if (s_links[i].sniff_fails >= SNIFF_MAX_FAILS || (int32_t)(now - s_links[i].sniff_hold_until) < 0) return 0;
     hci_con_handle_t audio = a2dp_in_con_handle();
-    return link_count() > 1 && audio != HCI_CON_HANDLE_INVALID && s_links[i].h != audio &&
-           a2dp_in_streaming() && !a2dp_in_link_streams_held(s_links[i].h) && s_links[i].sniff_fails < SNIFF_MAX_FAILS &&
-           (int32_t)(btstack_run_loop_get_time_ms() - s_links[i].sniff_hold_until) >= 0;
+    if (a2dp_in_streaming()) {
+        return (link_count() > 1 && audio != HCI_CON_HANDLE_INVALID && s_links[i].h != audio &&
+                !a2dp_in_link_streams_held(s_links[i].h)) ? 2 : 0;
+    }
+    if (!s_links[i].ready || now - s_links[i].up_ms < SNIFF_IDLE_AFTER_MS) return 0;
+    if (le_audio_starting() || a2dp_in_pairing()) return 0;
+    if (auracast_state() != AURACAST_STATE_OFF) return 0;   /* next to a BIG: see poll_wanted */
+    return 1;
 }
 
 /* returns true while the link is (going) in sniff: no QoS on it then */
 static bool sniff_apply(int i)
 {
     hci_con_handle_t h = s_links[i].h;
-    bool want = sniff_wanted(i);
+    int kind = sniff_wanted(i);
+    bool want = kind != 0;
+    if (want && s_links[i].sniff_req && s_links[i].sniff_long != (kind == 2)) {
+        /* idle <-> standby: out of sniff, back in with the other interval on the next tick */
+        s_links[i].sniff_req = false;
+        if (s_links[i].mode == 2) { gap_sniff_mode_exit(h); s_links[i].exit_pending = true; }
+        ESP_LOGW(TAG, "ACL 0x%04x: sniff interval changes (%s)", h, kind == 2 ? "the other phone streams" : "no phone plays");
+        return true;
+    }
     if (want && !s_links[i].sniff_req) {
+        if (s_links[i].mode == 2) return true;                        /* still leaving the old sniff */
         if (!hci_can_send_command_packet_now()) return true;          /* next tick */
+        bool lng = kind == 2;
+        uint16_t mn = lng ? SNIFF_MIN_SLOTS : s_idle_min, mx = lng ? SNIFF_MAX_SLOTS : s_idle_max;
         hci_send_cmd(&hci_write_link_policy_settings, h, 0x0004);     /* sniff allowed on this link */
-        gap_sniff_mode_enter(h, SNIFF_MIN_SLOTS, SNIFF_MAX_SLOTS, SNIFF_ATTEMPT, SNIFF_TIMEOUT);
+        s_links[i].sniff_allowed = true;
+        gap_sniff_mode_enter(h, mn, mx, lng ? SNIFF_ATTEMPT : s_idle_att, lng ? SNIFF_TIMEOUT : s_idle_to);
         s_links[i].sniff_req = true;
-        ESP_LOGW(TAG, "ACL 0x%04x: standby phone -> sniff (%u-%u ms) while the other phone streams", h,
-                 SNIFF_MIN_SLOTS * 5 / 8, SNIFF_MAX_SLOTS * 5 / 8);
+        s_links[i].sniff_long = lng;
+        ESP_LOGW(TAG, "ACL 0x%04x: %s -> sniff (%u-%u ms)%s", h, lng ? "standby phone" : "phone linked, nothing playing",
+                 mn * 5 / 8, mx * 5 / 8, lng ? " while the other phone streams" : "");
     } else if (!want && s_links[i].sniff_req) {
         s_links[i].sniff_req = false;
-        if (s_links[i].mode == 2) gap_sniff_mode_exit(h);
+        if (s_links[i].mode == 2) { gap_sniff_mode_exit(h); s_links[i].exit_pending = true; }
         s_links[i].applied = 0;                                       /* its poll again */
         ESP_LOGW(TAG, "ACL 0x%04x: leaving sniff (%s)", h,
+                 !s_links[i].sniff_long ? (auracast_state() != AURACAST_STATE_OFF ? "a broadcast starts" : "a phone plays") :
                  h == a2dp_in_con_handle() ? "now the audio phone" : "the other phone stopped");
+    } else if (!want) {
+        /* Sniff no longer wanted: take the permission back, or the phone enters sniff by itself later.
+         * Next to our BIG that timed links out (0x08): the S26 went to its own 360 ms sniff (= 12 ISO
+         * intervals, so every anchor met the BIS) and was gone 5 s later (2026-11-25). A phone already
+         * in its own sniff while we broadcast is called back to active mode. */
+        if (s_links[i].sniff_allowed && s_links[i].mode != 2 && hci_can_send_command_packet_now()) {
+            hci_send_cmd(&hci_write_link_policy_settings, h, 0x0000);
+            s_links[i].sniff_allowed = false;
+        }
+        if (s_links[i].mode == 2 && !s_links[i].exit_pending && auracast_state() != AURACAST_STATE_OFF && !s_links[i].own_sniff_exit &&
+            hci_can_send_command_packet_now()) {
+            gap_sniff_mode_exit(h);
+            s_links[i].own_sniff_exit = true;
+            ESP_LOGW(TAG, "ACL 0x%04x: the phone's own sniff next to our broadcast - back to active", h);
+        }
     }
     return s_links[i].sniff_req || s_links[i].mode == 2;
 }
@@ -227,7 +306,8 @@ static void poll_apply(const char *why)
                     other ? 4000 : 48000 /* B/s */, 0, (uint32_t)want * 625u, 0xFFFFFFFFu);
         s_links[i].applied = want;
         ESP_LOGW(TAG, "ACL 0x%04x: poll every %u slots (%.1f ms, %u polls/s) - %s", h, want, want * 0.625,
-                 (unsigned)(1600u / want), other ? (link_count() > 1 ? "second phone, not the A2DP one" : "no A2DP on it now") : why);
+                 (unsigned)(1600u / want), other ? (h == a2dp_in_con_handle() && !a2dp_in_streaming() ? "audio phone, nothing playing" :
+                                                    link_count() > 1 ? "second phone, not the A2DP one" : "no A2DP on it now") : why);
     }
 }
 
@@ -316,6 +396,9 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
                 s_links[i].ready = false;
                 s_links[i].up_ms = btstack_run_loop_get_time_ms();
                 s_links[i].sniff_req = false;
+                s_links[i].sniff_allowed = false;
+                s_links[i].own_sniff_exit = false;
+                s_links[i].exit_pending = false;
                 s_links[i].types = 0;
                 s_links[i].mode = 0;
                 s_links[i].sniff_fails = 0;
@@ -373,6 +456,7 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
         for (int i = 0; i < MAX_ACL; i++) {
             if (s_links[i].h != mh) continue;
             if (st != ERROR_CODE_SUCCESS) {
+                s_links[i].exit_pending = false;
                 s_links[i].sniff_req = false;
                 s_links[i].sniff_fails++;
                 s_links[i].sniff_hold_until = btstack_run_loop_get_time_ms() + 10000;
@@ -382,6 +466,8 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
                 break;
             }
             s_links[i].mode = mode;
+            s_links[i].own_sniff_exit = false;
+            s_links[i].exit_pending = false;
             if (mode == 2) {
                 s_links[i].sniff_since = btstack_run_loop_get_time_ms();
                 ESP_LOGW(TAG, "ACL 0x%04x: in sniff, anchor every %.1f ms", mh,
@@ -395,6 +481,7 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
                 }
                 s_links[i].applied = 0;
                 ESP_LOGW(TAG, "ACL 0x%04x: active mode again", mh);
+                if (link_count() > 1) poll_apply("out of sniff");          /* its slow poll now, not in 0.5 s */
             }
         }
         break;
@@ -409,12 +496,20 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
             uint32_t lat = little_endian_read_32(packet, 15);
             ESP_LOGW(TAG, "ACL 0x%04x QoS setup status 0x%02x: service %u, token %lu B/s, latency %lu us",
                      qh, packet[2], packet[6], (unsigned long)little_endian_read_32(packet, 7), (unsigned long)lat);
+            /* A phone asking for a faster poll than we want gets ours back at once, not on the next
+             * tick: the held phone of multipoint wakes from sniff, starts its stream and asks for a
+             * 10 ms poll; for the ~0.4 s until our tick the controller served two fast links next to
+             * the BIG and dropped whole BIG events (60 ms gaps, the receivers' SDUs lost) at every
+             * hold (2026-11-25). */
+            bool redo = false;
             for (int i = 0; i < MAX_ACL; i++) {
-                if (s_links[i].h == qh && s_links[i].applied == POLL_SLOTS_OTHER &&
-                    lat < (uint32_t)POLL_SLOTS_OTHER * 625u) {
-                    s_links[i].applied = 0;           /* the idle phone asked for a fast poll: slow again next tick */
+                if (s_links[i].h == qh && qh != a2dp_in_con_handle() && s_links[i].ready && s_links[i].mode != 2 &&
+                    lat < (uint32_t)poll_wanted(qh) * 625u && packet[2] == ERROR_CODE_SUCCESS) {
+                    s_links[i].applied = 0;
+                    redo = true;
                 }
             }
+            if (redo) poll_apply("the phone asked for a faster poll");
         }
         break;
     case HCI_EVENT_DISCONNECTION_COMPLETE: {
@@ -498,3 +593,21 @@ void link_tune_setup(void)
     btstack_run_loop_set_timer(&s_poll_timer, POLL_CHECK_MS);
     btstack_run_loop_add_timer(&s_poll_timer);
 }
+
+/* a phone link in a sniff a starting BIG must not meet: our idle sniff, or one the phone entered
+ * itself (the standby phone's long sniff next to a streaming BIG is the tested multipoint setup) */
+bool link_tune_any_sniff(void)
+{
+    for (int i = 0; i < MAX_ACL; i++) {
+        if (s_links[i].h == HCI_CON_HANDLE_INVALID) continue;
+        if (s_links[i].mode == 2 && !(s_links[i].sniff_req && s_links[i].sniff_long)) return true;
+        if (s_links[i].sniff_req && !s_links[i].sniff_long) return true;
+    }
+    return false;
+}
+
+void link_tune_wake(void)
+{
+    poll_apply("a broadcast starts");
+}
+
