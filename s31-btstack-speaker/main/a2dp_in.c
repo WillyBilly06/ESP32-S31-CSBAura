@@ -99,11 +99,15 @@ static btstack_packet_callback_registration_t s_hci_reg;
  * No calls: like the Xtreme 5 the S31 has no hands-free profile, calls stay on the phone. */
 #define TAKEOVER_MS 1000                 /* AVRCP "paused" only (a song change looks the same) */
 #define TAKEOVER_SUSPENDED_MS 500        /* its stream suspended: a real pause */
-/* A held phone's stream is SUSPENDED by us (AVDTP Suspend from the sink): left running, its
- * ~330 kbit/s next to the playing phone and the broadcast gave the playing phone ~1 underflow
- * every 2 s. It stays "playing" on the phone; at the take-over we send AVDTP Start. A phone
- * that starts again right after each suspend gets an AVRCP Pause after HELD_MAX_SUSPENDS. */
-#define HELD_MAX_SUSPENDS 3
+#define TAKEOVER_QUIET_MS 700            /* or its music silent this long */
+/* A held phone gets an AVRCP Pause: left streaming, its ~330 kbit/s next to the playing phone
+ * and the broadcast gave the playing phone ~1 underflow every 2 s. (An AVDTP Suspend from our
+ * side kept it "playing" on the phone, but an Android phone with A2DP offload dropped A2DP
+ * ~10 s later and came back with its music stopped.) At the take-over it gets AVRCP Play.
+ * It is paused again each time it restarts by itself while the other plays (seen: YouTube
+ * resumed 24 s after the Pause): the playing phone is never interrupted for it (the user's
+ * rule). Switching on request: console 'source'. */
+#define RESUME_WAIT_MS 6000              /* AVRCP Play sent: its stream should start by then */
 typedef struct {
     bool used;                       /* A2DP signaling up */
     bd_addr_t addr;
@@ -117,9 +121,9 @@ typedef struct {
     uint8_t play_status;
     uint8_t volume;                  /* its own volume (0..127), valid if vol_known */
     bool vol_known;
-    bool held;                       /* wants to play: we suspended its stream (no airtime used) */
-    bool resuming;                   /* we sent it AVDTP Start: take over when it starts */
-    uint8_t held_suspends;           /* our suspends since it last played */
+    bool held;                       /* wanted to play while the other played: we paused it */
+    bool resuming;                   /* we sent it Play: take over when its stream starts */
+    uint32_t held_ms;                /* when we held it */
 } phone_t;
 static phone_t s_alt = { .con = HCI_CON_HANDLE_INVALID, .play_status = 0xFE };
 static bool s_a2dp_started;          /* the active phone's AVDTP stream (s_streaming also means LE Audio) */
@@ -1489,7 +1493,6 @@ static void phone_swap(const char *why)
     s_alt.vol_known = true;
     s_alt.held = false;
     s_alt.resuming = false;
-    s_alt.held_suspends = 0;
     s_connected = a.used;
     bd_addr_copy(s_peer, a.addr);
     s_a2dp_cid = a.a2dp_cid;
@@ -1559,29 +1562,55 @@ static bool active_paused(void)
     return !s_a2dp_started || s_play_status == AVRCP_PLAYBACK_STATUS_PAUSED ||
            s_play_status == AVRCP_PLAYBACK_STATUS_STOPPED;
 }
-static void takeover_cb(btstack_timer_source_t *ts)
+/* the held phone: AVRCP Play, take over when its stream starts (alt STREAM_STARTED) */
+static btstack_timer_source_t s_resume_timer;
+static void resume_timeout(btstack_timer_source_t *ts)
 {
     (void)ts;
+    if (!s_alt.resuming || s_alt.started) return;
+    ESP_LOGW(TAG, "multipoint: held phone %s did not start within %u ms - left on standby", bd_addr_to_str(s_alt.addr),
+             RESUME_WAIT_MS);
+    s_alt.resuming = false;
+    s_alt.held = false;
+    link_tune_refresh("held phone did not resume");
+}
+static void held_resume(const char *why)
+{
+    s_alt.resuming = true;
+    uint8_t st = s_alt.avrcp_cid ? avrcp_controller_play(s_alt.avrcp_cid) : 0xFF;
+    if (st != ERROR_CODE_SUCCESS) st = avdtp_sink_start_stream(s_alt.a2dp_cid, s_alt.local_seid);   /* no AVRCP */
+    ESP_LOGW(TAG, "multipoint: held phone %s %s: Play -> 0x%02x", bd_addr_to_str(s_alt.addr), why, st);
+    link_tune_refresh("held phone resumes");      /* out of sniff */
+    btstack_run_loop_remove_timer(&s_resume_timer);
+    btstack_run_loop_set_timer_handler(&s_resume_timer, resume_timeout);
+    btstack_run_loop_set_timer(&s_resume_timer, RESUME_WAIT_MS);
+    btstack_run_loop_add_timer(&s_resume_timer);
+}
+
+static uint8_t s_takeover_checks;
+static void takeover_cb(btstack_timer_source_t *ts)
+{
     if (!s_alt.used || !(s_alt.started || s_alt.held) || s_ext_on) return;
     if (!active_paused()) {
         ESP_LOGW(TAG, "multipoint: the playing phone plays again - %s stays held", bd_addr_to_str(s_alt.addr));
         return;
     }
+    /* AVRCP "paused" alone is not enough: YouTube reports it for a moment at a song change while
+     * its music goes on (seen: a take-over, then straight back). Its stream suspended, or its
+     * music silent for TAKEOVER_QUIET_MS. */
+    uint32_t quiet = audio_out_quiet_ms();
+    if (s_a2dp_started && quiet < TAKEOVER_QUIET_MS) {
+        if (++s_takeover_checks <= 12) {          /* look again for ~6 s */
+            btstack_run_loop_set_timer(ts, 500);
+            btstack_run_loop_add_timer(ts);
+        } else {
+            ESP_LOGW(TAG, "multipoint: the playing phone says paused but its music goes on - %s stays held",
+                     bd_addr_to_str(s_alt.addr));
+        }
+        return;
+    }
     if (s_alt.held && !s_alt.started) {
-        if (s_alt.play_status == AVRCP_PLAYBACK_STATUS_PAUSED || s_alt.play_status == AVRCP_PLAYBACK_STATUS_STOPPED) {
-            ESP_LOGW(TAG, "multipoint: held phone %s was paused meanwhile - no take-over", bd_addr_to_str(s_alt.addr));
-            s_alt.held = false;
-            return;
-        }
-        s_alt.resuming = true;
-        uint8_t st = avdtp_sink_start_stream(s_alt.a2dp_cid, s_alt.local_seid);
-        ESP_LOGW(TAG, "multipoint: held phone %s takes over: AVDTP Start -> 0x%02x", bd_addr_to_str(s_alt.addr), st);
-        link_tune_refresh("held phone resumes");          /* out of sniff */
-        if (st != ERROR_CODE_SUCCESS) {
-            s_alt.resuming = false;
-            uint8_t ps = s_alt.avrcp_cid ? avrcp_controller_play(s_alt.avrcp_cid) : 0xFF;
-            ESP_LOGW(TAG, "multipoint: AVRCP Play to it instead -> 0x%02x", ps);
-        }
+        held_resume("takes over");
         return;
     }
     phone_swap("the other phone paused");
@@ -1591,6 +1620,7 @@ static void takeover_arm(const char *why)
 {
     if (!s_alt.used || !(s_alt.started || s_alt.held)) return;
     uint32_t ms = s_a2dp_started ? TAKEOVER_MS : TAKEOVER_SUSPENDED_MS;
+    s_takeover_checks = 0;
     btstack_run_loop_remove_timer(&s_takeover_timer);
     btstack_run_loop_set_timer_handler(&s_takeover_timer, takeover_cb);
     btstack_run_loop_set_timer(&s_takeover_timer, ms);
@@ -1614,11 +1644,8 @@ void a2dp_in_source_switch(void)
     }
     btstack_run_loop_remove_timer(&s_takeover_timer);
     if (s_a2dp_started) avrcp_pause_active("switching source on request");
-    if (!s_alt.started) {                          /* held: restart its stream, swap when it runs */
-        s_alt.resuming = true;
-        uint8_t st = avdtp_sink_start_stream(s_alt.a2dp_cid, s_alt.local_seid);
-        ESP_LOGW(TAG, "multipoint: source switch: AVDTP Start to %s -> 0x%02x", bd_addr_to_str(s_alt.addr), st);
-        link_tune_refresh("held phone resumes");
+    if (!s_alt.started) {                          /* held: play it, swap when its stream runs */
+        held_resume("gets the speaker (source switch)");
         return;
     }
     phone_swap("source switch requested");
@@ -1729,10 +1756,12 @@ static bool alt_event(uint8_t *packet)
     case A2DP_SUBEVENT_STREAM_STARTED:
         s_alt.started = true;
         if (s_a2dp_started && !s_ext_on) {
-            if (s_alt.resuming) {                 /* our Start at the take-over */
+            if (s_alt.resuming) {                 /* our Play at the take-over / source switch */
                 s_alt.resuming = false;
                 s_alt.held = false;
-                phone_swap("the other phone paused");
+                btstack_run_loop_remove_timer(&s_resume_timer);
+                if (s_a2dp_started && !active_paused()) avrcp_pause_active("switching source on request");
+                phone_swap("held phone resumed");
                 active_started("A2DP audio (held phone takes over)");
                 break;
             }
@@ -1741,15 +1770,11 @@ static bool alt_event(uint8_t *packet)
                 strcpy(held_s, bd_addr_to_str(s_alt.addr));
                 strcpy(keep_s, bd_addr_to_str(s_peer));
                 s_alt.held = true;
-                if (++s_alt.held_suspends > HELD_MAX_SUSPENDS) {
-                    uint8_t st = s_alt.avrcp_cid ? avrcp_controller_pause(s_alt.avrcp_cid) : 0xFF;
-                    ESP_LOGW(TAG, "multipoint: %s keeps restarting while held - AVRCP Pause -> 0x%02x", held_s, st);
-                    s_alt.held = false;
-                } else {
-                    uint8_t st = avdtp_sink_suspend(s_alt.a2dp_cid, s_alt.local_seid);
-                    ESP_LOGW(TAG, "multipoint: %s started playing - HELD (stream suspended -> 0x%02x), %s keeps the "
-                             "speaker; it takes over when %s pauses", held_s, st, keep_s, keep_s);
-                }
+                s_alt.held_ms = btstack_run_loop_get_time_ms();
+                uint8_t st = s_alt.avrcp_cid ? avrcp_controller_pause(s_alt.avrcp_cid) : 0xFF;
+                if (st != ERROR_CODE_SUCCESS) st = avdtp_sink_suspend(s_alt.a2dp_cid, s_alt.local_seid);   /* no AVRCP */
+                ESP_LOGW(TAG, "multipoint: %s started playing - HELD (paused -> 0x%02x), %s keeps the speaker; %s "
+                         "resumes when %s pauses", held_s, st, keep_s, held_s, keep_s);
             } else {
                 takeover_arm("is paused");
             }
@@ -2034,10 +2059,15 @@ static void a2dp_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet,
         link_tune_refresh("A2DP gone, link kept");
         ESP_LOGW(TAG, "A2DP disconnected");
         if (s_alt.used) {                          /* multipoint: the standby phone becomes the active one */
+            bool was_held = s_alt.held;
             s_avrcp_cid = 0;                       /* the AVRCP of the phone that left */
             phone_swap("the other phone disconnected");
             alt_clear();
             if (s_a2dp_started) active_started("A2DP audio (other phone) playing");
+            else if (was_held && s_avrcp_cid) {    /* we paused it to hold it: it plays now */
+                ESP_LOGW(TAG, "multipoint: held phone gets the speaker - Play -> 0x%02x",
+                         avrcp_controller_play(s_avrcp_cid));
+            }
         } else {
             active_stopped();
         }
@@ -2258,12 +2288,15 @@ static void avrcp_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet
         if (packet[2] == AVRCP_SUBEVENT_CONNECTION_RELEASED) s_alt.avrcp_cid = 0;
         else if (packet[2] == AVRCP_SUBEVENT_NOTIFICATION_PLAYBACK_STATUS_CHANGED) {
             s_alt.play_status = avrcp_subevent_notification_playback_status_changed_get_play_status(packet);
-            if (s_alt.held && (s_alt.play_status == AVRCP_PLAYBACK_STATUS_PAUSED ||
-                               s_alt.play_status == AVRCP_PLAYBACK_STATUS_STOPPED) && !s_alt.resuming) {
-                s_alt.held = false;
-                s_alt.held_suspends = 0;
-                ESP_LOGW(TAG, "multipoint: held phone %s paused by its user - not held any more",
-                         bd_addr_to_str(s_alt.addr));
+            /* PAUSED right after we held it is our own Pause: it stays held */
+            if (s_alt.play_status == AVRCP_PLAYBACK_STATUS_PLAYING && !s_alt.resuming && s_a2dp_started &&
+                !active_paused() && !s_ext_on) {
+                s_alt.held = true;
+                s_alt.held_ms = btstack_run_loop_get_time_ms();
+                char held_s[18];
+                strcpy(held_s, bd_addr_to_str(s_alt.addr));
+                ESP_LOGW(TAG, "multipoint: %s plays while %s does - HELD (paused -> 0x%02x)", held_s,
+                         bd_addr_to_str(s_peer), avrcp_controller_pause(s_alt.avrcp_cid));
             }
         }
         else if (packet[2] == AVRCP_SUBEVENT_NOTIFICATION_VOLUME_CHANGED) {

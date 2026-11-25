@@ -57,6 +57,7 @@ static volatile uint32_t s_tone_len, s_tone_rate, s_tone_seq;
 static volatile bool s_tone_cut;
 static volatile uint32_t st_tones;
 static volatile int32_t st_peak_in, st_peak_out;  /* |sample| max this window: before / after the volume */
+static volatile int64_t s_loud_us;                /* last pushed input above ~-60 dBFS */
 
 static int32_t peak_of(const int16_t *lr, int n)
 {
@@ -187,6 +188,7 @@ void audio_out_push(ao_owner_t owner, const int16_t *lr, int n)
     {
         int32_t p = peak_of(lr, n);
         if (p > st_peak_in) st_peak_in = p;
+        if (p > 32) s_loud_us = esp_timer_get_time();
     }
     if ((owner == AO_HOST || owner == AO_LOCAL) && n <= 480) {
         memcpy(vol_buf, lr, (size_t)n * 4);       /* phone volume: here, not on the broadcast */
@@ -396,4 +398,10 @@ void audio_out_log_stats(void)
              (unsigned long)st_underruns, (unsigned long)st_primes, (unsigned long)st_dropped,
              (unsigned long)st_tones);
     st_peak_in = st_peak_out = 0;
+}
+
+uint32_t audio_out_quiet_ms(void)
+{
+    int64_t d = (esp_timer_get_time() - s_loud_us) / 1000;
+    return d > 0xFFFFFFF ? 0xFFFFFFF : (uint32_t)d;
 }
