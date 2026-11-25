@@ -16,7 +16,19 @@ Mọi thứ cần để build đều có sẵn trong repository, đã vá:
 - **BTstack** trong [`third_party/btstack`](../../third_party/btstack/S31_README.md).
 
 Chỉ có công cụ của ESP-IDF (trình biên dịch, CMake, Ninja, môi trường Python) là không thể để
-trong repository. Lần **Build + Flash** đầu tiên sẽ tự cài chúng.
+trong repository. Lần **Build + Flash** đầu tiên sẽ tự cài chúng, từ internet hoặc, khi không có
+mạng, từ gói offline.
+
+**Gói offline.** Trình nạp tìm thư mục `S31-offline`, hoặc file `S31-offline-tools-win64.zip`
+giải nén ra thư mục đó, nằm cạnh file exe hoặc trong thư mục dự án. Bản tải đầy đủ
+(`S31-CSBAura-complete-win64.zip` trên trang Releases) đã có sẵn thư mục này. Với gói này, lần
+Build + Flash đầu tiên:
+- đặt các file nén công cụ của ESP-IDF vào nơi trình cài của ESP-IDF tìm chúng (nó kiểm tra
+  SHA-256 của từng file);
+- cài các gói Python từ thư mục `wheels` (pip chạy không dùng index);
+- dùng Python 3.12, và cài Python 3.12.10 từ gói nếu máy chưa có bản 3.12.
+
+Gói này chứa đúng những gì dự án đã được kiểm thử. `tools/release/make_offline.py` tạo ra nó.
 
 ## Bạn cần gì
 

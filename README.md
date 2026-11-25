@@ -30,6 +30,22 @@ This firmware turns an **ESP32-S31** board into a speaker that behaves like a **
 
 ![Where the folder and S31Flasher.exe go](docs/folder-layout.svg)
 
+### Easiest: the complete download (everything, works offline)
+
+On the [Releases](../../releases) page, download **`S31-CSBAura-complete-win64.zip`** (about
+1.3 GB). It holds everything this project is built and tested with:
+- this repository with the patched ESP-IDF and BTstack,
+- `S31Flasher.exe`,
+- ESP-IDF's tools for the ESP32-S31: compiler, debugger, CMake, Ninja and the rest,
+- the Python packages for ESP-IDF's Python environment,
+- the Python 3.12 installer.
+
+Unzip it to `C:\S31`, so you get `C:\S31\ESP32-S31-CSBAura`. Run `S31Flasher.exe` in that
+folder and press **Build + Flash** (steps 6 to 10 below). The first build installs the tools
+from the `S31-offline` folder, with no internet at all.
+
+### Or: the repository and the flasher separately
+
 1. **Get the repository.** On GitHub use **Code → Download ZIP** and unpack it, or
    `git clone` it. It already contains the patched ESP-IDF and BTstack: nothing has to be
    cloned or patched.

@@ -30,6 +30,22 @@ Firmware này biến một bo mạch **ESP32-S31** thành một chiếc loa ho�
 
 ![Đặt thư mục và S31Flasher.exe ở đâu](docs/folder-layout.svg)
 
+### Dễ nhất: bản tải đầy đủ (có tất cả, chạy không cần mạng)
+
+Trên trang [Releases](../../releases), tải **`S31-CSBAura-complete-win64.zip`** (khoảng 1,3 GB).
+Trong đó có mọi thứ dự án này dùng để build và kiểm thử:
+- repository này cùng ESP-IDF và BTstack đã vá,
+- `S31Flasher.exe`,
+- công cụ ESP-IDF cho ESP32-S31: trình biên dịch, trình gỡ lỗi, CMake, Ninja và các công cụ khác,
+- các gói Python cho môi trường Python của ESP-IDF,
+- bộ cài Python 3.12.
+
+Giải nén vào `C:\S31` để có `C:\S31\ESP32-S31-CSBAura`. Chạy `S31Flasher.exe` trong thư mục đó
+và bấm **Build + Flash** (các bước 6 đến 10 bên dưới). Lần build đầu cài công cụ từ thư mục
+`S31-offline`, hoàn toàn không cần internet.
+
+### Hoặc: tải repository và trình nạp riêng
+
 1. **Tải repository.** Trên GitHub chọn **Code → Download ZIP** rồi giải nén, hoặc dùng
    `git clone`. Trong đó đã có sẵn ESP-IDF và BTstack đã vá: không cần clone hay vá gì thêm.
 2. **Đặt nó ở một đường dẫn ngắn**, ví dụ `C:\S31\ESP32-S31-CSBAura`: dưới 80 ký tự, không có

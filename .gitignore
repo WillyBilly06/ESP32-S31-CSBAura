@@ -28,3 +28,8 @@ build/tones.bin
 Thumbs.db
 desktop.ini
 __pycache__/
+
+# the complete download's extras (release assets, not in git)
+/S31Flasher.exe
+/S31-offline/
+/S31-offline-tools-win64.zip

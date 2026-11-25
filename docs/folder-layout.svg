@@ -1,7 +1,7 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="900" height="560" viewBox="0 0 900 560" font-family="Segoe UI, Helvetica, Arial, sans-serif">
-  <rect x="0" y="0" width="900" height="560" rx="14" fill="#f4f5f7"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="600" viewBox="0 0 900 600" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+  <rect x="0" y="0" width="900" height="600" rx="14" fill="#f4f5f7"/>
   <!-- window -->
-  <rect x="24" y="24" width="560" height="512" rx="10" fill="#ffffff" stroke="#d0d3d9"/>
+  <rect x="24" y="24" width="560" height="552" rx="10" fill="#ffffff" stroke="#d0d3d9"/>
   <rect x="24" y="24" width="560" height="40" rx="10" fill="#eceef2"/>
   <rect x="24" y="54" width="560" height="10" fill="#eceef2"/>
   <circle cx="48" cy="44" r="6" fill="#ff5f57"/><circle cx="68" cy="44" r="6" fill="#febc2e"/><circle cx="88" cy="44" r="6" fill="#28c840"/>
@@ -9,44 +9,28 @@
   <!-- address bar -->
   <rect x="40" y="76" width="528" height="34" rx="6" fill="#ffffff" stroke="#c4c8cf"/>
   <text x="54" y="98" font-size="15" fill="#1d1d1f" font-family="Consolas, Menlo, monospace">C:\S31\ESP32-S31-CSBAura</text>
-  <!-- header -->
   <text x="56" y="140" font-size="12" fill="#6e6e73">Name</text>
   <line x1="40" y1="148" x2="568" y2="148" stroke="#e3e5e9"/>
-  <!-- rows -->
   <g font-size="15" fill="#1d1d1f">
-    <g transform="translate(0,0)">
-      <path d="M58 166 h8 l3 3 h11 v12 h-22z" fill="#f2c14e"/><text x="92" y="180">btstack-patches</text>
-    </g>
-    <g transform="translate(0,34)">
-      <path d="M58 166 h8 l3 3 h11 v12 h-22z" fill="#f2c14e"/><text x="92" y="180">idf-patches</text>
-    </g>
-    <g transform="translate(0,68)">
-      <path d="M58 166 h8 l3 3 h11 v12 h-22z" fill="#f2c14e"/><text x="92" y="180">s31-btstack-speaker</text>
-    </g>
+    <g><path d="M58 166 h8 l3 3 h11 v12 h-22z" fill="#f2c14e"/><text x="92" y="180">btstack-patches</text></g>
+    <g transform="translate(0,34)"><path d="M58 166 h8 l3 3 h11 v12 h-22z" fill="#f2c14e"/><text x="92" y="180">idf-patches</text></g>
+    <g transform="translate(0,68)"><path d="M58 166 h8 l3 3 h11 v12 h-22z" fill="#f2c14e"/><text x="92" y="180">s31-btstack-speaker</text></g>
     <g transform="translate(0,102)">
-      <path d="M58 166 h8 l3 3 h11 v12 h-22z" fill="#f2c14e"/><text x="92" y="180">third_party</text>
+      <path d="M58 166 h8 l3 3 h11 v12 h-22z" fill="#9ec5fe"/><text x="92" y="180">S31-offline</text>
+      <text x="196" y="180" font-size="12" fill="#1f5fbf">complete download only / chỉ có trong bản đầy đủ</text>
     </g>
-    <g transform="translate(0,136)">
-      <path d="M58 166 h8 l3 3 h11 v12 h-22z" fill="#f2c14e"/><text x="92" y="180">tools</text>
-    </g>
-    <g transform="translate(0,170)">
-      <rect x="60" y="165" width="17" height="19" rx="2" fill="#ffffff" stroke="#8a8f98"/><text x="92" y="180">README.md</text>
-    </g>
-    <g transform="translate(0,204)">
-      <rect x="60" y="165" width="17" height="19" rx="2" fill="#ffffff" stroke="#8a8f98"/><text x="92" y="180">README.vi.md</text>
-    </g>
-    <!-- the exe, highlighted -->
-    <g transform="translate(0,238)">
+    <g transform="translate(0,136)"><path d="M58 166 h8 l3 3 h11 v12 h-22z" fill="#f2c14e"/><text x="92" y="180">third_party</text></g>
+    <g transform="translate(0,170)"><path d="M58 166 h8 l3 3 h11 v12 h-22z" fill="#f2c14e"/><text x="92" y="180">tools</text></g>
+    <g transform="translate(0,204)"><rect x="60" y="165" width="17" height="19" rx="2" fill="#ffffff" stroke="#8a8f98"/><text x="92" y="180">README.md</text></g>
+    <g transform="translate(0,238)"><rect x="60" y="165" width="17" height="19" rx="2" fill="#ffffff" stroke="#8a8f98"/><text x="92" y="180">README.vi.md</text></g>
+    <g transform="translate(0,272)">
       <rect x="44" y="158" width="520" height="32" rx="6" fill="#fff1e6" stroke="#ff6a00" stroke-width="2"/>
       <rect x="59" y="164" width="20" height="20" rx="4" fill="#ff6a00"/>
       <text x="64" y="179" font-size="12" fill="#ffffff" font-weight="bold">S</text>
       <text x="92" y="180" font-weight="bold">S31Flasher.exe</text>
     </g>
-    <g transform="translate(0,276)">
-      <rect x="60" y="165" width="17" height="19" rx="2" fill="#ffffff" stroke="#8a8f98"/><text x="92" y="180">tones.bin</text>
-    </g>
+    <g transform="translate(0,310)"><rect x="60" y="165" width="17" height="19" rx="2" fill="#ffffff" stroke="#8a8f98"/><text x="92" y="180">tones.bin</text></g>
   </g>
-  <!-- callouts -->
   <g font-size="15">
     <path d="M572 93 C 610 93, 610 112, 630 112" fill="none" stroke="#1f5fbf" stroke-width="2"/>
     <circle cx="572" cy="93" r="3" fill="#1f5fbf"/>
@@ -56,18 +40,18 @@
     <text x="636" y="166" fill="#6e6e73" font-style="italic">Đường dẫn ngắn: không dấu cách,</text>
     <text x="636" y="185" fill="#6e6e73" font-style="italic">không dấu tiếng Việt, dưới 80 ký tự.</text>
 
-    <path d="M568 412 C 600 412, 610 330, 630 330" fill="none" stroke="#ff6a00" stroke-width="2"/>
-    <circle cx="568" cy="412" r="3" fill="#ff6a00"/>
-    <text x="636" y="300" font-weight="bold" fill="#ff6a00">2  Put the exe here</text>
-    <text x="636" y="320" fill="#1d1d1f">Next to README.md and</text>
-    <text x="636" y="339" fill="#1d1d1f">s31-btstack-speaker, then run it.</text>
-    <text x="636" y="362" fill="#6e6e73" font-style="italic">Đặt file exe ở đây, cạnh</text>
-    <text x="636" y="381" fill="#6e6e73" font-style="italic">README.md và s31-btstack-speaker,</text>
-    <text x="636" y="400" fill="#6e6e73" font-style="italic">rồi chạy nó.</text>
+    <path d="M568 446 C 600 446, 610 352, 630 352" fill="none" stroke="#ff6a00" stroke-width="2"/>
+    <circle cx="568" cy="446" r="3" fill="#ff6a00"/>
+    <text x="636" y="322" font-weight="bold" fill="#ff6a00">2  The exe goes here</text>
+    <text x="636" y="342" fill="#1d1d1f">Next to README.md and</text>
+    <text x="636" y="361" fill="#1d1d1f">s31-btstack-speaker, then run it.</text>
+    <text x="636" y="384" fill="#6e6e73" font-style="italic">File exe nằm ở đây, cạnh</text>
+    <text x="636" y="403" fill="#6e6e73" font-style="italic">README.md và s31-btstack-speaker,</text>
+    <text x="636" y="422" fill="#6e6e73" font-style="italic">rồi chạy nó.</text>
 
-    <text x="636" y="470" font-size="13" fill="#6e6e73">The whole repository: Code → Download ZIP,</text>
-    <text x="636" y="488" font-size="13" fill="#6e6e73">unpacked (or git clone).</text>
-    <text x="636" y="508" font-size="13" fill="#6e6e73" font-style="italic">Toàn bộ repository: Code → Download ZIP,</text>
-    <text x="636" y="526" font-size="13" fill="#6e6e73" font-style="italic">giải nén (hoặc git clone).</text>
+    <text x="636" y="500" font-size="13" fill="#6e6e73">The complete download already has</text>
+    <text x="636" y="518" font-size="13" fill="#6e6e73">them in place: unzip it to C:\S31.</text>
+    <text x="636" y="542" font-size="13" fill="#6e6e73" font-style="italic">Bản đầy đủ đã sắp xếp sẵn như vậy:</text>
+    <text x="636" y="560" font-size="13" fill="#6e6e73" font-style="italic">chỉ cần giải nén vào C:\S31.</text>
   </g>
 </svg>

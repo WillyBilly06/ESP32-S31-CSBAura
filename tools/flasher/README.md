@@ -16,7 +16,20 @@ Everything it builds from comes with the repository, already patched:
 - **BTstack** in [`third_party/btstack`](../../third_party/btstack/S31_README.md).
 
 Only ESP-IDF's tools (compiler, CMake, Ninja, a Python environment) can't live in the
-repository. The first **Build + Flash** installs them by itself.
+repository. The first **Build + Flash** installs them by itself, from the internet or, with no
+internet at all, from the offline package.
+
+**Offline package.** The flasher looks for an `S31-offline` folder, or the
+`S31-offline-tools-win64.zip` that unpacks to it, next to the exe or in the project folder.
+The complete download (`S31-CSBAura-complete-win64.zip` on the Releases page) has it in
+place. With it, the first Build + Flash:
+- places ESP-IDF's tool archives where ESP-IDF's installer looks for them (it checks each
+  one's SHA-256);
+- installs the Python packages from its `wheels` folder (pip runs with no index);
+- uses Python 3.12, installing Python 3.12.10 from the package if the PC has no 3.12.
+
+The package holds exactly what this project is tested with. `tools/release/make_offline.py`
+makes it.
 
 ## What you need
 

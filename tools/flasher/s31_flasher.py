@@ -79,6 +79,63 @@ def find_project_near(d):
     return None
 
 
+# ---------------------------------------------------------------- offline tools package
+OFFLINE_DIR = "S31-offline"                  # tools/release/make_offline.py
+OFFLINE_ZIP = "S31-offline-tools-win64.zip"
+OFFLINE = None                               # the package folder, when there is one
+
+
+def find_offline(project, log=None):
+    """the offline tools package next to the exe or in the project folder; a zip is unpacked
+    once into the project folder"""
+    places = [d for d in (project, base_dir()) if d]
+    for d in places:
+        p = os.path.join(d, OFFLINE_DIR)
+        if os.path.isfile(os.path.join(p, "manifest.json")):
+            return p
+    for d in places:
+        z = os.path.join(d, OFFLINE_ZIP)
+        if os.path.isfile(z):
+            import zipfile
+            dest = project if project and os.path.isdir(project) else d
+            if log:
+                log(f"Unpacking {OFFLINE_ZIP} (ESP-IDF's tools, no internet needed)...\n")
+            with zipfile.ZipFile(z) as zf:
+                zf.extractall(dest)
+            p = os.path.join(dest, OFFLINE_DIR)
+            if os.path.isfile(os.path.join(p, "manifest.json")):
+                return p
+    return None
+
+
+def offline_python_installer():
+    if not OFFLINE:
+        return None
+    exe = os.path.join(OFFLINE, "python", os.path.basename(PY_URL))
+    return exe if os.path.isfile(exe) else None
+
+
+def seed_offline_tools(log):
+    """the package's tool archives into ESP-IDF's download folder (its installer uses them
+    instead of downloading, after checking their SHA-256) and its constraints file (fresh,
+    so it is not downloaded again)"""
+    dist = os.path.join(idf_tools_path(), "dist")
+    os.makedirs(dist, exist_ok=True)
+    src = os.path.join(OFFLINE, "dist")
+    n = 0
+    for fn in os.listdir(src):
+        a, b = os.path.join(src, fn), os.path.join(dist, fn)
+        if not (os.path.isfile(b) and os.path.getsize(b) == os.path.getsize(a)):
+            shutil.copyfile(a, b)
+            n += 1
+    for fn in os.listdir(OFFLINE):
+        if fn.startswith("espidf.constraints"):
+            b = os.path.join(idf_tools_path(), fn)
+            shutil.copyfile(os.path.join(OFFLINE, fn), b)
+            os.utime(b, None)
+    log(f"Offline package: {n} tool archive(s) placed, Python packages from {os.path.join(OFFLINE, 'wheels')}\n")
+
+
 def settings_path():
     return os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "S31Flasher", "settings.json")
 
@@ -229,7 +286,7 @@ PYTHON = None          # the Python ESP-IDF's scripts run with (ensure_python)
 
 
 def idf_tools_path():
-    return os.path.join(os.path.expanduser("~"), ".espressif")
+    return os.environ.get("S31_IDF_TOOLS_PATH") or os.path.join(os.path.expanduser("~"), ".espressif")
 
 
 def idf_env(idf):
@@ -237,6 +294,9 @@ def idf_env(idf):
     the chosen Python first on PATH (install.ps1 / export.ps1 run plain `python`)"""
     extra = {"IDF_PATH": os.path.normpath(idf), "IDF_TOOLS_PATH": idf_tools_path(),
              "IDF_TARGET": "esp32s31", "IDF_SKIP_CHECK_SUBMODULES": "1"}
+    if OFFLINE:                              # every pip call ESP-IDF's installer makes: no index
+        extra["PIP_NO_INDEX"] = "1"
+        extra["PIP_FIND_LINKS"] = os.path.join(OFFLINE, "wheels")
     env = clean_env(extra)
     if PYTHON:
         d = os.path.dirname(PYTHON)
@@ -311,8 +371,19 @@ def python_from(cmd):
         return None
 
 
+def python_version(exe):
+    try:
+        r = subprocess.run([exe, "-I", "-c", "import sys; print('%d.%d' % sys.version_info[:2])"],
+                           capture_output=True, text=True, timeout=30, env=clean_env(),
+                           creationflags=subprocess.CREATE_NO_WINDOW if WIN else 0)
+        return r.stdout.strip()
+    except Exception:
+        return ""
+
+
 def find_python():
-    """a Python ESP-IDF can use: the saved one, the flasher's own, the py launcher's, PATH's"""
+    """a Python ESP-IDF can use: the saved one, the flasher's own, the py launcher's, PATH's
+    (with the offline package only a 3.12: its Python packages are built for it)"""
     cands = [load_settings().get("python"), os.path.join(own_python_dir(), "python.exe" if WIN else "bin/python3")]
     if WIN and shutil.which("py"):
         for v in ("3.12", "3.11", "3.13", "3.10"):
@@ -321,8 +392,9 @@ def find_python():
         w = shutil.which(n, path=clean_env().get("PATH"))
         if w:
             cands.append(python_from([w]))
+    want = ".".join(PY_VERSION.split(".")[:2]) if OFFLINE else None
     for c in cands:
-        if python_ok(c):
+        if python_ok(c) and (want is None or python_version(c) == want):
             return c
     return None
 
@@ -334,17 +406,22 @@ def install_python(log):
         raise RuntimeError("install Python 3.10 to 3.13 and try again")
     tmp = os.path.join(tempfile.gettempdir(), "S31Flasher")
     os.makedirs(tmp, exist_ok=True)
-    exe = os.path.join(tmp, os.path.basename(PY_URL))
-    log(f"No usable Python found: installing Python {PY_VERSION} from python.org for ESP-IDF's tools...\n")
-    download(PY_URL, exe, log)
+    exe = offline_python_installer()
+    if exe:
+        log(f"No Python {PY_VERSION[:4]} found: installing Python {PY_VERSION} from the offline package...\n")
+    else:
+        exe = os.path.join(tmp, os.path.basename(PY_URL))
+        log(f"No usable Python found: installing Python {PY_VERSION} from python.org for ESP-IDF's tools...\n")
+        download(PY_URL, exe, log)
     target = own_python_dir()
     stream([exe, "/quiet", "InstallAllUsers=0", f"TargetDir={target}", "PrependPath=0", "Include_launcher=0",
             "InstallLauncherAllUsers=0", "Include_test=0", "Include_doc=0", "Include_tcltk=0",
             "Shortcuts=0", "AssociateFiles=0", "Include_pip=1"], log)
-    try:
-        os.remove(exe)
-    except OSError:
-        pass
+    if not offline_python_installer():
+        try:
+            os.remove(exe)
+        except OSError:
+            pass
 
 
 def ensure_python(log):
@@ -382,7 +459,11 @@ def tools_ready(idf):
 
 
 def install_tools(idf, log):
-    log("Installing ESP-IDF's ESP32-S31 tools (compiler, CMake, Ninja, Python environment; about 1 GB, once)...\n")
+    if OFFLINE:
+        seed_offline_tools(log)
+        log("Installing ESP-IDF's ESP32-S31 tools from the offline package (no internet; a few minutes, once)...\n")
+    else:
+        log("Installing ESP-IDF's ESP32-S31 tools (compiler, CMake, Ninja, Python environment; about 1 GB, once)...\n")
     if WIN:
         stream(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File",
                 os.path.join(idf, "install.ps1"), "esp32s31"], log, cwd=idf, env=idf_env(idf))
@@ -415,6 +496,10 @@ def ensure_ready(project, idf, log):
         raise RuntimeError(f"the project folder's path is too long ({len(os.path.abspath(project))} characters; "
                            f"ESP-IDF's files inside need it under {MAX_PROJECT_PATH}) - move the folder "
                            "somewhere shorter, e.g. C:\\S31\\ESP32-S31-CSBAura")
+    global OFFLINE
+    OFFLINE = find_offline(project, log)
+    if OFFLINE:
+        log(f"Offline tools package: {OFFLINE}\n")
     state = idf_state(idf, project)
     if state != "ready":
         if os.path.normcase(os.path.abspath(idf)) == os.path.normcase(os.path.abspath(bundled_idf(project))):
