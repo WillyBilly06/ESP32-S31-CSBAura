@@ -42,6 +42,11 @@ void jbl_beacon_name_changed(void);
 /* BT thread: JBL One control link up / down - misc b6 "JBL app connected". */
 void jbl_beacon_set_app_connected(bool on);
 
+/* Test knob (console beacon_ms): a fixed beacon interval in ms; 0 = automatic. */
+void jbl_beacon_force_interval_ms(unsigned ms);
+/* Test knob (console beacon_props): advertising event properties (0x13 ADV_IND, 0x10 ADV_NONCONN_IND). */
+void jbl_beacon_test_props(uint8_t props);
+
 #ifdef __cplusplus
 }
 #endif

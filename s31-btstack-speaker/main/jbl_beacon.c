@@ -138,9 +138,36 @@ void jbl_beacon_name_changed(void)
     }
 }
 
+static uint16_t s_force_units;                     /* console 'beacon_ms': 0 = automatic */
+static uint32_t s_scan_reqs, s_scan_reqs_logged;   /* every scan request on the beacon */
+
 static uint16_t interval_units(bool streaming)
 {
+    if (s_force_units) return s_force_units;
     return streaming ? BEACON_STREAM_UNITS : BEACON_IDLE_UNITS;
+}
+
+static void apply_interval(void)
+{
+    s_params.primary_advertising_interval_min = interval_units(s_st.streaming);
+    s_params.primary_advertising_interval_max = interval_units(s_st.streaming);
+    gap_extended_advertising_set_params(s_handle, &s_params);   /* BTstack stops / restarts the set */
+    s_interval_changes++;
+    ESP_LOGI(TAG, "JBL beacon interval now %u ms", (unsigned)(interval_units(s_st.streaming) * 5 / 8));
+}
+
+void jbl_beacon_test_props(uint8_t props)
+{
+    s_params.advertising_event_properties = props;
+    if (s_started) apply_interval();
+    ESP_LOGW(TAG, "beacon PDU properties now 0x%02x", props);
+}
+
+void jbl_beacon_force_interval_ms(unsigned ms)
+{
+    s_force_units = ms ? (uint16_t)(ms * 8 / 5) : 0;
+    if (s_force_units && s_force_units < 32) s_force_units = 32;
+    if (s_started) apply_interval();
 }
 
 static void log_payload(void)
@@ -237,6 +264,7 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
             }
             bd_addr_t a;
             hci_subevent_le_scan_request_received_get_scanner_address(packet, a);
+            s_scan_reqs++;
             int k;
             for (k = 0; k < n_seen; k++) {
                 if (bd_addr_cmp(seen[k], a) == 0) {
@@ -338,24 +366,22 @@ void jbl_beacon_update(const jbl_beacon_state_t *st)
         s_data_updates++;
         log_payload();
     }
-    if (interval_changed) {
-        s_params.primary_advertising_interval_min = interval_units(s_st.streaming);
-        s_params.primary_advertising_interval_max = interval_units(s_st.streaming);
-        gap_extended_advertising_set_params(s_handle, &s_params);   /* BTstack stops / restarts the set */
-        s_interval_changes++;
-        ESP_LOGI(TAG, "JBL beacon interval now %u ms", (unsigned)(interval_units(s_st.streaming) * 5 / 8));
+    if (interval_changed && !s_force_units) {
+        apply_interval();
     }
 }
 
 void jbl_beacon_log_stats(void)
 {
     ESP_LOGI(TAG, "beacon %s handle %u, %u ms, partyInfo 0x%04x%s | data updates %lu, interval changes %lu, "
-             "peer connects %lu, re-arms %lu, scanners %lu",
+             "peer connects %lu, re-arms %lu, scanners %lu, scan requests %lu (+%lu)",
              !s_started ? "OFF" : s_stopped_by_con ? "PAUSED (peer connected)" : "on", s_handle,
              (unsigned)(interval_units(s_st.streaming) * 5 / 8), s_st.party_info,
              s_st.name_known ? " +srcName1Crc" : "", (unsigned long)s_data_updates,
              (unsigned long)s_interval_changes, (unsigned long)s_peer_cons, (unsigned long)s_rearms,
-             (unsigned long)s_scanners_seen);
+             (unsigned long)s_scanners_seen, (unsigned long)s_scan_reqs,
+             (unsigned long)(s_scan_reqs - s_scan_reqs_logged));
+    s_scan_reqs_logged = s_scan_reqs;
 }
 
 void jbl_beacon_pause(bool pause)

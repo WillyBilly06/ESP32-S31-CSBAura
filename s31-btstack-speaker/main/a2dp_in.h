@@ -115,6 +115,11 @@ void a2dp_in_set_stereo_secondary(bool on);
 void a2dp_in_callback_now(void);
 /* the power-up call-back of the last phone is scheduled or paging (the stereo pair waits for it) */
 bool a2dp_in_callback_busy(void);
+
+/* multipoint: switch to the held (standby, playing) phone now (console 'source') */
+void a2dp_in_source_switch(void);
+/* multipoint: this link is the standby phone and its stream runs (held) */
+bool a2dp_in_link_streams_held(uint16_t con_handle);
 /* console: how long the phone gets to open AVRCP itself before we do */
 void a2dp_in_set_avrcp_wait(uint32_t ms);
 bool a2dp_in_pairing(void);

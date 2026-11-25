@@ -790,10 +790,12 @@ static void stereo_linked(bool linked)
     }
     ESP_LOGW(TAG, "stereo pair: partner link %s - 0x2C80 = %u", linked ? "UP" : "down", cfg.lls);
     if (linked) {
-        /* beacon as a linked stereo speaker: group Stereo, Connected, our role, our channel; the
-         * group id byte stays (JBL One groups the two cards by it) */
-        uint16_t pi = (uint16_t)(0x4000u | 0x1000u | (cfg.stereo_role == 2 ? 0x0400u : 0x0200u) |
-                                 ((cfg.party_channel & 3u) << 7) | 0x0040u);
+        /* beacon as a linked stereo speaker, exactly as a real Xtreme 5 in a pair advertises it
+         * (0xD080 left / 0xD100 right, either role): b15 on, group Stereo, Connected, no role
+         * bits, our channel. Without b15 (0x54C0 before) JBL One took the pair as off and only
+         * grouped the cards later, over its control link. The group id byte stays (the cards
+         * are grouped by it). */
+        uint16_t pi = (uint16_t)(0x8000u | 0x4000u | 0x1000u | ((cfg.party_channel & 3u) << 7));
         jbl_set_stereo_wait(pi, (uint8_t)cfg.stereo_id[3]);
         /* the primary splits: it plays its own channel and broadcasts the secondary's as one BIS */
         audio_out_set_channel(cfg.stereo_role == 2 ? cfg.party_channel : 0);

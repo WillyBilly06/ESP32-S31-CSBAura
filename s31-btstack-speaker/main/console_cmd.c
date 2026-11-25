@@ -49,6 +49,7 @@
 #include "csb.h"
 #include "lls.h"
 #include "jbl_models.h"
+#include "jbl_beacon.h"
 #include "s31_ident.h"
 #include "le_audio.h"
 #include "party.h"
@@ -254,6 +255,14 @@ static void run_cmd(void *ctx)
     } else if (!strncmp(c, "beacons", 7)) {
         int sec = atoi(c + 7);
         lls_beacon_dump((uint16_t)(sec > 0 ? sec : 15));
+    } else if (!strncmp(c, "beacon_props ", 13)) {
+        jbl_beacon_test_props((uint8_t)strtoul(c + 13, NULL, 16));
+    } else if (!strncmp(c, "beacon_ms", 9)) {
+        int ms = atoi(c + 9);
+        jbl_beacon_force_interval_ms(ms > 0 ? (unsigned)ms : 0);
+        ESP_LOGW(TAG, "beacon interval %s", ms > 0 ? "fixed (test)" : "automatic");
+    } else if (!strcmp(c, "source")) {
+        a2dp_in_source_switch();
     } else if (!strcmp(c, "switchpair")) {
         a2dp_in_button(A2DP_BTN_PAIRING_SWITCH);
     } else if (!strncmp(c, "tone ", 5)) {
@@ -269,7 +278,7 @@ static void run_cmd(void *ctx)
         power_reboot();
     } else if (!strcmp(c, "help") || !c[0]) {
         ESP_LOGW(TAG, "commands: pair | aura [on|off] | vol+ | vol- | play | leaudio on|off | forget | switchpair | v5set <id> <hex> | "
-                      "tone <name> | status | jscan [ms] | callback | aestest | stacks | reboot");
+                      "tone <name> | status | jscan [ms] | beacon_ms [ms] | callback | source | aestest | stacks | reboot");
     } else {
         ESP_LOGW(TAG, "unknown command '%s' (help)", c);
     }

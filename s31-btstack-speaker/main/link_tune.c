@@ -67,7 +67,30 @@ static struct {
     bool had_a2dp;                                /* A2DP ran on it (and may be gone now) */
     bool ready;                                   /* encrypted (or 4 s up): our tuning may start */
     uint32_t up_ms;
+    bool sniff_req;                               /* we asked for sniff (standby phone) */
+    uint8_t mode;                                 /* 0 active, 2 sniff (HCI Mode Change) */
+    uint8_t sniff_fails;
+    uint32_t sniff_hold_until;                    /* no new sniff request before this */
+    uint32_t sniff_since;                         /* entered sniff at */
 } s_links[MAX_ACL];
+
+/* The standby phone (multipoint: linked, not the one playing) sniffs while the other
+ * phone streams. Its 50 ms poll was cheap alone, but next to a broadcast with the S31 as
+ * the streaming phone's slave (no role switch while broadcasting) it left the streaming
+ * link 60-124 ms delivery gaps and ~1 underrun/s; in sniff it costs one anchor per
+ * ~0.5 s. The Xtreme 5 sniffs idle links too. The phone leaves sniff by itself when it
+ * has something to send (play, AVRCP); we leave it when that phone becomes the audio one
+ * or the other stops streaming. */
+#define SNIFF_MIN_SLOTS     640                   /* 400 ms */
+#define SNIFF_MAX_SLOTS     800                   /* 500 ms */
+#define SNIFF_ATTEMPT       4
+#define SNIFF_TIMEOUT       2
+/* after the phone left sniff itself: it may have had nothing to send (seen: an Android phone left
+ * sniff and stayed silent; 5 s of 50 ms polls there gave the streaming phone 6 underflows).
+ * Play / AVRCP from it arrive within that second and make it the audio phone anyway. */
+#define SNIFF_HOLD_MS       1000
+#define SNIFF_HOLD_LONG_MS  4000                  /* it left again within 3 s of entering */
+#define SNIFF_MAX_FAILS     3
 
 /* Our tuning (packet types, QoS poll) waits until a new link is encrypted: sent right at
  * the connect, on top of a phone's Secure Connections pairing, it overflowed the
@@ -134,6 +157,36 @@ static void link_ready(int i, const char *why)
     poll_apply(why);
 }
 
+static bool sniff_wanted(int i)
+{
+    hci_con_handle_t audio = a2dp_in_con_handle();
+    return link_count() > 1 && audio != HCI_CON_HANDLE_INVALID && s_links[i].h != audio &&
+           a2dp_in_streaming() && !a2dp_in_link_streams_held(s_links[i].h) && s_links[i].sniff_fails < SNIFF_MAX_FAILS &&
+           (int32_t)(btstack_run_loop_get_time_ms() - s_links[i].sniff_hold_until) >= 0;
+}
+
+/* returns true while the link is (going) in sniff: no QoS on it then */
+static bool sniff_apply(int i)
+{
+    hci_con_handle_t h = s_links[i].h;
+    bool want = sniff_wanted(i);
+    if (want && !s_links[i].sniff_req) {
+        if (!hci_can_send_command_packet_now()) return true;          /* next tick */
+        hci_send_cmd(&hci_write_link_policy_settings, h, 0x0004);     /* sniff allowed on this link */
+        gap_sniff_mode_enter(h, SNIFF_MIN_SLOTS, SNIFF_MAX_SLOTS, SNIFF_ATTEMPT, SNIFF_TIMEOUT);
+        s_links[i].sniff_req = true;
+        ESP_LOGW(TAG, "ACL 0x%04x: standby phone -> sniff (%u-%u ms) while the other phone streams", h,
+                 SNIFF_MIN_SLOTS * 5 / 8, SNIFF_MAX_SLOTS * 5 / 8);
+    } else if (!want && s_links[i].sniff_req) {
+        s_links[i].sniff_req = false;
+        if (s_links[i].mode == 2) gap_sniff_mode_exit(h);
+        s_links[i].applied = 0;                                       /* its poll again */
+        ESP_LOGW(TAG, "ACL 0x%04x: leaving sniff (%s)", h,
+                 h == a2dp_in_con_handle() ? "now the audio phone" : "the other phone stopped");
+    }
+    return s_links[i].sniff_req || s_links[i].mode == 2;
+}
+
 static void poll_apply(const char *why)
 {
     for (int i = 0; i < MAX_ACL; i++) {
@@ -144,6 +197,7 @@ static void poll_apply(const char *why)
             link_ready(i, "link up 4 s, not encrypted");   /* calls poll_apply again: done */
             return;
         }
+        if (sniff_apply(i)) continue;
         uint16_t want = poll_wanted(h);
         if (want == s_links[i].applied) continue;
         bool other = want == POLL_SLOTS_OTHER;
@@ -239,6 +293,10 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
                 s_links[i].had_a2dp = false;
                 s_links[i].ready = false;
                 s_links[i].up_ms = btstack_run_loop_get_time_ms();
+                s_links[i].sniff_req = false;
+                s_links[i].mode = 0;
+                s_links[i].sniff_fails = 0;
+                s_links[i].sniff_hold_until = 0;
                 break;
             }
         }
@@ -285,6 +343,39 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
             }
         }
         break;
+    case HCI_EVENT_MODE_CHANGE: {
+        hci_con_handle_t mh = hci_event_mode_change_get_handle(packet);
+        uint8_t st = hci_event_mode_change_get_status(packet);
+        uint8_t mode = hci_event_mode_change_get_mode(packet);
+        for (int i = 0; i < MAX_ACL; i++) {
+            if (s_links[i].h != mh) continue;
+            if (st != ERROR_CODE_SUCCESS) {
+                s_links[i].sniff_req = false;
+                s_links[i].sniff_fails++;
+                s_links[i].sniff_hold_until = btstack_run_loop_get_time_ms() + 10000;
+                s_links[i].applied = 0;
+                ESP_LOGW(TAG, "ACL 0x%04x: sniff refused (0x%02x, %u/%u)", mh, st, s_links[i].sniff_fails,
+                         SNIFF_MAX_FAILS);
+                break;
+            }
+            s_links[i].mode = mode;
+            if (mode == 2) {
+                s_links[i].sniff_since = btstack_run_loop_get_time_ms();
+                ESP_LOGW(TAG, "ACL 0x%04x: in sniff, anchor every %.1f ms", mh,
+                         hci_event_mode_change_get_interval(packet) * 0.625);
+            } else {
+                if (s_links[i].sniff_req) {                  /* the phone left sniff itself */
+                    s_links[i].sniff_req = false;
+                    uint32_t now = btstack_run_loop_get_time_ms();
+                    s_links[i].sniff_hold_until = now + (now - s_links[i].sniff_since < 3000 ? SNIFF_HOLD_LONG_MS
+                                                                                            : SNIFF_HOLD_MS);
+                }
+                s_links[i].applied = 0;
+                ESP_LOGW(TAG, "ACL 0x%04x: active mode again", mh);
+            }
+        }
+        break;
+    }
     case HCI_EVENT_MAX_SLOTS_CHANGED:
         ESP_LOGW(TAG, "ACL 0x%04x max slots now %u", hci_event_max_slots_changed_get_handle(packet),
                  hci_event_max_slots_changed_get_lmp_max_slots(packet));
