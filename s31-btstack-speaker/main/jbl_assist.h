@@ -36,6 +36,8 @@ bool jbl_assist_is_link(hci_con_handle_t con);
 bool jbl_assist_scan_idle(void);
 
 void jbl_assist_log_stats(void);
+/* console: scan ms and log every JBL beacon heard (any thread) */
+void jbl_assist_jscan(uint32_t ms);
 
 #ifdef __cplusplus
 }

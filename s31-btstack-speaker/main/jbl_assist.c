@@ -479,6 +479,75 @@ static bool time_reached(uint32_t now, uint32_t t)
     return (int32_t)(now - t) >= 0;
 }
 
+/* console "jscan": a short scan that logs every JBL beacon (0xFDDF service data) heard,
+ * once per address and again when its payload changes - which speakers are on air */
+#define JSCAN_MAX 8
+static uint32_t s_jscan_until;
+static btstack_timer_source_t s_jscan_timer;
+static struct { bd_addr_t a; uint8_t len; uint8_t d[24]; } s_jscan[JSCAN_MAX];
+static uint8_t s_jscan_n;
+
+static void jscan_report(const bd_addr_t addr, bool connectable, const uint8_t *data, uint8_t len)
+{
+    ad_context_t ctx;
+    for (ad_iterator_init(&ctx, len, data); ad_iterator_has_more(&ctx); ad_iterator_next(&ctx)) {
+        const uint8_t *d = ad_iterator_get_data(&ctx);
+        uint8_t n = ad_iterator_get_data_len(&ctx);
+        if (ad_iterator_get_data_type(&ctx) != BLUETOOTH_DATA_TYPE_SERVICE_DATA_16_BIT_UUID || n < 3 ||
+            little_endian_read_16(d, 0) != 0xFDDF) {
+            continue;
+        }
+        d += 2; n -= 2;
+        if (n > 24) n = 24;
+        int i = 0;
+        while (i < s_jscan_n && bd_addr_cmp(s_jscan[i].a, addr) != 0) i++;
+        if (i < s_jscan_n && s_jscan[i].len == n && memcmp(s_jscan[i].d, d, n) == 0) return;
+        if (i == s_jscan_n) {
+            if (s_jscan_n == JSCAN_MAX) return;
+            s_jscan_n++;
+            bd_addr_copy(s_jscan[i].a, addr);
+        }
+        s_jscan[i].len = n;
+        memcpy(s_jscan[i].d, d, n);
+        char hex[3 * 24 + 1];
+        for (int k = 0; k < n; k++) snprintf(hex + 3 * k, 4, "%02x ", d[k]);
+        ESP_LOGW(TAG, "jscan: %s%s JBL beacon: %s", bd_addr_to_str(addr), connectable ? "" : " (not connectable)", hex);
+        return;
+    }
+}
+
+static void jscan_end(btstack_timer_source_t *ts)
+{
+    (void)ts;
+    s_jscan_until = 0;
+    if (s_state != ST_SCANNING) gap_stop_scan();
+    ESP_LOGW(TAG, "jscan: done, %u JBL speaker(s) heard", s_jscan_n);
+}
+
+static btstack_context_callback_registration_t s_jscan_reg;
+static void jscan_start(void *ctx)
+{
+    uint32_t ms = (uint32_t)(uintptr_t)ctx;
+    s_jscan_n = 0;
+    s_jscan_until = btstack_run_loop_get_time_ms() + ms;
+    if (s_state != ST_SCANNING) {
+        gap_set_scan_params(0 /* passive */, 0x60, 0x30, 0);
+        gap_start_scan();
+    }
+    btstack_run_loop_remove_timer(&s_jscan_timer);
+    btstack_run_loop_set_timer_handler(&s_jscan_timer, jscan_end);
+    btstack_run_loop_set_timer(&s_jscan_timer, ms);
+    btstack_run_loop_add_timer(&s_jscan_timer);
+    ESP_LOGW(TAG, "jscan: listening for JBL beacons for %lu ms", (unsigned long)ms);
+}
+
+void jbl_assist_jscan(uint32_t ms)
+{
+    s_jscan_reg.callback = jscan_start;
+    s_jscan_reg.context = (void *)(uintptr_t)ms;
+    btstack_run_loop_execute_on_main_thread(&s_jscan_reg);
+}
+
 static void on_adv_report(const bd_addr_t addr, bd_addr_type_t addr_type, bool connectable,
                           const uint8_t *ad, int ad_len)
 {
@@ -737,6 +806,8 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
         bd_addr_t a;
         gap_event_advertising_report_get_address(packet, a);
         uint8_t type = gap_event_advertising_report_get_advertising_event_type(packet);
+        if (s_jscan_until) jscan_report(a, type == 0 || type == 1, gap_event_advertising_report_get_data(packet),
+                                        gap_event_advertising_report_get_data_length(packet));
         on_adv_report(a, (bd_addr_type_t)gap_event_advertising_report_get_address_type(packet),
                       type == 0 || type == 1,               /* ADV_IND / ADV_DIRECT_IND */
                       gap_event_advertising_report_get_data(packet),
@@ -747,6 +818,8 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
         bd_addr_t a;
         gap_event_extended_advertising_report_get_address(packet, a);
         uint16_t type = gap_event_extended_advertising_report_get_advertising_event_type(packet);
+        if (s_jscan_until) jscan_report(a, (type & 0x01) != 0, gap_event_extended_advertising_report_get_data(packet),
+                                        gap_event_extended_advertising_report_get_data_length(packet));
         on_adv_report(a, (bd_addr_type_t)gap_event_extended_advertising_report_get_address_type(packet),
                       (type & 0x01) != 0,
                       gap_event_extended_advertising_report_get_data(packet),

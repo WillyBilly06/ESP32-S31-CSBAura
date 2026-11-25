@@ -16,6 +16,8 @@
  *   csb rx <bd_addr>               receive a speaker's CPB (its sync train, then its broadcast)
  *   csb rx off | csb tx [slots] | csb tx off | csb data <hex>   CPB receive / transmit tests
  *   model [pid hex [color hex]]     list the JBL models / become one (NVS, reboot); "model 0" = flashed one
+ *   jscan [ms]                    scan (default 6 s) and log every JBL beacon heard
+ *   callback                      call the last phone back (or, with one linked, the one before it)
  *   reboot | help
  *
  * Send with: python tools/s31_console/s31ctl.py send "<command>"
@@ -41,6 +43,7 @@
 
 #include "a2dp_in.h"
 #include "power.h"
+#include "jbl_assist.h"
 #include "auracast.h"
 #include "jbl_v5.h"
 #include "csb.h"
@@ -170,6 +173,9 @@ static void run_cmd(void *ctx)
         le_audio_set_reachable(c[9] == 'n');
     } else if (!strncmp(c, "avrcpwait ", 10)) {
         a2dp_in_set_avrcp_wait((uint32_t)strtoul(c + 10, NULL, 10));
+    } else if (!strcmp(c, "jscan") || !strncmp(c, "jscan ", 6)) {
+        uint32_t ms = c[5] ? (uint32_t)strtoul(c + 6, NULL, 10) : 6000;
+        jbl_assist_jscan(ms < 500 ? 500 : (ms > 60000 ? 60000 : ms));
     } else if (!strcmp(c, "callback")) {
         a2dp_in_callback_now();
     } else if (!strcmp(c, "forget")) {
@@ -263,7 +269,7 @@ static void run_cmd(void *ctx)
         power_reboot();
     } else if (!strcmp(c, "help") || !c[0]) {
         ESP_LOGW(TAG, "commands: pair | aura [on|off] | vol+ | vol- | play | leaudio on|off | forget | switchpair | v5set <id> <hex> | "
-                      "tone <name> | status | aestest | stacks | reboot");
+                      "tone <name> | status | jscan [ms] | callback | aestest | stacks | reboot");
     } else {
         ESP_LOGW(TAG, "unknown command '%s' (help)", c);
     }

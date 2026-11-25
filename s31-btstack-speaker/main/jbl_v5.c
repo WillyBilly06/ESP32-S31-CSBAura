@@ -130,7 +130,8 @@ static v5_cfg_t cfg = {
     .rgb_loop = { 0x01, 0x00, 0x00, 0x00 },
     .fw = V5_FW_DEFAULT,
     .name = JBL_DEVICE_NAME,
-    .auto_off = 0x8000 | 1200,          /* 20 min: one of the app's choices */
+    .auto_off = 1200,                   /* off by default (user's choice, 2026-11-24): always on;
+                                         * JBL One's switch sets b15, 20 min stays the time */
     .bcast_hq = 0x80,
     .bcast_name = JBL_BROADCAST_NAME,
     .eq_be = 1,
