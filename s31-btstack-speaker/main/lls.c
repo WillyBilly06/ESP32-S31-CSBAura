@@ -977,6 +977,8 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
             if (s_state == L_LINKED) {
                 ESP_LOGW(TAG, "stereo link closed (reason 0x%02x)", r);
                 btstack_run_loop_remove_timer(&s_sync_timer);
+                s_ungrouping = false;                   /* the partner closed it: that is the ack */
+                btstack_run_loop_remove_timer(&s_ug_timer);
                 party_set_stereo_secondary(false);
                 a2dp_in_set_stereo_secondary(false);
                 s_txq_len = 0;

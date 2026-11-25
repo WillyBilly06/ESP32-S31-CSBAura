@@ -1212,13 +1212,37 @@ void a2dp_in_refresh_discoverable(void)
     }
 }
 
+static void callback_now(void *ctx);
+static void prev_phone_soon(uint32_t ms);
+
+/* Pairing mode dropped every phone. When it ends they come back: with no phone connected
+ * the last one is called back (then the one before it); after a new phone paired, the one
+ * before it is called back as the second phone. Not after the LE Audio switch, which
+ * forgot every pairing. */
+static btstack_timer_source_t s_after_pair_timer;
+static btstack_timer_source_t s_prev_timer;          /* tentative: defined again below */
+static void after_pairing(btstack_timer_source_t *ts)
+{
+    (void)ts;
+    if (s_pairing || s_stereo_sec) return;
+    if (!s_connected) callback_now(NULL);
+    else prev_phone_soon(10);
+}
+
 static void pairing_stop(const char *why)
 {
     btstack_run_loop_remove_timer(&s_pair_timer);
+    bool new_bond = s_new_bond;
     s_pairing = false;
     s_new_bond = false;
     a2dp_in_refresh_discoverable();
     ESP_LOGW(TAG, "pairing mode ended (%s)", why);
+    if (!s_pair_switch) {
+        btstack_run_loop_remove_timer(&s_after_pair_timer);
+        btstack_run_loop_set_timer_handler(&s_after_pair_timer, after_pairing);
+        btstack_run_loop_set_timer(&s_after_pair_timer, new_bond ? 5000 : 500);
+        btstack_run_loop_add_timer(&s_after_pair_timer);
+    }
 }
 
 static void pairing_end(btstack_timer_source_t *ts)
@@ -1937,6 +1961,16 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
     case HCI_EVENT_CONNECTION_COMPLETE:
         s_conn_req_pending = false;
         btstack_run_loop_remove_timer(&s_accept_timer);
+        if (s_stereo_sec && hci_event_connection_complete_get_status(packet) == ERROR_CODE_SUCCESS) {
+            /* a phone link that completed after we became the stereo secondary (a page that
+             * was already running): the secondary has no phone */
+            bd_addr_t a;
+            hci_event_connection_complete_get_bd_addr(packet, a);
+            if (!lls_is_partner_addr(a)) {
+                ESP_LOGW(TAG, "stereo secondary: phone link %s came up late - closing it", bd_addr_to_str(a));
+                gap_disconnect(hci_event_connection_complete_get_connection_handle(packet));
+            }
+        }
         break;
     case HCI_EVENT_COMMAND_COMPLETE:
         if (hci_event_command_complete_get_command_opcode(packet) == 0x1408 && size >= 9) {   /* Read Encryption Key Size */
@@ -2351,6 +2385,8 @@ void a2dp_in_set_stereo_secondary(bool on)
     le_audio_set_quiet(on);
     if (on) {
         btstack_run_loop_remove_timer(&s_reconn_timer);
+        btstack_run_loop_remove_timer(&s_prev_timer);
+        btstack_run_loop_remove_timer(&s_after_pair_timer);
         s_reconn_pending = false;
         int n = 0;
         btstack_linked_list_iterator_t it;
@@ -2360,7 +2396,13 @@ void a2dp_in_set_stereo_secondary(bool on)
             if (lls_is_link(c->con_handle) || lls_is_partner_addr(c->address)) continue;
             ESP_LOGW(TAG, "stereo secondary: disconnecting %s (con 0x%04x, %s)", bd_addr_to_str(c->address),
                      c->con_handle, c->address_type == BD_ADDR_TYPE_ACL ? "Classic" : "LE");
-            gap_disconnect(c->con_handle);
+            if (c->con_handle == HCI_CON_HANDLE_INVALID && c->address_type == BD_ADDR_TYPE_ACL) {
+                /* our call-back's page is still running: a disconnect does nothing there, the
+                 * page completed later and left that phone's A2DP setup stuck - cancel it */
+                hci_send_cmd(&hci_create_connection_cancel, c->address);
+            } else {
+                gap_disconnect(c->con_handle);
+            }
             n++;
         }
         ESP_LOGW(TAG, "stereo secondary: %d phone link(s) dropped, not connectable until the pair ends", n);

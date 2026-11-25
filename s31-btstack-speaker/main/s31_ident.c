@@ -17,8 +17,8 @@
  * over the partition (testing models without flashing).
  *
  * The identity (Classic + LE address, beacon address, macCrc, serial, Broadcast_ID) comes
- * from the chip's factory MAC, so every board is its own Xtreme 5 and keeps its pairings
- * across flashes. id[6] is no longer used (see s31_ident_init).
+ * from id[6] when the flasher wrote one (a new speaker on every flash), else from the chip's
+ * factory MAC (every board its own Xtreme 5, pairings kept across flashes).
  */
 #include "s31_ident.h"
 
@@ -121,14 +121,22 @@ void s31_ident_init(void)
     uint8_t id[6];
     bool cfg = cfg_read(id);
     model_override();
-    /* The Bluetooth address stays the chip's factory MAC (unique per chip). Setting another
-     * one (esp_iface_mac_addr_set) is accepted by the ESP32-S31 controller, but its BR/EDR
-     * authentication then fails on every reconnect: phones pair once and never reconnect,
-     * and LE Audio breaks with it. A v2 s31cfg id from that time is ignored. */
-    (void)id_usable;
-    esp_read_mac(s_mac, ESP_MAC_BT);
+    /* The Bluetooth address: the flashed one when the flasher gave this flash its own
+     * identity ("New Xtreme 5 on every flash"), else the chip's factory MAC (unique per chip,
+     * kept across flashes). A new address is a new speaker: its pairings are cleared
+     * (nvs_follow_identity) and phones pair with it as with a new Xtreme 5. */
+    bool own_id = cfg && id_usable(id);
+    if (own_id) {
+        esp_err_t e = esp_iface_mac_addr_set(id, ESP_MAC_BT);
+        if (e == ESP_OK) {
+            memcpy(s_mac, id, 6);
+        } else {
+            ESP_LOGE(TAG, "flashed Bluetooth address refused (%s) - the chip MAC instead", esp_err_to_name(e));
+            own_id = false;
+        }
+    }
+    if (!own_id) esp_read_mac(s_mac, ESP_MAC_BT);
     nvs_follow_identity(s_mac);
-    bool own_id = false;
     snprintf(s_serial, sizeof(s_serial), "S31X5%02X%02X%02X", s_mac[3], s_mac[4], s_mac[5]);
     /* a per-speaker standard Broadcast_ID: phones list broadcasts by it */
     uint32_t sid = ((uint32_t)crc16_arc(s_mac, 6) << 8) ^ s_mac[5] ^ ((uint32_t)s_mac[4] << 16);

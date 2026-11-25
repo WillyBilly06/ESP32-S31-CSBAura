@@ -544,6 +544,30 @@ def make_cfg(color_id, name, ident=None, model=DEFAULT_PID):
     return body.ljust(CFG_SIZE, b"\xff")
 
 
+def new_identity():
+    """a fresh Bluetooth address for "New speaker on every flash": Espressif's 30:ED:A0 and 3
+    random bytes, outside the reserved inquiry LAPs 9E8B00..9E8B3F"""
+    while True:
+        tail = os.urandom(3)
+        if not (tail[0] == 0x9E and tail[1] == 0x8B and tail[2] <= 0x3F):
+            return bytes([0x30, 0xED, 0xA0]) + tail
+
+
+def cfg_identity(blob):
+    """the Bluetooth address in an s31cfg image (v2 / v3), None when it has none"""
+    if len(blob) < 50 or blob[:4] != b"S31C" or blob[4] not in (2, 3):
+        return None
+    body = 46 if blob[4] == 2 else 48
+    if struct.unpack_from("<H", blob, body)[0] != crc16_arc(blob[:body]):
+        return None
+    ident = bytes(blob[40:46])
+    return None if ident in (bytes(6), bytes([0xFF]) * 6) or ident[0] & 1 else ident
+
+
+def addr_str(ident):
+    return ":".join(f"{b:02X}" for b in ident)
+
+
 def load_build(build_dir):
     path = os.path.join(build_dir, "flasher_args.json")
     if not os.path.isfile(path):
@@ -616,16 +640,42 @@ def run_esptool_fast(tail, port, chip, before, after, log):
     raise RuntimeError(f"esptool failed: {last}")
 
 
-def flash(project, port, color_id, name, erase, color_only, log, model=DEFAULT_PID):
+def board_identity(port, tmp, log):
+    """the identity the board's s31cfg holds now (None: the chip's own MAC, or unreadable)"""
+    path = os.path.join(tmp, "s31cfg_board.bin")
+    try:
+        run_esptool_fast(["read-flash", hex(CFG_OFFSET), "64", path], port, "esp32s31", "default-reset", "no-reset", log)
+        with open(path, "rb") as f:
+            return cfg_identity(f.read())
+    except Exception as e:
+        log(f"(could not read the board's identity: {e} - it gets the chip's own address)\n")
+        return None
+
+
+def flash(project, port, color_id, name, erase, color_only, log, model=DEFAULT_PID, new_id=False):
+    """new_id: this flash makes a new speaker (a fresh Bluetooth address; phones pair it as a new
+    one). Otherwise the board keeps the identity it has (read back from it); erase goes back to
+    the chip's own address."""
     build_dir = project_file(project, PROJECT_SUBDIR, "build")
     # a fixed work file, overwritten each time and never deleted: esptool can still hold it
     # open when we return, and Windows refuses to delete an open file (WinError 32)
     tmp = os.path.join(tempfile.gettempdir(), "S31Flasher")
     os.makedirs(tmp, exist_ok=True)
     if True:
+        if new_id:
+            ident = new_identity()
+            log(f"New speaker: Bluetooth address {addr_str(ident)} (phones pair it as a new one)\n")
+        elif not erase:
+            # off: the board stays the speaker it is now (its address and pairings), whether
+            # that is the chip's own address or one an earlier flash gave it
+            ident = board_identity(port, tmp, log)
+            log(f"Identity kept: {addr_str(ident) if ident else 'the chip MAC'} (pairings kept)\n")
+        else:
+            ident = None
+            log("Identity: the chip's own Bluetooth address (the board is erased)\n")
         cfg = os.path.join(tmp, "s31cfg.bin")
         with open(cfg, "wb") as f:
-            f.write(make_cfg(color_id, name, model=model))  # identity: the chip's own MAC
+            f.write(make_cfg(color_id, name, ident=ident, model=model))
         if color_only:
             run_esptool_fast(["write-flash", hex(CFG_OFFSET), cfg], port, "esp32s31", "default-reset", "hard-reset", log)
             log(f"\nModel {model:04X}, color 0x{color_id:02X} set. The board restarts with it.\n")
@@ -711,6 +761,7 @@ def gui(project, idf):
     port_var = tk.StringVar()
     name_var = tk.StringVar()
     erase_var = tk.BooleanVar(value=False)
+    newid_var = tk.BooleanVar(value=load_settings().get("new_identity", True))
     saved_model = model_by_pid(load_settings().get("model", DEFAULT_PID)) or model_by_pid(DEFAULT_PID) or MODELS[0]
     model_var = tk.StringVar(value=saved_model[1])
     color_var = tk.StringVar(value=saved_model[2][0][0])
@@ -814,8 +865,14 @@ def gui(project, idf):
         port_var.set(last_port)
     elif port_box["values"]:
         port_box.current(0)
-    ttk.Checkbutton(c2, text="Erase the whole board first (only for a brand-new board)", variable=erase_var,
+    ttk.Checkbutton(c2, text="Erase the whole board first (a clean start: no pairings, the chip's own address)",
+                    variable=erase_var,
                     style="Card.TCheckbutton").grid(row=2, column=0, columnspan=4, sticky="w", pady=(6, 0))
+    ttk.Checkbutton(c2, text="New speaker on every flash (a new Bluetooth address: phones pair it as a new one)",
+                    variable=newid_var, style="Card.TCheckbutton").grid(row=3, column=0, columnspan=4, sticky="w",
+                                                                         pady=(2, 0))
+    ttk.Label(c2, text="Off: the board stays the speaker it is now, with its pairings. Erase goes back to the chip's own.",
+              style="Muted.TLabel").grid(row=4, column=0, columnspan=4, sticky="w", padx=(22, 0))
 
     # 3 - model + color swatches
     c3 = card("3", "Speaker model and color")
@@ -959,6 +1016,7 @@ def gui(project, idf):
         s["idf_path"] = idf_var.get()
         s["project"] = proj_var.get()
         s["model"] = cur_model()[0]
+        s["new_identity"] = bool(newid_var.get())
         if port_var.get().strip():
             s["port"] = port_var.get().strip()
         save_settings(s)
@@ -987,12 +1045,13 @@ def gui(project, idf):
         remember()
         p, i, cid, nm, er = proj_var.get(), idf_var.get(), color_id(), name_var.get().strip(), erase_var.get()
         pid = cur_model()[0]
+        nid = bool(newid_var.get())
 
         def job():
             if do_build:
                 build(p, i, log)          # installs ESP-IDF's tools first if they are missing
                 tools_var[i] = True
-            flash(p, port, cid, nm, er, False, log, pid)
+            flash(p, port, cid, nm, er, False, log, pid, new_id=nid)
         run(job, f"{'Building and flashing' if do_build else 'Flashing'} ({model_var.get()}, {color_var.get()})")
 
     def do_color():
@@ -1005,7 +1064,8 @@ def gui(project, idf):
 
     go_btn.configure(command=lambda: do_flash(True))
     setup_btn.configure(command=do_setup)
-    menu.add_command(label="Set model / color / name only (keeps everything else)", command=do_color)
+    menu.add_command(label="Set model / color / name only (keeps the identity and everything else)",
+                     command=do_color)
     menu.add_command(label="Flash the last build (no build)", command=lambda: do_flash(False))
 
     saved = load_settings()
@@ -1030,6 +1090,9 @@ def main():
     ap.add_argument("--no-build", action="store_true", help="flash the last build without building")
     ap.add_argument("--erase", action="store_true", help="erase the whole flash first")
     ap.add_argument("--color-only", action="store_true", help="only write the model / color / name")
+    ap.add_argument("--new-identity", action="store_true",
+                    help="a new speaker: a fresh Bluetooth address (phones pair it as new); default: the board "
+                         "keeps the identity it has (--erase: the chip's own)")
     a = ap.parse_args()
     if a.list_models:
         for m in MODELS:
@@ -1057,7 +1120,8 @@ def main():
             return
     if not a.color_only and not a.no_build:
         build(project, idf, cli_log)
-    flash(project, a.port, color_from_args(a, model), a.name, a.erase, a.color_only, cli_log, model[0])
+    flash(project, a.port, color_from_args(a, model), a.name, a.erase, a.color_only, cli_log, model[0],
+          new_id=a.new_identity)
 
 
 if __name__ == "__main__":

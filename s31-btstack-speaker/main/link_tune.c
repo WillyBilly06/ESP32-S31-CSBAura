@@ -65,7 +65,15 @@ static struct {
     hci_con_handle_t h;
     uint16_t applied;                             /* poll slots set, 0 = redo */
     bool had_a2dp;                                /* A2DP ran on it (and may be gone now) */
+    bool ready;                                   /* encrypted (or 4 s up): our tuning may start */
+    uint32_t up_ms;
 } s_links[MAX_ACL];
+
+/* Our tuning (packet types, QoS poll) waits until a new link is encrypted: sent right at
+ * the connect, on top of a phone's Secure Connections pairing, it overflowed the
+ * controller's per-link procedure list ("OLM_CONN: pend list full ... refuse") and the
+ * phone gave up pairing (0x13). A link that never encrypts gets it after 4 s. */
+#define TUNE_WAIT_MS 4000
 static hci_con_handle_t s_acl = HCI_CON_HANDLE_INVALID;   /* newest link */
 static hci_con_handle_t s_le = HCI_CON_HANDLE_INVALID;
 static btstack_timer_source_t s_le_timer;
@@ -104,6 +112,7 @@ static uint16_t poll_wanted(hci_con_handle_t h)
 }
 
 static void poll_apply(const char *why);
+static const char *pkt_types_str(uint16_t t, char *buf, size_t n);
 static int s_qos_retries;                         /* QoS Setup refusals retried (reset per new link) */
 
 void link_tune_refresh(const char *why)
@@ -115,11 +124,26 @@ void link_tune_refresh(const char *why)
     poll_apply(why);
 }
 
+static void link_ready(int i, const char *why)
+{
+    char buf[96];
+    s_links[i].ready = true;
+    hci_send_cmd(&hci_change_connection_packet_type, s_links[i].h, s_pkt_types);
+    ESP_LOGW(TAG, "ACL 0x%04x: packet types 0x%04x (%s)", s_links[i].h, s_pkt_types,
+             pkt_types_str(s_pkt_types, buf, sizeof(buf)));
+    poll_apply(why);
+}
+
 static void poll_apply(const char *why)
 {
     for (int i = 0; i < MAX_ACL; i++) {
         hci_con_handle_t h = s_links[i].h;
         if (h == HCI_CON_HANDLE_INVALID) continue;
+        if (!s_links[i].ready) {
+            if (btstack_run_loop_get_time_ms() - s_links[i].up_ms < TUNE_WAIT_MS) continue;
+            link_ready(i, "link up 4 s, not encrypted");   /* calls poll_apply again: done */
+            return;
+        }
         uint16_t want = poll_wanted(h);
         if (want == s_links[i].applied) continue;
         bool other = want == POLL_SLOTS_OTHER;
@@ -213,15 +237,22 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, 
                 s_links[i].h = s_acl;
                 s_links[i].applied = 0;
                 s_links[i].had_a2dp = false;
+                s_links[i].ready = false;
+                s_links[i].up_ms = btstack_run_loop_get_time_ms();
                 break;
             }
         }
         s_pkt_types = hci_usable_acl_packet_types();
-        hci_send_cmd(&hci_change_connection_packet_type, s_acl, s_pkt_types);
-        poll_apply("phone connected");
         a2dp_in_refresh_discoverable();
-        ESP_LOGW(TAG, "ACL 0x%04x: packet types 0x%04x (%s), inquiry scan off",
-                 s_acl, s_pkt_types, pkt_types_str(s_pkt_types, buf, sizeof(buf)));
+        break;
+    case HCI_EVENT_ENCRYPTION_CHANGE:
+    case HCI_EVENT_ENCRYPTION_CHANGE_V2:
+        if (packet[2] == ERROR_CODE_SUCCESS && packet[5] != 0) {
+            hci_con_handle_t eh = little_endian_read_16(packet, 3);
+            for (int i = 0; i < MAX_ACL; i++) {
+                if (s_links[i].h == eh && !s_links[i].ready) link_ready(i, "phone connected");
+            }
+        }
         break;
     case HCI_EVENT_READ_REMOTE_SUPPORTED_FEATURES_COMPLETE:
         if (size >= 13 && packet[2] == 0) {
