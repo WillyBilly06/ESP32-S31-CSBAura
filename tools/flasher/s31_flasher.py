@@ -743,7 +743,7 @@ def board_identity(port, tmp, log):
         with open(path, "rb") as f:
             return cfg_identity(f.read())
     except Exception as e:
-        raise RuntimeError(f"could not read the board's identity ({e}). Nothing was written: flashing now "
+        raise RuntimeError(f"could not read the board's identity ({' '.join(str(e).split())}). Nothing was written: flashing now "
                            "could change its Bluetooth address and lose its pairings. Check the cable / port "
                            "and try again (or choose Erase / New speaker).") from e
 
