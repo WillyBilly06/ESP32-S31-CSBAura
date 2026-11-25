@@ -18,12 +18,14 @@
  *   model [pid hex [color hex]]     list the JBL models / become one (NVS, reboot); "model 0" = flashed one
  *   jscan [ms]                    scan (default 6 s) and log every JBL beacon heard
  *   callback                      call the last phone back (or, with one linked, the one before it)
+ *   acl <s>                       log ACL packets up to 72 B (L2CAP signalling, AVDTP / AVRCP) for s seconds
  *   reboot | help
  *
  * Send with: python tools/s31_console/s31ctl.py send "<command>"
  */
 #include "bt_sched_tune.h"
 #include "console_cmd.h"
+#include "hci_transport_s31_vhci.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -170,6 +172,10 @@ static void run_cmd(void *ctx)
         } else {
             ESP_LOGW(TAG, "usage: prio <acl> <bis first> <bis rep> <bis pre-tx>");
         }
+    } else if (!strncmp(c, "acl ", 4)) {                /* acl <s>: log ACL packets up to 72 B (signalling) */
+        unsigned s = (unsigned)atoi(c + 4);
+        hci_transport_s31_acl_dump(s * 1000u);
+        ESP_LOGW(TAG, "ACL packets up to 72 B logged for %u s", s);
     } else if (!strncmp(c, "pti ", 4)) {                /* pti <idx> <dft> <inc>: BR/EDR activity priority */
         unsigned v[3];
         if (sscanf(c + 4, "%u %u %u", &v[0], &v[1], &v[2]) == 3) {

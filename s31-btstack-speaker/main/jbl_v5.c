@@ -821,6 +821,10 @@ static void stereo_clear(void)
     cfg.stereo_name[0] = cfg.stereo_id[0] = 0;
     memset(cfg.partner, 0, 6);
     stereo_linked(false);
+    /* stored at once on every path: ungrouped by the partner or the ungroup key only cleared RAM,
+     * and after a restart the S31 searched for the old partner again for good (directed adverts
+     * every 20 ms next to the phone links, 2026-11-25) */
+    persist_later(false);
 }
 
 void jbl_v5_stereo_partner_ungrouped(void)

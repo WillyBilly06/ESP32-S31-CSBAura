@@ -730,15 +730,22 @@ def run_esptool_fast(tail, port, chip, before, after, log):
 
 
 def board_identity(port, tmp, log):
-    """the identity the board's s31cfg holds now (None: the chip's own MAC, or unreadable)"""
+    """the identity the board's s31cfg holds now (None: the chip's own MAC). A board that cannot be
+    read stops the flash: writing the chip's own address over an identity an earlier flash gave it
+    would silently cost the speaker every pairing it has."""
     path = os.path.join(tmp, "s31cfg_board.bin")
+    try:
+        os.remove(path)                             # never read back an older board's file
+    except OSError:
+        pass
     try:
         run_esptool_fast(["read-flash", hex(CFG_OFFSET), "64", path], port, "esp32s31", "default-reset", "no-reset", log)
         with open(path, "rb") as f:
             return cfg_identity(f.read())
     except Exception as e:
-        log(f"(could not read the board's identity: {e} - it gets the chip's own address)\n")
-        return None
+        raise RuntimeError(f"could not read the board's identity ({e}). Nothing was written: flashing now "
+                           "could change its Bluetooth address and lose its pairings. Check the cable / port "
+                           "and try again (or choose Erase / New speaker).") from e
 
 
 def flash(project, port, color_id, name, erase, color_only, log, model=DEFAULT_PID, new_id=False):

@@ -1426,6 +1426,49 @@ static void alt_clear(void)
     s_alt.play_status = 0xFE;
 }
 
+/* Hold the standby phone that started playing: AVRCP Pause. One start is reported twice (its
+ * AVRCP "playing" and its stream start, ~20 ms apart): one Pause. A Pause refused because the
+ * AVRCP controller still waits for the previous command's response is sent again shortly - never
+ * the AVDTP suspend for that: suspended, the RedMagic dropped A2DP ~9 s later and the take-over
+ * found no phone (10 s of silence and a connect tone), and an S26 kept "playing" into the
+ * suspended stream instead of pausing (2026-11-25). AVDTP suspend only for a phone without AVRCP. */
+#define HOLD_DEDUP_MS 1500
+#define HOLD_RETRY_MS 150
+#define HOLD_RETRIES 10
+static btstack_timer_source_t s_hold_timer;
+static uint8_t s_hold_tries;
+static void hold_retry(btstack_timer_source_t *ts);
+static uint8_t alt_hold_send(void)
+{
+    if (s_alt.avrcp_cid == 0) return avdtp_sink_suspend(s_alt.a2dp_cid, s_alt.local_seid);   /* no AVRCP */
+    uint8_t st = avrcp_controller_pause(s_alt.avrcp_cid);
+    if (st != ERROR_CODE_SUCCESS && s_hold_tries < HOLD_RETRIES) {
+        s_hold_tries++;
+        btstack_run_loop_remove_timer(&s_hold_timer);
+        btstack_run_loop_set_timer_handler(&s_hold_timer, hold_retry);
+        btstack_run_loop_set_timer(&s_hold_timer, HOLD_RETRY_MS);
+        btstack_run_loop_add_timer(&s_hold_timer);
+    }
+    return st;
+}
+static void hold_retry(btstack_timer_source_t *ts)
+{
+    (void)ts;
+    if (!s_alt.held || s_alt.resuming) return;
+    uint8_t st = alt_hold_send();
+    ESP_LOGW(TAG, "multipoint: Pause to %s again (AVRCP was busy) -> 0x%02x", bd_addr_to_str(s_alt.addr), st);
+}
+/* the status of the Pause (or suspend); 0xFE: held moments ago, no second Pause */
+static uint8_t alt_hold(void)
+{
+    uint32_t now = btstack_run_loop_get_time_ms();
+    if (s_alt.held && (uint32_t)(now - s_alt.held_ms) < HOLD_DEDUP_MS) return 0xFE;
+    s_alt.held = true;
+    s_alt.held_ms = now;
+    s_hold_tries = 0;
+    return alt_hold_send();
+}
+
 /* the LE Audio phone is this A2DP phone (one phone moving between the two) */
 static bool same_phone_as_le(void)
 {
@@ -1578,11 +1621,33 @@ static void resume_timeout(btstack_timer_source_t *ts)
     s_alt.held = false;
     link_tune_refresh("held phone did not resume");
 }
+/* a Play refused while AVRCP waits for an earlier response: again shortly (as the hold's Pause) */
+static void resume_retry(btstack_timer_source_t *ts)
+{
+    if (!s_alt.resuming || s_alt.started || s_alt.avrcp_cid == 0) return;
+    uint8_t st = avrcp_controller_play(s_alt.avrcp_cid);
+    if (st != ERROR_CODE_SUCCESS && ++s_hold_tries < HOLD_RETRIES) {
+        btstack_run_loop_set_timer(ts, HOLD_RETRY_MS);
+        btstack_run_loop_add_timer(ts);
+    }
+    ESP_LOGW(TAG, "multipoint: Play to %s again (AVRCP was busy) -> 0x%02x", bd_addr_to_str(s_alt.addr), st);
+}
 static void held_resume(const char *why)
 {
     s_alt.resuming = true;
-    uint8_t st = s_alt.avrcp_cid ? avrcp_controller_play(s_alt.avrcp_cid) : 0xFF;
-    if (st != ERROR_CODE_SUCCESS) st = avdtp_sink_start_stream(s_alt.a2dp_cid, s_alt.local_seid);   /* no AVRCP */
+    btstack_run_loop_remove_timer(&s_hold_timer);   /* no Pause retry after this */
+    uint8_t st;
+    if (s_alt.avrcp_cid) {
+        st = avrcp_controller_play(s_alt.avrcp_cid);
+        if (st != ERROR_CODE_SUCCESS) {
+            s_hold_tries = 0;
+            btstack_run_loop_set_timer_handler(&s_hold_timer, resume_retry);
+            btstack_run_loop_set_timer(&s_hold_timer, HOLD_RETRY_MS);
+            btstack_run_loop_add_timer(&s_hold_timer);
+        }
+    } else {
+        st = avdtp_sink_start_stream(s_alt.a2dp_cid, s_alt.local_seid);   /* no AVRCP */
+    }
     ESP_LOGW(TAG, "multipoint: held phone %s %s: Play -> 0x%02x", bd_addr_to_str(s_alt.addr), why, st);
     link_tune_refresh("held phone resumes");      /* out of sniff */
     btstack_run_loop_remove_timer(&s_resume_timer);
@@ -1665,7 +1730,7 @@ bool a2dp_in_link_streams_held(uint16_t h)
  * phone that was set aside, gets the speaker */
 static void active_stopped(void)
 {
-    if (s_alt.used && s_alt.started) {
+    if (s_alt.used && (s_alt.started || s_alt.held)) {   /* held: its own stream suspended too */
         takeover_arm("stopped its stream");
         return;
     }
@@ -1773,10 +1838,7 @@ static bool alt_event(uint8_t *packet)
                 char held_s[18], keep_s[18];
                 strcpy(held_s, bd_addr_to_str(s_alt.addr));
                 strcpy(keep_s, bd_addr_to_str(s_peer));
-                s_alt.held = true;
-                s_alt.held_ms = btstack_run_loop_get_time_ms();
-                uint8_t st = s_alt.avrcp_cid ? avrcp_controller_pause(s_alt.avrcp_cid) : 0xFF;
-                if (st != ERROR_CODE_SUCCESS) st = avdtp_sink_suspend(s_alt.a2dp_cid, s_alt.local_seid);   /* no AVRCP */
+                uint8_t st = alt_hold();
                 ESP_LOGW(TAG, "multipoint: %s started playing - HELD (paused -> 0x%02x), %s keeps the speaker; %s "
                          "resumes when %s pauses", held_s, st, keep_s, held_s, keep_s);
             } else {
@@ -2295,11 +2357,9 @@ static void avrcp_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet
             /* PAUSED right after we held it is our own Pause: it stays held */
             if (s_alt.play_status == AVRCP_PLAYBACK_STATUS_PLAYING && !s_alt.resuming && s_a2dp_started &&
                 !active_paused() && !s_ext_on) {
-                s_alt.held = true;
-                s_alt.held_ms = btstack_run_loop_get_time_ms();
                 char held_s[18];
                 strcpy(held_s, bd_addr_to_str(s_alt.addr));
-                uint8_t st = avrcp_controller_pause(s_alt.avrcp_cid);
+                uint8_t st = alt_hold();
                 ESP_LOGW(TAG, "multipoint: %s plays while %s does - HELD (paused -> 0x%02x)", held_s,
                          bd_addr_to_str(s_peer), st);
             }
