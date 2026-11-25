@@ -1552,6 +1552,7 @@ static void active_started(const char *what)
         else le_hold();                           /* another phone on LE Audio: the last one wins */
     }
     a2dp_in_refresh_discoverable();               /* page scan short while streaming */
+    link_tune_refresh("audio started");           /* the streaming poll right away */
     bt_sched_tune_streaming(true);                /* streaming profile (MASTER: same as idle, BIS copies above the ACL) */
     delay_report_soon(100);                       /* again while streaming (allowed in STREAMING too) */
     ESP_LOGW(TAG, "%s", what);
