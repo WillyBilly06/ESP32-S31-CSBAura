@@ -73,7 +73,9 @@ def tool_archives(idf):
         d = v.get(PLATFORM) or v.get("any")
         if not d:
             continue                                        # not a Windows tool
-        out.append((t["name"], v["name"], d["url"], d["sha256"], d["size"]))
+        # the name ESP-IDF keeps the archive under in dist/ (ninja: rename_dist)
+        fn = d.get("rename_dist") or os.path.basename(d["url"])
+        out.append((t["name"], v["name"], d["url"], d["sha256"], d["size"], fn))
     return out
 
 
@@ -92,8 +94,7 @@ def main():
     # 1 - tool archives
     cache = os.path.join(os.path.expanduser("~"), ".espressif", "dist")
     print("ESP-IDF tools for", TARGET)
-    for name, ver, url, sh, size in tool_archives(a.idf):
-        fn = os.path.basename(url)
+    for name, ver, url, sh, size, fn in tool_archives(a.idf):
         dest = os.path.join(pkg, "dist", fn)
         if not (os.path.isfile(dest) and sha256(dest) == sh):
             src = os.path.join(cache, fn)
